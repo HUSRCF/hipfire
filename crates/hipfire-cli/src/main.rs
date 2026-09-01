@@ -380,6 +380,11 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long)]
+    /// Select a published lm_head variant (see the registry's `heads`), e.g.
+    /// `--head q4k`. The overlay shadows the model's own head at load time;
+    /// omitting this uses the head baked into the model file.
+    head: Option<String>,
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
@@ -2127,6 +2132,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.kv_backend.as_deref(),
         canonical.as_deref(),
         args.model_draft.is_some(),
+        args.head.as_deref(),
     )?;
     let selector = args
         .speculation
@@ -2917,6 +2923,7 @@ pub(crate) fn load_params(
     kv_backend_override: Option<&str>,
     tag: Option<&str>,
     explicit_draft: bool,
+    head_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
@@ -2951,6 +2958,45 @@ pub(crate) fn load_params(
             }
         }
     }
+    // Resolve --head <name> against the registry's `heads` map. The overlay
+    // lives beside the model file, exactly like the triattn sidecar. Refuse
+    // rather than fall back: a silent fall-back would serve the base's head
+    // and answer a different question than the operator asked.
+    let head_file = match head_override.filter(|s| !s.is_empty()) {
+        None => String::new(),
+        // A direct path is accepted as well as a registry name: loading a
+        // model BY PATH has no registry entry, so names cannot resolve there
+        // and only a path can work.
+        Some(name) if Path::new(name).is_file() => name.to_string(),
+        Some(name) => {
+            let heads = entry.map(|e| &e.heads);
+            let sidecar = heads.and_then(|h| h.get(name)).ok_or_else(|| {
+                let known: Vec<&str> = heads
+                    .map(|h| h.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                anyhow!(
+                    "--head {name}: not a file, and this model has no such head variant{}",
+                    if known.is_empty() {
+                        " (it publishes none)".to_string()
+                    } else {
+                        format!(" (available: {})", known.join(", "))
+                    }
+                )
+            })?;
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if !candidate.is_file() {
+                bail!(
+                    "--head {name}: overlay {} not found — fetch it with \
+                     `hipfire pull` or place it beside the model",
+                    candidate.display()
+                );
+            }
+            candidate.display().to_string()
+        }
+    };
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "deepseek4_compute_placement": config_string(
@@ -2971,6 +3017,7 @@ pub(crate) fn load_params(
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
         "cask_sidecar": cask_sidecar,
+        "head": head_file,
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
@@ -4673,6 +4720,8 @@ fn open_bench_engine(
         args.kv_backend.as_deref(),
         tag.as_deref(),
         false,
+        // No --head on this path yet; the model's own head is used.
+        None,
     )?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
@@ -6948,6 +6997,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["cask"], false);
@@ -6974,6 +7024,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["cask"], false);
@@ -6996,6 +7047,7 @@ mod tests {
             Some("vmm"),
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "vmm");
@@ -7015,6 +7067,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
@@ -7321,6 +7374,7 @@ mod tests {
             Some("contiguous"),
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
@@ -7335,6 +7389,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params2["kv_backend"], "vmm");
@@ -7445,6 +7500,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], "single");
@@ -7471,6 +7527,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
@@ -7500,6 +7557,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], raw);
@@ -7531,6 +7589,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["draft"], draft);
@@ -8546,6 +8605,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "off");
