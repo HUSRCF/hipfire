@@ -210,6 +210,16 @@ pub struct ModelEntry {
     /// trunk; sha256/size_bytes stay absent until the pack ships.
     #[serde(default)]
     pub vision: Option<Sidecar>,
+    /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
+    ///
+    /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
+    /// shadows the base's `lm_head.weight` at load time. The BASE ships the
+    /// recommended head and runs standalone; these only exist so a different
+    /// carrier costs a 188-635 MB download instead of a near-identical 6.5 GB
+    /// model. Three full variants would be 19.63 GB; base plus two overlays is
+    /// 7.30 GB.
+    #[serde(default)]
+    pub heads: std::collections::BTreeMap<String, Sidecar>,
     #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
@@ -400,6 +410,7 @@ impl RegistryV1 {
             ]
             .into_iter()
             .flatten()
+            .chain(entry.heads.values())
             {
                 if sidecar.file.trim().is_empty() {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
@@ -763,6 +774,39 @@ fn epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `heads` map must be VALIDATED, not merely parsed.
+    ///
+    /// Adding a field to the struct makes it round-trip; it does not make the
+    /// validator look at it. This asserts the negative directly: a head with a
+    /// malformed digest is REJECTED. Without the `.chain(entry.heads.values())`
+    /// in `validate`, this test fails and the bundled-registry check would
+    /// happily ship an unverifiable head overlay.
+    #[test]
+    fn heads_sidecars_are_digest_validated() {
+        let with_bad_head = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"m":{"repo":"r","file":"f.hfq","size_gb":1,"min_vram_gb":1,"desc":"d",
+              "heads":{"q4k":{"file":"h.hfq","sha256":"not-a-sha"}}}},
+            "aliases":{}
+        }"#;
+        let err = RegistryV1::parse(with_bad_head, "test")
+            .expect_err("a malformed head digest must be rejected");
+        assert!(
+            format!("{err}").contains("invalid SHA-256"),
+            "expected a digest complaint, got: {err}"
+        );
+
+        // Control: the SAME registry with a well-formed digest parses, so the
+        // rejection above is about the digest and not about `heads` being
+        // unparseable.
+        let good = with_bad_head.replace("not-a-sha", &"a".repeat(64));
+        let reg = RegistryV1::parse(&good, "test").expect("valid head must parse");
+        let (_, entry) = reg.model("m").unwrap();
+        assert_eq!(entry.heads.len(), 1);
+        assert_eq!(entry.heads["q4k"].file, "h.hfq");
+    }
 
     #[test]
     fn bundled_registry_is_strictly_valid() {
