@@ -24,7 +24,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemm::GemmParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps, run_uniform_moe_gate_up, GemvInput, Step};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2202,8 +2202,7 @@ fn apply_moe_branch(
     let gate_q8 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_q8 = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = (gate_mq4 || gate_hfq4 || gate_hfq6 || gate_q8)
-        && (down_q8 || down_hfq4g128);
+    let fast = (gate_mq4 || gate_hfq4 || gate_hfq6 || gate_q8) && (down_q8 || down_hfq4g128);
     {
         use std::sync::OnceLock;
         static LOGGED: OnceLock<()> = OnceLock::new();
@@ -2236,8 +2235,10 @@ fn apply_moe_branch(
                 2 * mi,
                 dim,
             )?;
-        } else if gate_hfq4 {
-            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+        } else if gate_hfq4 || gate_hfq6 {
+            run_uniform_moe_gate_up(
+                gpu,
+                first.gate_up_proj.gpu_dtype,
                 &moe.experts_gate_up_ptrs,
                 &scratch.moe_topk_indices,
                 &scratch.moe_pre2,
@@ -2246,18 +2247,8 @@ fn apply_moe_branch(
                 2 * mi,
                 dim,
                 k_top,
-            )?;
-        } else if gate_hfq6 {
-            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
-                &moe.experts_gate_up_ptrs,
-                &scratch.moe_topk_indices,
-                &scratch.moe_pre2,
-                &scratch.moe_expert_gate_batch,
-                &scratch.moe_expert_up_batch,
-                2 * mi,
-                dim,
-                k_top,
-            )?;
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else {
             // Q8_0 — no rotation needed.
             gpu.gemv_q8_0_moe_gate_up_k8_indexed(
