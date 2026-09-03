@@ -97,9 +97,11 @@ __global__ void attention_flash_q8_0_tile(
     float scale_attn,
     int tile_size,
     int window,                          // sliding-window span; <= 0 = full causal
-    int effective_seq_len                // >0 scans compact physical ring rows
+    int effective_seq_len                // retained ABI; dynamic length comes from pos_buf
 ) {
-    const int seq_len = (effective_seq_len > 0) ? effective_seq_len : (pos_buf[0] + 1);
+    (void)effective_seq_len;
+    const int logical_seq_len = pos_buf[0] + 1;
+    const int seq_len = (window > 0) ? min(logical_seq_len, max_seq) : logical_seq_len;
     // Sliding-window lower bound: keys at t < win_lo are outside the window
     // [seq_len-window, seq_len) and masked. window <= 0 = full causal.
     const int win_lo = (window > 0) ? (seq_len - window) : 0;
