@@ -2113,7 +2113,6 @@ fn apply_moe_branch(
     attn_out: &GpuTensor,
 ) -> HipResult<()> {
     let dim = config.dim;
-    let dim_bytes = dim * 4;
     let mi = config.moe_intermediate_size;
     let n_exp = config.num_experts;
     let k_top = config.top_k_experts;
@@ -2164,7 +2163,7 @@ fn apply_moe_branch(
         &scratch.moe_router_in,
         config.norm_eps,
     )?;
-    gpu.scale_f32(&scratch.moe_router_in, 1.0 / (dim as f32).sqrt())?;
+    gpu.scale_f32_recorded(&scratch.moe_router_in, 1.0 / (dim as f32).sqrt())?;
 
     // 4) Router GEMV → logits [n_exp]
     weight_gemv(
@@ -2198,11 +2197,13 @@ fn apply_moe_branch(
     // Hits the fast path. Other Gemma 4 variants might land in legacy.
     let first = &moe.experts[0];
     let gate_mq4 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let gate_hfq4 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::HFQ4G256;
+    let gate_hfq6 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::HFQ6G256;
     let gate_q8 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_q8 = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = (gate_mq4 || gate_q8) && down_q8;
-    let _ = (gate_mq4, down_hfq4g128);
+    let fast = (gate_mq4 || gate_hfq4 || gate_hfq6 || gate_q8)
+        && (down_q8 || down_hfq4g128);
     {
         use std::sync::OnceLock;
         static LOGGED: OnceLock<()> = OnceLock::new();
@@ -2235,6 +2236,28 @@ fn apply_moe_branch(
                 2 * mi,
                 dim,
             )?;
+        } else if gate_hfq4 {
+            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                &moe.experts_gate_up_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_pre2,
+                &scratch.moe_expert_gate_batch,
+                &scratch.moe_expert_up_batch,
+                2 * mi,
+                dim,
+                k_top,
+            )?;
+        } else if gate_hfq6 {
+            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                &moe.experts_gate_up_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_pre2,
+                &scratch.moe_expert_gate_batch,
+                &scratch.moe_expert_up_batch,
+                2 * mi,
+                dim,
+                k_top,
+            )?;
         } else {
             // Q8_0 — no rotation needed.
             gpu.gemv_q8_0_moe_gate_up_k8_indexed(
@@ -2261,12 +2284,7 @@ fn apply_moe_branch(
         )?;
 
         // Zero accumulator (memset is sync but tiny — 11 KB for dim=2816).
-        if let Some(s) = gpu.active_stream.as_ref() {
-            gpu.hip
-                .memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
-        } else {
-            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
-        }
+        gpu.zero_f32(&scratch.moe_cur_moe)?;
 
         // Indexed down + scaled residual: 8 fused GEMVs, atomicAdd into
         // moe_cur_moe with scale = topk_weights[krank] *
@@ -2316,12 +2334,7 @@ fn apply_moe_branch(
                 ));
             }
         }
-        if let Some(s) = gpu.active_stream.as_ref() {
-            gpu.hip
-                .memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
-        } else {
-            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
-        }
+        gpu.zero_f32(&scratch.moe_cur_moe)?;
         // Dump router info for first MoE layer
         {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2421,7 +2434,7 @@ fn apply_moe_branch(
     )?;
 
     // 10) combined = cur_mlp + cur_moe → scratch.tmp
-    gpu.add_f32(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
+    gpu.add_f32_graph_safe(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
 
     // 11) tmp = post_feedforward_layernorm(combined)
     gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;
@@ -5382,21 +5395,57 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 )),
             },
             g4_op::PROJ_V_SLIDING => match self.layer {
-                LayerWeights::Sliding(lw) => weight_gemv(gpu, &lw.v_proj, &s.tmp, &s.v),
+                LayerWeights::Sliding(lw) => {
+                    let wr = lw.v_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.v,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_V_SLIDING on non-Sliding layer",
                 )),
             },
             g4_op::PROJ_Q_FULL => match self.layer {
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.q_proj, &s.tmp, &s.q),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.q_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.q,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_Q_FULL on non-Full layer",
                 )),
             },
             g4_op::PROJ_K_FULL => match self.layer {
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.k_proj, &s.tmp, &s.k),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.k_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.tmp),
+                            out: &s.k,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
                 _ => Err(hip_bridge::HipError::new(
                     0,
                     "PROJ_K_FULL on non-Full layer",
@@ -5416,7 +5465,19 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     )
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                 }
-                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.o_proj, &s.attn_out, &s.tmp),
+                LayerWeights::Full(lw) => {
+                    let wr = lw.o_proj.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        ctx,
+                        &[Step::Gemv {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.attn_out),
+                            out: &s.tmp,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
             },
             g4_op::PROJ_GATE_UP => match self.layer {
                 LayerWeights::Sliding(lw) => {
@@ -5484,7 +5545,17 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                     }
                     LayerWeights::Full(lw) => {
-                        weight_gemv(gpu, &lw.down_proj, &s.ffn_hidden, &s.ffn_out)
+                        let wr = lw.down_proj.dispatch_ref();
+                        execute_steps(
+                            gpu,
+                            ctx,
+                            &[Step::Gemv {
+                                w: &wr,
+                                input: GemvInput::Raw(&s.ffn_hidden),
+                                out: &s.ffn_out,
+                            }],
+                        )
+                        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
                     }
                 }
             }
@@ -5503,7 +5574,6 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
     ) -> Result<(), hipfire_dispatch::types::DispatchError> {
         let s = self.scratch;
         let dim = self.config.dim;
-        let dim_bytes = dim * 4;
         let hip_to_dispatch =
             |e: hip_bridge::HipError| hipfire_dispatch::types::DispatchError::Hip(e.to_string());
 
@@ -5511,56 +5581,29 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
             g4_op::RESID_POST_ATTN => {
                 // First: save x → residual (this is the first time residual is set
                 // in this layer — Norm(INPUT) wrote to tmp, x is still intact).
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.residual, &s.x, dim)
+                    .map_err(hip_to_dispatch)?;
                 // x = residual + tmp (tmp holds post_attn_norm output).
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.x, &s.residual, dim)
+                    .map_err(hip_to_dispatch)?;
                 gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
                 // Save x → residual for the FFN residual stream.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.residual, &s.x, dim)
+                    .map_err(hip_to_dispatch)?;
                 Ok(())
             }
             g4_op::RESID_POST_FFN => {
                 // x = residual + tmp; x *= layer_scalar.
                 // Identical for dense and MoE — tmp already holds normalized output.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.x, &s.residual, dim)
+                    .map_err(hip_to_dispatch)?;
                 gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
                 let layer_scalar = match self.layer {
                     LayerWeights::Sliding(lw) => lw.layer_scalar_host,
                     LayerWeights::Full(lw) => lw.layer_scalar_host,
                 };
-                gpu.scale_f32(&s.x, layer_scalar).map_err(hip_to_dispatch)?;
+                gpu.scale_f32_recorded(&s.x, layer_scalar)
+                    .map_err(hip_to_dispatch)?;
                 Ok(())
             }
             other => Err(hip_bridge::HipError::new(
@@ -5674,7 +5717,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 .map_err(hip_to_dispatch)?;
 
                 // Pre-scale Q by sqrt(head_dim) — Gemma 4 attention scale is 1.0.
-                gpu.scale_f32(&s.q, (head_dim as f32).sqrt())
+                gpu.scale_f32_recorded(&s.q, (head_dim as f32).sqrt())
                     .map_err(hip_to_dispatch)?;
 
                 // Full rotate_half RoPE (all dims rotate).
@@ -5760,15 +5803,8 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 let kv_bytes = n_kv * head_dim * 4;
 
                 // CRITICAL: capture pre-k_norm K as V before applying k_norm.
-                if let Some(stream) = gpu.active_stream.as_ref() {
-                    gpu.hip
-                        .memcpy_dtod_async_at(&s.v.buf, 0, &s.k.buf, 0, kv_bytes, stream)
-                        .map_err(hip_to_dispatch)?;
-                } else {
-                    gpu.hip
-                        .memcpy_dtod(&s.v.buf, &s.k.buf, kv_bytes)
-                        .map_err(hip_to_dispatch)?;
-                }
+                gpu.copy_f32_buffer(&s.v, &s.k, kv_bytes / 4)
+                    .map_err(hip_to_dispatch)?;
 
                 // q/k/v norms (v_norm is no-scale — ones buffer).
                 gpu.rmsnorm_batched(&s.q, &lw.q_norm, &s.q, n_heads, head_dim, config.norm_eps)
@@ -5786,7 +5822,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 .map_err(hip_to_dispatch)?;
 
                 // Pre-scale Q by sqrt(head_dim).
-                gpu.scale_f32(&s.q, (head_dim as f32).sqrt())
+                gpu.scale_f32_recorded(&s.q, (head_dim as f32).sqrt())
                     .map_err(hip_to_dispatch)?;
 
                 // Proportional partial RoPE (only first n_rot_pairs pairs rotate).
