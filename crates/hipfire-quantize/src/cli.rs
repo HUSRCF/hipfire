@@ -34,9 +34,10 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
     about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file.
-    #[arg(long, value_name = "PATH_OR_MODEL_ID")]
-    pub input: String,
+    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// `--flux-pipe`, which names its own input.
+    #[arg(long, value_name = "PATH_OR_MODEL_ID", required_unless_present = "flux_pipe")]
+    pub input: Option<String>,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]
@@ -73,6 +74,22 @@ pub(crate) struct QuantizeArgs {
     /// Allow an architecture override to move Qwen3 off its pillar IDs.
     #[arg(long)]
     pub force_arch_id: bool,
+
+    /// Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files instead of
+    /// running the quantize pipeline (`--format` is ignored on this path).
+    /// The pipe is a dir root holding `transformer/`, `vae/`, `scheduler/`, the
+    /// text encoder dirs and `tokenizer*/`. The packs are the only form the
+    /// daemon loads; see docs/QUANTIZE.md.
+    #[arg(long, value_name = "PIPE_DIR")]
+    pub flux_pipe: Option<String>,
+
+    /// `--flux-pipe` only: one component to pack, or `all` (default) to write
+    /// every component derived from `--output`: `<stem>-transformer.hfq`,
+    /// `<stem>-t5.hfq`, `<stem>-clip.hfq`, `<stem>-vae.hfq` for FLUX.1;
+    /// `<stem>-transformer.hfq`, `<stem>-qwen3.hfq`, `<stem>-vae.hfq` for
+    /// FLUX.2 Klein. A single component writes exactly to `--output`.
+    #[arg(long, value_name = "COMPONENT", default_value = "all")]
+    pub flux_component: String,
 
     /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
     /// low-bit packers' column weighting. Value is the alpha the source was
