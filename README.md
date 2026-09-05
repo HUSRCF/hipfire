@@ -348,6 +348,7 @@ the prefill MMQ redesign log is at
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
 | [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
+| [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
