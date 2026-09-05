@@ -24,6 +24,7 @@ members = [
     "crates/hipfire-arch-cohere2moe",
     "crates/hipfire-arch-maple",
     "crates/hipfire-arch-dots-ocr",
+    "crates/hipfire-arch-diffusion",
     "crates/hipfire-quantize",
     "crates/saddle-quant",
     "crates/hipfire-detect",
