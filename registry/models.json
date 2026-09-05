@@ -316,7 +316,7 @@
         "temperature": 0.6,
         "top_p": 0.95
       },
-      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
+      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY — a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected — 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) — that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
     },
     "north-mini-code": {
       "repo": "nwoolmer/hipfire-north-mini-code",
@@ -1564,6 +1564,40 @@
         }
       },
       "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap."
+    },
+    "flux.schnell:1": {
+      "repo": "elphil/flux",
+      "file": "flux-schnell-transformer.hfq",
+      "t5": {
+        "file": "flux-schnell-t5.hfq"
+      },
+      "clip": {
+        "file": "flux-schnell-clip.hfq"
+      },
+      "vae": {
+        "file": "flux-schnell-vae.hfq"
+      },
+      "size_gb": 23.8,
+      "min_vram_gb": 24,
+      "arch_id": 40,
+      "desc": "FLUX.1-schnell MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Built with `hipfire-quantize --flux-pipe`; served via `hipfire img flux.schnell:1`. Step-distilled: 4 default steps (guidance_embed_dim 0). T5/CLIP/VAE sidecars are shared with flux.dev:1 - pull once. Published on the Hub as elphil/flux (private)."
+    },
+    "flux.dev:1": {
+      "repo": "hipfire-models/flux",
+      "file": "flux-dev-transformer.hfq",
+      "t5": {
+        "file": "flux-dev-t5.hfq"
+      },
+      "clip": {
+        "file": "flux-dev-clip.hfq"
+      },
+      "vae": {
+        "file": "flux-dev-vae.hfq"
+      },
+      "size_gb": 23.8,
+      "min_vram_gb": 24,
+      "arch_id": 40,
+      "desc": "FLUX.1-dev MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Guidance-distilled: 28 default steps (guidance_embed_dim 128). LOCAL-ONLY PLACEHOLDER: FLUX.1-dev is NCL and cannot be redistributed; dev packs are never uploaded to the Hub, so digest fields stay TBD."
     }
   },
   "aliases": {

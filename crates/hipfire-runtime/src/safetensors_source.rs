@@ -228,11 +228,35 @@ impl ModelSource for SafetensorsSource {
 }
 
 pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
-    let archs = config
+    let mut archs = config
         .get("architectures")
         .and_then(|a| a.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
+
+    // Diffusers component configs (e.g. `transformer/config.json`) carry no
+    // `architectures` array — they name the class via `_class_name` instead.
+    // When `architectures` is absent or empty, fall back to treating
+    // `[_class_name]` as the architectures list so the same table-driven
+    // substring match below resolves FLUX.1 vs FLUX.2 Klein.
+    //
+    // **Deliberately narrowed to the FLUX transformer classes.** `_class_name`
+    // is a diffusers-wide key: an unrestricted fallback promotes it above
+    // `model_type` for EVERY config in the workspace that happens to carry
+    // both, which is a global routing change made for one feature's benefit.
+    // `Flux*Transformer2DModel` is the whole set this feature needs
+    // (`FluxTransformer2DModel` -> 40, `Flux2Transformer2DModel` -> 44), it
+    // cannot collide with a text model's class name, and anything else keeps
+    // the pre-existing `model_type` route.
+    if archs.is_empty() {
+        if let Some(class_name) = config
+            .get("_class_name")
+            .and_then(|v| v.as_str())
+            .filter(|c| c.starts_with("Flux") && c.ends_with("Transformer2DModel"))
+        {
+            archs.push(class_name);
+        }
+    }
 
     // Check text_config for MoE indicators
     let text_config = config.get("text_config").unwrap_or(config);
@@ -471,6 +495,72 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+    }
+
+    /// A diffusers FLUX transformer component config (`model_type: "flux"`)
+    /// must route to arch 40 so the FluxDiffusionCarrier can claim it.
+    #[test]
+    fn flux_transformer_routes_to_arch_40() {
+        assert_eq!(derive_arch_id(&json!({ "model_type": "flux" })), 40);
+        // Diffusers layout has no `architectures`; the `_class_name` /
+        // `model_index` style fields must not interfere with the model_type
+        // fallback lookup.
+        let cfg = serde_json::json!({
+            "_class_name": "FluxTransformer2DModel",
+            "model_type": "flux",
+            "num_layers": 1,
+            "num_single_layers": 1,
+        });
+        assert_eq!(derive_arch_id(&cfg), 40);
+    }
+
+    /// A diffusers FLUX.2 Klein transformer component config
+    /// (`_class_name: "Flux2Transformer2DModel"` or `model_type: "flux2"`)
+    /// must route to arch 45, and a FLUX.1 config with both `_class_name`
+    /// and `model_type` present must still resolve to 40 (longest-key wins).
+    #[test]
+    fn flux2_transformer_routes_to_arch_45() {
+        assert_eq!(derive_arch_id(&json!({ "model_type": "flux2" })), 45);
+        assert_eq!(
+            derive_arch_id(&json!({ "_class_name": "Flux2Transformer2DModel", "num_layers": 5 })),
+            45
+        );
+        assert_eq!(
+            derive_arch_id(
+                &json!({ "_class_name": "FluxTransformer2DModel", "model_type": "flux" })
+            ),
+            40
+        );
+    }
+
+    /// The `_class_name` fallback is scoped to `Flux*Transformer2DModel` and
+    /// must NOT outrank `model_type` for anything else.
+    ///
+    /// `_class_name` is a diffusers-wide key, and the table match below is a
+    /// SUBSTRING match, so an unrestricted fallback silently re-routes every
+    /// config in the workspace that carries both fields. Both cases here were
+    /// mis-routed by the unrestricted form: a Qwen3 text encoder's class name
+    /// contains `qwen3` (arch 1) and would beat `model_type: qwen2` (arch 7);
+    /// a FLUX.2 VAE's class name contains `flux2` (arch 45) and would beat
+    /// `model_type: flux` (arch 40).
+    #[test]
+    fn non_flux_class_name_does_not_outrank_model_type() {
+        assert_eq!(
+            derive_arch_id(&json!({ "_class_name": "Qwen3ForCausalLM", "model_type": "qwen2" })),
+            7,
+            "a text encoder's _class_name must not beat its model_type"
+        );
+        assert_eq!(
+            derive_arch_id(&json!({ "_class_name": "AutoencoderKLFlux2", "model_type": "flux" })),
+            40,
+            "a VAE component's _class_name must not beat its model_type"
+        );
+        // And the fallback still does nothing at all when there is no
+        // `model_type` to fall through to: unclaimed, not a guess.
+        assert_eq!(
+            derive_arch_id(&json!({ "_class_name": "AutoencoderKLFlux2" })),
+            UNCLAIMED_ARCH_ID
+        );
     }
 
     /// C1: an unrecognized model_type must NOT silently become Qwen35 (arch_id=5).
