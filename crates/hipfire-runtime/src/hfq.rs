@@ -1183,6 +1183,11 @@ impl HfqFile {
     pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
         self.load_identity().map(std::sync::Arc::new)
     }
+
+    /// Full tensor index of this HFQ file, in on-disk order.
+    pub fn tensor_infos(&self) -> &[HfqTensorInfo] {
+        &self.tensors
+    }
 }
 
 // ─── ModelSource impl for HfqFile ───────────────────────────────────────────
@@ -1241,6 +1246,101 @@ impl crate::model_source::ModelSource for HfqFile {
     fn chat_template(&self) -> Option<String> {
         // Delegate to HfqFile's own chat_template method
         HfqFile::chat_template(self)
+    }
+}
+
+// ─── HfqModelSource: owned HFQ → ModelSource bridge ─────────────────────────
+//
+// HfqFile's plain ModelSource impl cannot serve `tensor_data` (the trait wants
+// `&TensorInfo` that outlives the call, and HfqFile stores `HfqTensorInfo`), so
+// this adapter materializes the tensor index ONCE and serves stable references
+// to it, with bytes backed by the HfqFile's mmap.
+//
+// Consumers: arch loaders that read weights through `&dyn ModelSource`. A pack
+// written by `hipfire-quantize` (F16 weights / F32 bias+scale) loads through
+// here unchanged, with no loader-side knowledge of the HFQ container.
+//
+// The caller must keep the underlying HfqFile's mmap alive for the life of the
+// adapter (do not call `prepare()`/`drop_mmap`): returned byte slices back the
+// mmap. Overlay (REAP) shadowing is not consulted for `tensor_info`; the
+// adapter serves the on-disk index only.
+
+/// Map a packed HFQ `quant_type` byte to the dtype string the arch loaders
+/// dispatch on (F16/F32/BF16). Unknown values map to a marker string the
+/// loaders reject by name.
+fn quant_type_to_dtype(quant_type: u8) -> &'static str {
+    match quant_type {
+        1 => "F16",
+        2 => "F32",
+        16 => "BF16",
+        _ => "?",
+    }
+}
+
+/// An owned [`HfqFile`] served through [`ModelSource`](crate::model_source::ModelSource)
+/// with a materialized [`TensorInfo`](crate::model_source::TensorInfo) index.
+pub struct HfqModelSource {
+    hfq: HfqFile,
+    infos: Vec<crate::model_source::TensorInfo>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl HfqModelSource {
+    /// Wrap an owned [`HfqFile`] (the caller reopens the pack). Owning the
+    /// file rather than borrowing it keeps the adapter `Send` (`&HfqFile` is
+    /// not, because of the pread `RefCell`), so a boxed adapter can be held
+    /// by a model type that must itself be `Send`.
+    pub fn from_hfq(hfq: HfqFile) -> Self {
+        let mut index = std::collections::HashMap::with_capacity(hfq.tensor_infos().len());
+        let infos = hfq
+            .tensor_infos()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                index.insert(t.name.clone(), i);
+                crate::model_source::TensorInfo {
+                    name: t.name.clone(),
+                    dtype: quant_type_to_dtype(t.quant_type).to_string(),
+                    shape: t.shape.iter().map(|&s| s as usize).collect(),
+                    quant_type: t.quant_type,
+                    data_offset: t.data_offset,
+                    data_size: t.data_size,
+                }
+            })
+            .collect();
+        Self { hfq, infos, index }
+    }
+}
+
+impl crate::model_source::ModelSource for HfqModelSource {
+    fn metadata_json(&self) -> &str {
+        &self.hfq.metadata_json
+    }
+
+    fn arch_id(&self) -> u32 {
+        self.hfq.arch_id
+    }
+
+    fn quant_config(&self) -> Option<&crate::model_source::QuantConfig> {
+        None // HFQ files encode quant_type per-tensor
+    }
+
+    fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+        let idx = *self.index.get(name)?;
+        let (_info, bytes) = self.hfq.tensor_data(name)?;
+        Some((&self.infos[idx], bytes))
+    }
+
+    fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
+        self.index.get(name).map(|&i| &self.infos[i])
+    }
+
+    fn tensor_names(&self) -> Vec<&str> {
+        self.hfq.tensor_names()
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.hfq.path()
     }
 }
 
