@@ -27,6 +27,7 @@ payloads fall back to cache then the embedded registry. Pin the bundle with
 | Command | Purpose |
 |---|---|
 | `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
+| `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `<model>-<WxH>-<seed>.png`. |
 | `hipfire chat <model> [--no-color]` | Interactive multi-turn TUI. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
@@ -75,6 +76,27 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--imag
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
 
+### `hipfire img` flags
+
+Run in a fresh daemon process; the prompt is the positional text. `--steps`
+defaults to the model's own default (4 for step-distilled `flux.schnell:1`,
+28 for guidance-distilled `flux.dev:1`).
+
+| Flag | Purpose |
+|---|---|
+| `--width` / `--height` | Latent grid size. Defaults match the reference (1024×1024 unless `--image` is given). |
+| `--steps <n>` | Denoise steps; omit for the architecture default. |
+| `--seed <n>` | Same model + seed → byte-identical PNG. |
+| `--backend <cpu\|gpu>` | Transformer backend; defaults to GPU when available. |
+| `--image <path>` | Reference image (FLUX.2 Klein edit only, arch 45). The CLI reads the file and sends its bytes; the daemon never opens a client-named path. |
+| `--sampler <name>` | `euler` / `flow-match` only. |
+| `--json` | Print the JSON result object instead of just the PNG path. |
+
+Model resolution accepts an HFQ **component pack** (trunk file) — the
+`t5`/`clip`/`vae` sidecar packs are discovered next to it by sibling name
+(`<stem>-t5.hfq` etc., or shared `t5-xxl.hfq` / `clip-l.hfq` / `vae.hfq`).
+`hipfire pull flux.schnell:1` fetches the trunk + all three sidecars at once.
+
 ## Configuration
 
 | Command | Purpose |
@@ -91,6 +113,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 | Command | Purpose |
 |---|---|
 | `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. |
+| `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
 | `hipfire sidecar-gen <model> [flags]` | Build a `.triattn.bin` next to the model (does not pull). |
 
 ### `quantize` (summary)

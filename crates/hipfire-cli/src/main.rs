@@ -126,6 +126,8 @@ pub(crate) enum Commands {
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
+    /// Generate an image (txt2img) through a fresh native daemon process.
+    Img(ImgArgs),
     /// Start an interactive conversation through the native HTTP service.
     Chat(ChatArgs),
     /// Start the native OpenAI-compatible HTTP service.
@@ -408,6 +410,51 @@ struct RunArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(after_help = "NOTE: --image must be given before the prompt words \
+    (e.g. `hipfire img --image a.png --image b.png my-flux2-klein-pipe edit this photo`); \
+    the prompt is a greedy trailing positional and swallows anything after it.")]
+struct ImgArgs {
+    /// Model tag, alias, filename, or path to an HFQ trunk pack
+    /// (`<base>-transformer.hfq`, with its sidecar packs next to it).
+    model: String,
+    /// Prompt words. Quote the prompt to preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    prompt: Vec<String>,
+    /// Reference image for FLUX.2 Klein edit (repeatable, up to 4). Requires
+    /// an arch-45 pipe; a FLUX.1 pipe refuses reference images.
+    #[arg(long = "image", value_name = "PATH")]
+    image: Vec<PathBuf>,
+    /// Output PNG path (default: hipfire-<seed>.png in the working directory).
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+    /// Pixel width (must be divisible by the VAE compression factor). Defaults
+    /// to 1024 when no `--image` is given; with `--image`, defaults to the
+    /// reference image's own size.
+    #[arg(long)]
+    width: Option<u64>,
+    /// Pixel height (must be divisible by the VAE compression factor).
+    /// Defaults to 1024 when no `--image` is given; with `--image`, defaults
+    /// to the reference image's own size.
+    #[arg(long)]
+    height: Option<u64>,
+    /// Denoise steps; defaults to the model's architecture default (4 for
+    /// step-distilled schnell, 28 for guidance-distilled dev).
+    #[arg(long)]
+    steps: Option<u64>,
+    /// Noise seed; same seed → byte-identical PNG.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Execution backend for the transformer forward: `gpu` (the HIP MMDiT
+    /// forward) or `cpu` (the f32 reference oracle). Defaults to `gpu` when
+    /// a GPU is available, else `cpu`.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Emit one JSON result object instead of the progress lines.
+    #[arg(short = 'j', long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct ChatArgs {
     /// Model tag, alias, filename, or local catalog identity.
     model: Option<String>,
@@ -654,6 +701,7 @@ fn run() -> Result<()> {
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
+        Some(Commands::Img(args)) => img_command(&paths, args),
         Some(Commands::Chat(args)) => chat_command(&paths, args),
         Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
@@ -1618,6 +1666,9 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("TriAttention", entry.triattn.as_ref()),
         ("MTP", entry.mtp.as_ref()),
         ("DSpark", entry.dspark.as_ref()),
+        ("T5", entry.t5.as_ref()),
+        ("CLIP", entry.clip.as_ref()),
+        ("VAE", entry.vae.as_ref()),
     ] {
         let Some(sidecar) = sidecar else {
             continue;
@@ -1779,11 +1830,18 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
     let mut targets = BTreeSet::from([path.clone()]);
     if let Some((_, entry)) = resolved {
         targets.extend(
-            [&entry.triattn, &entry.mtp, &entry.dspark]
-                .into_iter()
-                .flatten()
-                .map(|sidecar| paths.models.join(&sidecar.file))
-                .filter(|path| path.is_file()),
+            [
+                &entry.triattn,
+                &entry.mtp,
+                &entry.dspark,
+                &entry.t5,
+                &entry.clip,
+                &entry.vae,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar| paths.models.join(&sidecar.file))
+            .filter(|path| path.is_file()),
         );
     }
     if let (Some(parent), Some(file)) = (
@@ -2085,6 +2143,203 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         println!();
     }
     let _ = engine.unload();
+    Ok(())
+}
+
+/// Default `hipfire img --backend`: `"gpu"` when a GPU is available
+/// (`rdna_compute::Gpu::init()` succeeds), else `"cpu"`. Probed once per
+/// process and cached — never re-probes the GPU per invocation. An explicit
+/// `--backend` always overrides this default. A failed probe prints one
+/// stderr line with the underlying HIP error so a fixable driver problem
+/// isn't silently mistaken for "no GPU present".
+fn default_img_backend() -> &'static str {
+    static GPU_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_AVAILABLE.get_or_init(|| match rdna_compute::Gpu::init() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "hipfire: no GPU detected ({} [code {}]); defaulting --backend to cpu \
+                 (run `hipfire diag` for a full environment report if a GPU should be present)",
+                e.message, e.code
+            );
+            false
+        }
+    }) {
+        "gpu"
+    } else {
+        "cpu"
+    }
+}
+
+/// `hipfire img <model> <prompt…>`: one-shot txt2img through a fresh native
+/// daemon process. Mirrors `run`'s model resolution and
+/// local-spawn posture; prints per-step progress to stderr, writes the PNG,
+/// prints its path (or the JSON result object with `--json`).
+fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
+    if args.steps.is_some_and(|s| s == 0 || s > 128) {
+        bail!("--steps must be between 1 and 128 (omit for the model default)");
+    }
+    let backend = args
+        .backend
+        .clone()
+        .unwrap_or_else(|| default_img_backend().to_owned());
+    if backend != "cpu" && backend != "gpu" {
+        bail!("--backend must be \"cpu\" or \"gpu\", got {:?}", backend);
+    }
+    for (name, v) in [("--width", args.width), ("--height", args.height)] {
+        if let Some(v) = v {
+            if v == 0 || v > 8192 {
+                bail!("{name} must be between 1 and 8192");
+            }
+        }
+    }
+    if args.image.len() > 4 {
+        bail!("at most 4 --image references (got {})", args.image.len());
+    }
+    // Width/height default to 1024 only for plain txt2img (no reference
+    // images); a reference edit leaves them unset so the daemon defaults to
+    // the reference image's own size.
+    let (width, height) = if args.image.is_empty() {
+        (
+            Some(args.width.unwrap_or(1024)),
+            Some(args.height.unwrap_or(1024)),
+        )
+    } else {
+        (args.width, args.height)
+    };
+    // The CLI reads the reference files itself and ships their bytes; the
+    // daemon never opens a client-named path.
+    let images = args
+        .image
+        .iter()
+        .map(|p| {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--image {}: cannot read file", p.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    let prompt = if args.prompt.is_empty() {
+        "a tiny cat sitting on a tiny table".to_owned()
+    } else {
+        args.prompt.join(" ")
+    };
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    let (canonical, entry) = registry
+        .model(&args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let mut model_path = find_model_path(paths, registry, &args.model);
+    if model_path.is_none() {
+        if let Some(entry) = entry {
+            eprintln!(
+                "Model not found locally. Pulling {}...",
+                canonical.as_deref().unwrap_or(&args.model)
+            );
+            pull_command(
+                paths,
+                PullArgs {
+                    model: args.model.clone(),
+                    force: false,
+                },
+            )?;
+            model_path = Some(paths.models.join(&entry.file));
+        }
+    }
+    let model_path = model_path.ok_or_else(|| {
+        if std::path::Path::new(&args.model).is_dir() {
+            anyhow!(
+                "model not found: {0} is a directory; a diffusers pipe is not a model — pack it \
+                 with `hipfire-quantize --flux-pipe {0} --output <base>.hfq` and pass \
+                 `<base>-transformer.hfq`",
+                args.model
+            )
+        } else {
+            anyhow!("model not found: {}", args.model)
+        }
+    })?;
+    let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    engine.ping()?;
+    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+    let mut request = serde_json::json!({
+        "type": "img_generate",
+        "id": "img",
+        "prompt": prompt,
+        "seed": args.seed,
+        "backend": backend,
+    });
+    // Absent means the architecture default; the daemon refuses an explicit 0.
+    if let Some(s) = args.steps {
+        request["steps"] = serde_json::json!(s);
+    }
+    if let Some(w) = width {
+        request["width"] = serde_json::json!(w);
+    }
+    if let Some(h) = height {
+        request["height"] = serde_json::json!(h);
+    }
+    if !images.is_empty() {
+        request["images"] = serde_json::json!(images);
+    }
+    let mut progress = 0u64;
+    let done = engine.img_generate(&request, |event| {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("img_progress") {
+            let step = event
+                .get("step")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let total = event
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if !args.json && step > progress {
+                eprintln!("[img] step {step}/{total}");
+                progress = step;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = engine.unload();
+    let png_b64 = done
+        .get("png_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("daemon img_done missing png_b64"))?;
+    let png = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .context("daemon returned invalid base64 PNG")?
+    };
+    let out_path = args.out.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("hipfire-{}.png", args.seed))
+    });
+    std::fs::write(&out_path, &png)
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "path": out_path,
+                "bytes": png.len(),
+                "width": done.get("width").and_then(serde_json::Value::as_u64),
+                "height": done.get("height").and_then(serde_json::Value::as_u64),
+                "steps": done.get("steps").and_then(serde_json::Value::as_u64),
+                "seed": done.get("seed").and_then(serde_json::Value::as_u64),
+                "ms": done.get("ms").and_then(serde_json::Value::as_u64),
+                "model": done.get("model"),
+            }))?
+        );
+    } else {
+        println!("{}", out_path.display());
+    }
     Ok(())
 }
 

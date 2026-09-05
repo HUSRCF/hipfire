@@ -39,6 +39,7 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 
 # All arch crates — unconditional, no features.
 

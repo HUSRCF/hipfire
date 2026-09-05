@@ -663,6 +663,78 @@ impl Engine {
         Ok(response)
     }
 
+    /// Image generation request: send `img_generate`, surface every
+    /// `img_progress` event through `event`, and return the terminal
+    /// `img_done` value. Mirrors the control-channel discipline of
+    /// [`Engine::load`] — one persistent channel for the whole transaction,
+    /// so progress lines emitted between receives are never dropped.
+    pub fn img_generate(
+        &self,
+        request: &Value,
+        mut event: impl FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ClientError::Protocol("img_generate request missing id".into()))?
+            .to_owned();
+        let (tx, rx) = mpsc::channel();
+        // Two routing classes share this one channel:
+        // - `img_progress` / `img_done` are non-lifecycle and the reader
+        //   delivers them on the control slot, so register `tx` there.
+        // - the daemon's img_generate refusals are `error` lifecycle events
+        //   carrying (id, attempt_id=0); the reader routes those into the
+        //   `pending` map, and without a registration here they would be
+        //   quarantined and this transaction would hang forever.
+        let key = (request_id.clone(), 0u64);
+        {
+            let mut map = self.inner.dispatch.pending.lock().unwrap();
+            if map.contains_key(&key) {
+                return Err(ClientError::Protocol(format!(
+                    "duplicate live img_generate id={request_id} attempt_id=0"
+                )));
+            }
+            map.insert(key.clone(), tx.clone());
+        }
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let send_res = self.send(request);
+        if let Err(e) = send_res {
+            *self.inner.dispatch.control.lock().unwrap() = None;
+            self.inner.dispatch.pending.lock().unwrap().remove(&key);
+            return Err(e);
+        }
+        loop {
+            let response = match self.recv_control(&rx) {
+                Ok(v) => v,
+                Err(e) => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Err(e);
+                }
+            };
+            match response.get("type").and_then(Value::as_str) {
+                Some("img_done") => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Ok(response);
+                }
+                Some("error") => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Err(daemon_error_from_value(&response));
+                }
+                _ => {
+                    if let Err(e) = event(&response) {
+                        *self.inner.dispatch.control.lock().unwrap() = None;
+                        self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn generate(
         &self,
         request: &Value,
