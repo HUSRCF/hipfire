@@ -22,6 +22,7 @@
 //!   ← {"type":"unloaded"}
 
 use base64::Engine;
+use hipfire_config::developer_var;
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -494,7 +495,7 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_env("HIPFIRE_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("off"));
-    let json = hipfire_config::developer_var("HIPFIRE_LOG_FORMAT")
+    let json = developer_var("HIPFIRE_LOG_FORMAT")
         .map(|value| value.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
 
@@ -1134,7 +1135,7 @@ fn main() {
                 // serve prewarm / HTTP-reload path has no --model-draft flag):
                 // non-empty → wins over params.draft; explicitly EMPTY → opt out
                 // of draft loading entirely; unset → params.draft as before.
-                let env_draft = hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT").ok();
+                let env_draft = developer_var("HIPFIRE_DFLASH_DRAFT").ok();
                 let raw_draft: Option<String> = match env_draft.as_deref() {
                     Some("") => None,
                     Some(p) => Some(p.to_string()),
@@ -1517,10 +1518,7 @@ fn main() {
                         continue;
                     }
                     if draft_path.is_some()
-                        && hipfire_config::developer_var("HIPFIRE_PP_DFLASH")
-                            .ok()
-                            .as_deref()
-                            != Some("1")
+                        && developer_var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
                         emit_uncorrelated_error(&mut stdout, None, "DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap.", "unsupported", false, false);
                         let _ = stdout.flush();
@@ -1532,10 +1530,7 @@ fn main() {
                         continue;
                     }
                     if (pflash_drafter.is_some() || pflash_mode_str != "off")
-                        && hipfire_config::developer_var("HIPFIRE_PP_PFLASH")
-                            .ok()
-                            .as_deref()
-                            != Some("1")
+                        && developer_var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
                     {
                         emit_uncorrelated_error(&mut stdout, None, "PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap", "unsupported", false, false);
                         let _ = stdout.flush();
@@ -1838,9 +1833,7 @@ fn main() {
                         // truly ready, and TTFT measures real prefill alone.
                         //
                         // Default OFF (production daemon load latency unchanged).
-                        if let Ok(secs_str) =
-                            hipfire_config::developer_var("HIPFIRE_DPM_WARMUP_SECS")
-                        {
+                        if let Ok(secs_str) = developer_var("HIPFIRE_DPM_WARMUP_SECS") {
                             if let Ok(secs) = secs_str.parse::<f32>() {
                                 if secs > 0.0 {
                                     if let Err(e) = gpu.dpm_warmup(secs) {
@@ -3355,11 +3348,7 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    {
+                    if developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
                     let ep = hipfire_generate::common::production_fail_closed_rollback(
