@@ -50,7 +50,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--dspark-conf-threshold <f>` | DSpark confidence cutoff in `[0,1]` (qwen3 + deepseek4). |
 | `--system <text>` | System prompt. |
 | `--image <path>` | Vision input (when the model supports it). |
-| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Also on `serve`. |
+| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also on `serve`. |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
 
@@ -76,7 +76,7 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-m
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
-| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. |
+| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). |
 
 ### `hipfire img` flags
 
@@ -195,7 +195,8 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_KV_MODE=...` | Override KV layout. |
 | `HIPFIRE_SPECULATION=...` | Top of speculation ladder. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
-| `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. |
+| `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |
+| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `off` (default) / `auto` / `on`. |
 | `HIPFIRE_DFLASH_MODE=...` | Daemon-side mode (CLI default config is still `off`). |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry. |
 | `HIPFIRE_REGISTRY_URL=...` | Alternate registry URL. |

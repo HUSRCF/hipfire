@@ -450,6 +450,21 @@ fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool 
     load_tp > 1 && !model_present
 }
 
+/// Daemon-side `vision_mode` gate for the tower sidecar path.
+///
+/// `off` (the default) is a hard override that drops even an explicit
+/// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
+/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
+/// ladder result through untouched. Pure string plumbing — no arch or
+/// tensor knowledge; admission still validates the surviving path.
+fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
+    if vision_mode == "off" {
+        None
+    } else {
+        raw_vision
+    }
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -1163,8 +1178,19 @@ fn main() {
                 // unset → `params.vision` as sent. Arch-free string plumbing —
                 // admission validates (arch 5|6, tower tensor present) and the
                 // Qwen35 carrier loads the tower from it.
+                //
+                // `vision_mode=off` (the default) is a hard daemon-side override,
+                // mirroring the `dflash_mode=off` guard above: even an explicit
+                // sidecar is skipped, so a default load never pays the +~1 GB
+                // tower VRAM. CLI-side gating is the primary path; this guard
+                // makes the flag durable for non-hipfire-CLI clients.
+                let vision_mode = msg
+                    .get("params")
+                    .and_then(|p| p.get("vision_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("off");
                 let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let vision_path: Option<String> = match env_vision.as_deref() {
+                let raw_vision: Option<String> = match env_vision.as_deref() {
                     Some("") => None,
                     Some(p) => Some(p.to_string()),
                     None => msg
@@ -1174,6 +1200,14 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                if vision_mode == "off" {
+                    if let Some(v) = raw_vision.as_deref() {
+                        eprintln!(
+                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
+                        );
+                    }
+                }
+                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -4316,6 +4350,33 @@ fn main() {
                 );
                 let _ = stdout.flush();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_vision_mode_gate;
+
+    #[test]
+    fn vision_mode_off_drops_even_an_explicit_sidecar() {
+        // Hard override, mirroring the `dflash_mode=off` draft guard: a
+        // default load never pays the tower VRAM, however the path arrived.
+        assert_eq!(
+            apply_vision_mode_gate("off", Some("/models/qwen3.8-27b-vision.hfq".into())),
+            None
+        );
+        assert_eq!(apply_vision_mode_gate("off", None), None);
+    }
+
+    #[test]
+    fn vision_mode_auto_and_on_pass_the_ladder_result_through() {
+        for mode in ["auto", "on"] {
+            assert_eq!(
+                apply_vision_mode_gate(mode, Some("/models/qwen3.8-27b-vision.hfq".into())),
+                Some("/models/qwen3.8-27b-vision.hfq".to_owned())
+            );
+            assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
     }
 }

@@ -131,7 +131,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Notes |
 |---|---|---|
-| `HIPFIRE_VISION_SIDECAR` | explicit vision-tower path (overrides the registry sidecar); empty opts out | Read via `developer_var` (env beats `developer.vision_sidecar`); wired into the daemon load as `params["vision"]`. |
+| `HIPFIRE_VISION_SIDECAR` | explicit vision-tower path (overrides the registry sidecar); empty opts out | Read via `developer_var` (env beats `developer.vision_sidecar`); wired into the daemon load as `params["vision"]`. Skipped while `vision_mode=off`. |
+| `HIPFIRE_VISION_MODE` | tower sidecar gate: `off` (default) / `auto` / `on` | Env-compat for config `vision.mode`; projected into load params as `vision_mode` and enforced daemon-side. |
 
 ### Graph / MMQ / prefill
 
@@ -294,7 +295,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 736
+**Count:** 737
 
 | Variable | Example source path(s) |
 |---|---|
@@ -1043,6 +1044,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/tree_graph_bench.sh |
 | `HIPFIRE_VERSION` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
+| `HIPFIRE_VISION_MODE` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_VISION_SIDECAR` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/serve/mod.rs |
 | `HIPFIRE_VL_DUMP_DIR` | crates/hipfire-runtime/examples/infer.rs |
 | `HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernels.rs |
