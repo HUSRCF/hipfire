@@ -518,29 +518,29 @@ For dataclass benches:
 
 ### Pinned Hugging Face bench fixture
 
-For dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify the
+For dense Qwen3.8-27B MQ4V2/DFlash perf work, do not identify the
 canonical trunk by local filename. Local filenames drift and lookalike
-AWQ/MQ4 files are not comparable.
+MQ4/MQ4V2 files are not comparable.
 
-The canonical trunk is whichever local artifact byte-matches the current
-Hugging Face `.mq4` artifact:
+The canonical dense trunk is whichever local artifact byte-matches
+`qwen3.8-27b.mq4-xt` from HF repo `hipfire-models/qwen3.8-27b`
+(registry tag `qwen3.8:27b-mq4-xt`):
 
-- HF repo: `hipfire-models/qwen3.6-27b` (moved from `schuttdev/hipfire-qwen3.6-27b`
-  on 2026-08-14; HF redirects the old path, and the commit/digest pins below are
-  unchanged by the move)
-- HF file: `qwen3.6-27b.mq4`
-- HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
-- File size: `14984158208`
-- SHA-256 / HF `x-linked-etag`:
-  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`
+- HF repo: `hipfire-models/qwen3.8-27b`
+- HF / local file: `qwen3.8-27b.mq4-xt`
+- File size: `14980361216`
+- SHA-256: `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`
+- Paired draft (measured with the canonical fixture identity):
+  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
+  (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
-Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
-trunk with `sha256sum` and require the digest above. If Hugging Face has
-published a newer `.mq4`, refresh the HF headers first and pin the new
-`x-linked-etag`/size in the report.
+Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
+trunk with `sha256sum` and require the digest above. Reports that use a
+trunk with a different digest are not comparable and should be discarded.
 
-Reports that use a trunk with a different digest are not comparable and
-should be discarded.
+Historical: the prior dense pin was Qwen3.6-27B
+(`hipfire-models/qwen3.6-27b` / `qwen3.6-27b.mq4`, size `14984158208`,
+sha256 `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`).
 
 ### Pinned A3B MoE DFlash fixtures
 
