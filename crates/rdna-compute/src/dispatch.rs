@@ -1061,8 +1061,7 @@ impl Gpu {
     /// Poll interval for [`Self::sync_with_deadline`]: 2 ms. Coarse enough
     /// never to spin a core, fine-grained enough for a deadline measured in
     /// seconds.
-    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration =
-        std::time::Duration::from_millis(2);
+    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
     /// Bounded stream sync: record a completion event on this `Gpu`'s stream
     /// (or the null stream) and poll `hipEventQuery` until it completes or
@@ -1218,6 +1217,12 @@ impl Gpu {
         // `gfx10-1-generic` (covers Navi 10/12/14) without per-arch JIT
         // cache fragmentation. Empty / unset preserves prior behavior.
         let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        // Record the DETECTED (not compile-target-overridden) arch for
+        // config-time policy that runs without a Gpu handle in hand — the
+        // kv_slots memory preflight resolves its auto mode (unified-memory
+        // APU vs discrete GPU) from physical topology, which a
+        // HIPFIRE_TARGET_ARCH override does not change.
+        crate::arch_caps::note_process_gpu_arch(&detected_arch);
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -2340,7 +2345,10 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        let result: HipResult<()> = if record || self.graphs.capture_mode || self.flags.force_blob_path {
+        let result: HipResult<()> = if record
+            || self.graphs.capture_mode
+            || self.flags.force_blob_path
+        {
             let mut blob = blob_builder();
             blob.pad_to(16);
             if record {
@@ -4835,12 +4843,12 @@ impl Drop for Gpu {
 mod tests {
     use super::gen_fwht_signs;
     use super::DType;
+    use super::Gpu;
     use super::HessianCapture;
     use super::MQ2G256V2_GROUP_BYTES;
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
-    use super::Gpu;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -5326,10 +5334,7 @@ mod tests {
     fn deadline_error_names_last_kernel() {
         // Constructor-level pin; the timeout path itself is driven below
         // through `poll_until_ready` with a stubbed query.
-        let e = Gpu::deadline_exceeded(
-            Some("gemv_hfq4g256"),
-            std::time::Duration::from_secs(5),
-        );
+        let e = Gpu::deadline_exceeded(Some("gemv_hfq4g256"), std::time::Duration::from_secs(5));
         let s = e.to_string();
         assert!(s.contains("gemv_hfq4g256"), "names the kernel: {s}");
         assert!(s.contains("5s"), "names the deadline: {s}");
@@ -5377,11 +5382,9 @@ mod tests {
     #[test]
     fn poll_propagates_query_errors() {
         // A real query failure (bad handle, lost device) is not "not ready".
-        let err = Gpu::poll_until_ready(
-            std::time::Duration::from_secs(5),
-            Some("k"),
-            || Err(hip_bridge::HipError::new(999, "boom")),
-        )
+        let err = Gpu::poll_until_ready(std::time::Duration::from_secs(5), Some("k"), || {
+            Err(hip_bridge::HipError::new(999, "boom"))
+        })
         .expect_err("query errors must propagate");
         assert!(err.to_string().contains("boom"), "{err}");
     }
