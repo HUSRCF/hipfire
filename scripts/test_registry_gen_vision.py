@@ -38,14 +38,17 @@ def _tiers(models: dict) -> dict:
 def test_every_qwen38_27b_tier_declares_the_shared_vision_file():
     models = _tiers(_curated()["models"])
     assert len(models) > 0, "expected qwen3.8:27b* tiers in curated models"
+    digests = set()
     for tag, entry in models.items():
         vision = entry.get("vision")
         assert isinstance(vision, dict), f"{tag} must declare a vision slot"
         assert vision.get("file") == VISION_FILE, f"{tag} must share {VISION_FILE}"
-        assert set(vision) == {"file"}, (
-            f"{tag}: vision slot carries only the file until the pack ships "
-            f"(sha256/size_bytes are filled after packing)"
-        )
+        assert set(vision) == {"file", "sha256", "size_bytes"}, f"{tag}: vision slot must be digest-pinned"
+        digests.add((vision["sha256"], vision["size_bytes"]))
+    # One physical pack serves every tier: the pins must agree, or `pull` for
+    # one tier would verify a different file than `rm`'s shared-keeper logic
+    # protects for another.
+    assert len(digests) == 1, f"qwen3.8 tiers disagree on the vision pack digest: {digests}"
 
 
 def test_annotate_sidecar_resolves_vision_digest_from_tree():

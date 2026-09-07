@@ -739,7 +739,9 @@
         "file": "qwen38-27b-dflash-mq3.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq3": {
@@ -773,7 +775,9 @@
         "file": "qwen38-27b-dflash-mq3.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq3-pro": {
@@ -807,7 +811,9 @@
         "file": "qwen38-27b-dflash-mq3.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq4-xt": {
@@ -841,7 +847,9 @@
         "file": "qwen38-27b-dflash-mq4.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b": {
@@ -875,7 +883,9 @@
         "file": "qwen38-27b-dflash-mq4.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq4-pro": {
@@ -909,7 +919,9 @@
         "file": "qwen38-27b-dflash-mq4.hfq"
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5-xt": {
@@ -940,7 +952,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5": {
@@ -971,7 +985,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5-pro": {
@@ -1002,7 +1018,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6-xt": {
@@ -1033,7 +1051,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6": {
@@ -1064,7 +1084,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6-pro": {
@@ -1095,7 +1117,9 @@
         }
       },
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.5:0.8b-mq6": {
@@ -1229,7 +1253,9 @@
       "min_vram_gb": 16,
       "desc": "MQ3 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-draft-mq4": {
@@ -1239,7 +1265,9 @@
       "min_vram_gb": 16,
       "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3–MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available.",
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-draft-mq5": {
@@ -1249,7 +1277,9 @@
       "min_vram_gb": 16,
       "desc": "MQ5 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-draft-mq6": {
@@ -1259,7 +1289,9 @@
       "min_vram_gb": 16,
       "desc": "MQ6 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
       "vision": {
-        "file": "qwen3.8-27b-vision.hfq"
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.5:9b-draft": {
