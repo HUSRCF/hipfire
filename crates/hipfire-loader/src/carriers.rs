@@ -276,7 +276,7 @@ fn load_qwen35_pp(
     // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
     // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
     hfq_file.set_evict_page_cache(
-        std::env::var("HIPFIRE_PAGE_EVICTION")
+        hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
             .ok()
             .map(|v| v != "0")
             .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
@@ -524,7 +524,7 @@ impl Carrier for Qwen35Carrier {
                 // re-read on every load. UMA keeps eviction (default) to
                 // avoid OOM vs hipMalloc staging.
                 hfq_file.set_evict_page_cache(
-                    std::env::var("HIPFIRE_PAGE_EVICTION")
+                    hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
                         .ok()
                         .map(|v| v != "0")
                         .unwrap_or_else(|| ctx.gpu.is_uma()),
@@ -2409,13 +2409,15 @@ impl Carrier for MuseGlimmerCarrier {
                         // Freeze HIPFIRE_GLIMMER_CTX_CAP once at load (daemon/load default
                         // 256). Same value sizes drafter scratch and device hidden log.
                         let ctx_cap = {
-                            let requested = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                                .ok()
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .filter(|v| *v > 0)
-                                .unwrap_or(
-                                    hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
-                                );
+                            let requested = hipfire_config::developer_var(
+                                "HIPFIRE_GLIMMER_CTX_CAP",
+                            )
+                            .ok()
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .filter(|v| *v > 0)
+                            .unwrap_or(
+                                hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
+                            );
                             requested.clamp(1, ctx.max_seq)
                         };
                         let dscratch =
