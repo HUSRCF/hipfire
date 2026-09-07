@@ -104,4 +104,7 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-bypass_total                <= 247
+# Raised 247 -> 257 on the imggen port: the +10 is the new hipfire-arch-diffusion
+# ledger row (arch 40/45 trunk, direct f16 WMMA LDS GEMM + VAE/text-encoder calls,
+# recorded as debt), not growth in any existing crate.
+bypass_total                <= 257
