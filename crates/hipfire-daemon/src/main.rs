@@ -1764,6 +1764,8 @@ fn main() {
                             12 => "north_mini_code",
                             13 => "gemma4",
                             14 => "muse_glimmer",
+                            40 => "flux_mmdit",
+                            45 => "flux2_mmdit",
                             _ => "qwen3",
                         };
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
@@ -2151,6 +2153,22 @@ fn main() {
                         continue;
                     }
                 };
+                // Fail-closed: a diffusion checkpoint trunk
+                // (arch 40 or 45) is a loadable component, never a chat model.
+                // Text generate on it must refuse — not fall through to the
+                // token path with a vocab-0 skeleton tokenizer.
+                if hipfire_loader::img_route(m.arch_id).is_diffusion() {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        "text generate refused: loaded model is a diffusion checkpoint (arch 40/45) — use img_generate",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if let Some(reason) = batch_poisoned.as_ref() {
                     hipfire_generate::dense::emit_active_attempt_error(
                         &mut stdout,
@@ -3537,6 +3555,66 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            // ── Image generation wire ─────────────────
+            // `img_load` is deliberately NOT a separate command: the ordinary
+            // `load` message routes a FLUX trunk pack to the arch-40/45
+            // carrier. Refuse the name so a client typo never silently
+            // no-ops.
+            "img_load" => {
+                emit_uncorrelated_error(
+                    &mut stdout,
+                    msg.get("id").and_then(|v| v.as_str()),
+                    "img_load is not a command: load the pack with {\"type\":\"load\",\"model\":\"<base>-transformer.hfq\"} (arch 40/45), then send img_generate",
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+            }
+
+            "img_generate" => {
+                // Contract: monotonic img_progress 0..steps,
+                // exactly one img_done; fail-closed errors for bad
+                // width/height/steps/seed/sampler and for non-diffusion
+                // loads (the mirror of the text-generate refusal above).
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string();
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id.as_str()),
+                            "no model loaded",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if !hipfire_loader::img_route(m.arch_id).is_diffusion() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        Some(id.as_str()),
+                        "img_generate refused: loaded model is not a diffusion checkpoint (arch 40/45) — use generate",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                // The body lives in hipfire_generate::img so main.rs names
+                // no arch-crate type (keeps daemon_arch_refs at 0).
+                hipfire_generate::img::generate_img(m, &mut gpu, &mut stdout, &id, &msg);
+                let _ = stdout.flush();
+            }
+
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
@@ -3553,6 +3631,8 @@ fn main() {
                         12 => "north_mini_code",
                         13 => "gemma4",
                         14 => "muse_glimmer",
+                        40 => "flux_mmdit",
+                        45 => "flux2_mmdit",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -3647,6 +3727,21 @@ fn main() {
                 // for v1.
                 if m.pp > 1 || m.ep.is_some() {
                     emit_uncorrelated_error(&mut stdout, None, "bench_prefill requires a single-GPU model (pp=1, non-EP); multi-GPU/EP bench not implemented", "unsupported", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                }
+                // Diffusion trunks have no token prefill; the carrier-level
+                // dispatch below would panic on the unimplemented trait
+                // default, so refuse cleanly here.
+                if hipfire_loader::img_route(m.arch_id).is_diffusion() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "bench_prefill unsupported for diffusion checkpoints (arch 40/45)",
+                        "unsupported",
+                        false,
+                        false,
+                    );
                     let _ = stdout.flush();
                     continue;
                 }

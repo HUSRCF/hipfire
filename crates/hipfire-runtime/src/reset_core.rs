@@ -211,6 +211,35 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "maple not a serve-hardening retry candidate yet",
         },
     };
+    // Image-gen component (arch 40): never a text retry candidate.
+    const FLUX: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "flux",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "flux is an image-gen component — never a text retry candidate",
+        },
+    };
+    // Image-gen component (arch 45): FLUX.2 Klein, never a text retry
+    // candidate.
+    const FLUX2: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "flux2",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "flux2 is an image-gen component — never a text retry candidate",
+        },
+    };
     &[
         QWEN35,
         DEEPSEEK4,
@@ -223,6 +252,8 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         GEMMA4,
         MUSE_GLIMMER,
         MAPLE,
+        FLUX,
+        FLUX2,
     ]
 }
 
@@ -521,6 +552,8 @@ mod tests {
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
+                40 => Some("flux"),
+                45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry
                 // candidates and have no inventory row.
                 22 | 23 => None,

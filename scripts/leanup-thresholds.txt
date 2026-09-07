@@ -31,7 +31,7 @@ required_features_daemon    == 0
 # G2 block (28 net lines once the DS4 tp>1 refusal moved before admission)
 # with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
 # (351c326e0). See commit message.
-daemon_lines                <= 4208
+daemon_lines                <= 4303
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -100,4 +100,4 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-bypass_total                <= 247
+bypass_total                <= 257

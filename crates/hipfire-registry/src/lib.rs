@@ -187,6 +187,21 @@ pub struct ModelEntry {
     pub mtp: Option<Sidecar>,
     #[serde(default)]
     pub dspark: Option<Sidecar>,
+    // Image-generation component sidecars (arch 40+ trunks, see
+    // docs/architecture-ids.md — ids provisional until the HFQM pack ships).
+    // `t5` is the T5-XXL text-encoder component (sidecar arch 41), `clip` the
+    // CLIP-L pooled-text encoder (arch 42), `vae` the VAE decoder (arch 43).
+    // Shared across FLUX.1 entries; a FLUX.2 Klein entry uses `qwen3` (its
+    // Qwen3 text encoder, arch 45) plus the shared `vae` instead of
+    // `t5`/`clip`.
+    #[serde(default)]
+    pub t5: Option<Sidecar>,
+    #[serde(default)]
+    pub clip: Option<Sidecar>,
+    #[serde(default)]
+    pub qwen3: Option<Sidecar>,
+    #[serde(default)]
+    pub vae: Option<Sidecar>,
     #[serde(default)]
     pub dflash: Option<Sidecar>,
     #[serde(default)]
@@ -366,9 +381,18 @@ impl RegistryV1 {
                 return Err(fail(format!("model '{tag}' has invalid size metadata")));
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
-            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark, &entry.dflash]
-                .into_iter()
-                .flatten()
+            for sidecar in [
+                &entry.triattn,
+                &entry.mtp,
+                &entry.dspark,
+                &entry.dflash,
+                &entry.t5,
+                &entry.clip,
+                &entry.qwen3,
+                &entry.vae,
+            ]
+            .into_iter()
+            .flatten()
             {
                 if sidecar.file.trim().is_empty() {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
@@ -751,7 +775,10 @@ mod tests {
             let (resolved, fast) = registry
                 .model(alias)
                 .unwrap_or_else(|| panic!("{alias} must resolve"));
-            assert_eq!(resolved, "ornith-1.5:35b-a3b-mq4r", "{alias} is the MQ4R speed SKU");
+            assert_eq!(
+                resolved, "ornith-1.5:35b-a3b-mq4r",
+                "{alias} is the MQ4R speed SKU"
+            );
             assert_eq!(fast.file, "ornith-1.5-35b-a3b.mq4r");
         }
         assert_eq!(model.file, "ornith-1.5-35b-a3b.mq4r");
@@ -1110,7 +1137,9 @@ mod tests {
             registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq4"),
             "/home/u/.hipfire/models/qwen3.8-27b.mq4"
         );
-        assert!(registry.model("/home/u/.hipfire/models/qwen3.8-27b.mq4").is_none());
+        assert!(registry
+            .model("/home/u/.hipfire/models/qwen3.8-27b.mq4")
+            .is_none());
 
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
@@ -1204,12 +1233,13 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (tag, _) = registry.entry_for_file("qwen3.6-27b.mq4").unwrap();
         assert_eq!(tag, "qwen3.6:27b");
-        assert!(registry.entry_for_file("/elsewhere/qwen3.6-27b.mq4").is_none());
+        assert!(registry
+            .entry_for_file("/elsewhere/qwen3.6-27b.mq4")
+            .is_none());
         assert!(registry.entry_for_file("qwen3.6:27b").is_none());
         assert!(registry.entry_for_file("qwen36").is_none());
         assert!(registry.entry_for_file("other.mq4").is_none());
     }
-
 
     #[test]
     fn recommended_settings_lower_the_full_sampling_contract_to_config() {

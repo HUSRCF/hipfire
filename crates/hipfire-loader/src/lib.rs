@@ -274,6 +274,39 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     }
 }
 
+/// Image-generation route: diffusion checkpoint trunks are
+/// loadable components that must NEVER ride the text `generate` path, and
+/// text models must never ride `img_generate`. The daemon consults this in
+/// both directions as the fail-closed gate (the same posture as the `toy`
+/// 0xFF rule and the VL `has_image` gate above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImgRoute {
+    /// FLUX.1 MMDiT pipe (arch 40) — `img_generate` dispatches the CPU
+    /// pipeline through the `FluxPipeModel` bundle.
+    Flux,
+    /// FLUX.2 Klein MMDiT pipe (arch 45) — `img_generate` dispatches the CPU
+    /// pipeline through the same `FluxPipeModel` bundle, plus reference-image
+    /// edit via `images[]`.
+    Flux2,
+    None,
+}
+impl ImgRoute {
+    /// True for any diffusion image-gen route (`Flux`/`Flux2`); false for
+    /// `None`. The daemon's text-generate and bench_prefill gates use this so
+    /// a new diffusion family is refused by construction rather than by an
+    /// enumerated arch-id list that can drift.
+    pub fn is_diffusion(&self) -> bool {
+        !matches!(self, ImgRoute::None)
+    }
+}
+pub fn img_route(arch_id: u32) -> ImgRoute {
+    match arch_id {
+        40 => ImgRoute::Flux,
+        45 => ImgRoute::Flux2,
+        _ => ImgRoute::None,
+    }
+}
+
 /// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
 /// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +369,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MapleCarrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
+    &FluxDiffusionCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -1226,6 +1260,24 @@ impl LoadedModel {
             (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
         })
     }
+
+    /// FLUX diffusion pipe bundle (arch 40) — the `img_generate` body's
+    /// handle. `None` for every text/vision model (paired with
+    /// [`img_route`] as the fail-closed gate).
+    pub fn flux_pipe(&self) -> Option<&hipfire_arch_diffusion::arch_model::FluxPipeModel> {
+        self.state.as_deref().and_then(|s| {
+            (s as &dyn Any).downcast_ref::<hipfire_arch_diffusion::arch_model::FluxPipeModel>()
+        })
+    }
+
+    pub fn flux_pipe_mut(
+        &mut self,
+    ) -> Option<&mut hipfire_arch_diffusion::arch_model::FluxPipeModel> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_diffusion::arch_model::FluxPipeModel>()
+        })
+    }
+
     /// Arch-agnostic view of the loaded model, when any is loaded.
     pub fn as_arch_model(&self) -> Option<&dyn hipfire_runtime::arch_model::ArchModel> {
         self.state
@@ -4172,6 +4224,10 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (40, false, "flux"),
+            (40, true, "flux"),
+            (45, false, "flux"),
+            (45, true, "flux"),
         ];
         for &(id, is_dir, want) in cases {
             let got: Vec<&str> = REGISTRY
@@ -4326,8 +4382,9 @@ mod registry_tests {
     fn caps_and_route_tables_are_pinned() {
         use super::{
             bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
-            generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
-            EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
+            generation_early_route, img_route, vision_route, BenchDecodeRoute,
+            ContinuousBatchRoute, EpEosRoute, EpPromptRoute, GenerationEarlyRoute, ImgRoute,
+            VisionRoute,
         };
         use saddle_core::caps::{ArchCaps, DflashKind, ReasoningContract};
 
@@ -4450,6 +4507,19 @@ mod registry_tests {
                 _ => VisionRoute::None,
             };
             assert_eq!(vision_route(id), want, "vision_route({id})");
+        }
+
+        // ── img_route: exactly 40 -> Flux, 45 -> Flux2; every text/vision
+        // arch (and the toy sentinel) stays None, pinning the fail-closed
+        // gate in both directions (text generate refuses 40/45,
+        // img_generate refuses everything else). ──
+        for id in (0u32..=14).chain([20, 40, 45, 22, 0xFF]) {
+            let want = match id {
+                40 => ImgRoute::Flux,
+                45 => ImgRoute::Flux2,
+                _ => ImgRoute::None,
+            };
+            assert_eq!(img_route(id), want, "img_route({id})");
         }
 
         // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──

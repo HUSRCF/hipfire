@@ -62,6 +62,27 @@ Research / reserved formats require explicit opt-in on the binary:
 | `--allow-mq3-lloyd` | `mq3-lloyd` |
 | `--allow-mq4-lloyd` | `mq4-lloyd` |
 
+### FLUX component packs (no quantization)
+
+`--flux-pipe` does not quantize — it *re-containers* a diffusers FLUX.1 or
+FLUX.2 Klein pipe into per-component HFQ files with the dtype policy the
+diffusion loaders dispatch on. The packs are the only form the daemon loads; a
+pipe directory is the packer's input, never a model path:
+
+```bash
+hipfire-quantize --flux-pipe <pipe_dir> --output <base>.hfq
+#   <base>-transformer.hfq   arch 40  (F16 weights / F32 bias+scale)
+#   <base>-t5.hfq            arch 41  (T5-XXL; shared across variants)
+#   <base>-clip.hfq          arch 42  (CLIP-L)
+#   <base>-vae.hfq           arch 43  (shared across variants)
+hipfire-quantize --flux-pipe <pipe_dir> --output t5-xxl.hfq --flux-component t5
+```
+
+The family is detected from `transformer/config.json`. A FLUX.2 (Klein) pipe
+packs as `<base>-transformer.hfq` (arch 45), `<base>-qwen3.hfq` (arch 46, the
+Qwen3 text encoder) and `<base>-vae.hfq` (arch 43). Component ids:
+`docs/architecture-ids.md` § Image-generation component ids.
+
 ## From HuggingFace
 
 ```bash

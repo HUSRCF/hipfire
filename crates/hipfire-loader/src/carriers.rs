@@ -2548,6 +2548,178 @@ impl Carrier for MuseGlimmerCarrier {
     }
 }
 
+// ─── FluxDiffusionCarrier (arch 40 FLUX.1 / arch 45 FLUX.2 Klein) ──────
+//
+// Image-generation COMPONENT carrier: loads the HFQ component packs that
+// `hipfire-quantize --flux-pipe` writes (the trunk plus its sidecars, found
+// next to it by name) into a `FluxPipeModel`. A diffusers pipe directory is
+// the packer's input, not a model — it is refused by name. The daemon must
+// never text-generate on the result; `img_route` in lib.rs is the
+// fail-closed gate in both directions.
+
+pub struct FluxDiffusionCarrier;
+impl Carrier for FluxDiffusionCarrier {
+    fn name(&self) -> &'static str {
+        "flux"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 40 || arch_id == 45
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        use hipfire_arch_diffusion::pipeline::HfqSidecars;
+
+        let hfq = match &src {
+            ModelSource::Hfq(hfq) => hfq,
+            ModelSource::Dir(source) => {
+                return Err(format!(
+                    "flux (arch 40/45): {} is a diffusers pipe directory, which is not \
+                     loadable; pack it with `hipfire-quantize --flux-pipe <pipe_dir> \
+                     --output <base>.hfq` and load `<base>-transformer.hfq`",
+                    source.path().display()
+                ));
+            }
+        };
+        // The trunk pack (arch 40 or 45) plus the sidecar packs the packer
+        // wrote next to it: `<base>-t5.hfq` / `<base>-clip.hfq` / `<base>-vae.hfq`
+        // for FLUX.1, `<base>-qwen3.hfq` / `<base>-vae.hfq` for FLUX.2 Klein,
+        // when the trunk is `<base>-transformer.hfq`. The shared names the
+        // registry sidecar slots land under (`t5-xxl.hfq` / `clip-l.hfq` /
+        // `qwen3.hfq` / `vae.hfq`) are accepted too, so one T5 and one VAE
+        // serve both schnell and dev.
+        let arch_id = hfq.arch_id;
+        let trunk_path = hfq.path().to_path_buf();
+        let reopen = |p: &std::path::Path| -> Result<hipfire_runtime::hfq::HfqFile, String> {
+            hipfire_runtime::hfq::HfqFile::open(p)
+                .map_err(|e| format!("flux (HFQ): reopen {}: {e}", p.display()))
+        };
+        let file = trunk_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let stem = trunk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file);
+        let base = stem.strip_suffix("-transformer").unwrap_or(stem);
+        let find = |candidates: &[String]| -> Option<std::path::PathBuf> {
+            candidates
+                .iter()
+                .map(|n| trunk_path.with_file_name(n))
+                .find(|p| p.is_file())
+        };
+        let vae_names = [format!("{base}-vae.hfq"), "vae.hfq".into()];
+        let Some(vae_path) = find(&vae_names) else {
+            return Err(format!(
+                "flux (HFQ): {file} needs the vae sidecar pack next to it \
+                 (tried {base}-vae.hfq and the shared vae.hfq)"
+            ));
+        };
+        let sidecars = match arch_id {
+            40 => {
+                let t5_names = [
+                    format!("{base}-t5.hfq"),
+                    "t5-xxl.hfq".into(),
+                    "t5.hfq".into(),
+                ];
+                let clip_names = [
+                    format!("{base}-clip.hfq"),
+                    "clip-l.hfq".into(),
+                    "clip.hfq".into(),
+                ];
+                let (Some(t5_path), Some(clip_path)) = (find(&t5_names), find(&clip_names)) else {
+                    return Err(format!(
+                        "flux (HFQ): {file} needs the t5 and clip sidecar packs next to it \
+                         (tried {base}-t5.hfq, {base}-clip.hfq and the shared t5-xxl.hfq / \
+                         clip-l.hfq)"
+                    ));
+                };
+                HfqSidecars::Flux1 {
+                    t5: reopen(&t5_path)?,
+                    clip: reopen(&clip_path)?,
+                    vae: reopen(&vae_path)?,
+                }
+            }
+            45 => {
+                let qwen3_names = [format!("{base}-qwen3.hfq"), "qwen3.hfq".into()];
+                let Some(qwen3_path) = find(&qwen3_names) else {
+                    return Err(format!(
+                        "flux (HFQ): {file} needs the qwen3 sidecar pack next to it \
+                         (tried {base}-qwen3.hfq and the shared qwen3.hfq)"
+                    ));
+                };
+                HfqSidecars::Flux2 {
+                    qwen3: reopen(&qwen3_path)?,
+                    vae: reopen(&vae_path)?,
+                }
+            }
+            other => return Err(format!(
+                "flux (HFQ): arch {other} is not a FLUX trunk pack (40 FLUX.1 / 45 FLUX.2 Klein)"
+            )),
+        };
+        // Reopen the trunk fresh: the loader's copy may have been prepared
+        // (mmap dropped) for a UMA device, and the streaming load needs the
+        // mapping alive for its whole run.
+        let bundle =
+            hipfire_arch_diffusion::pipeline::load_pipe_hfq(reopen(&trunk_path)?, sidecars)?;
+        // Skeleton tokenizer for the `LoadedModel` contract. The img path
+        // never encodes through it (the bundle's own tokenizers do the
+        // conditioning; text `generate` refuses arch 40/45), so any parseable
+        // vocab satisfies the field: the embedded CLIP `vocab.json` (FLUX.1)
+        // or the embedded Qwen3 `tokenizer.json` (Klein), else a minimal
+        // one-token vocab. No panic: fail closed as an error.
+        let skeleton_tokenizer = {
+            let meta: serde_json::Value =
+                serde_json::from_str(hfq.metadata_json()).unwrap_or(serde_json::Value::Null);
+            let tok = meta.get("tokenizer");
+            tok.and_then(|t| t.get("clip_vocab"))
+                .and_then(|vocab| {
+                    let blob = serde_json::json!({ "model": { "vocab": vocab } });
+                    hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&blob.to_string()).ok()
+                })
+                .or_else(|| {
+                    tok.and_then(|t| t.get("qwen"))
+                        .and_then(|q| q.as_str())
+                        .and_then(|q| hipfire_runtime::tokenizer::Tokenizer::from_hf_json(q).ok())
+                })
+                .or_else(|| {
+                    hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
+                        r#"{"model":{"vocab":{"<pad>":0}}}"#,
+                    )
+                    .ok()
+                })
+                .ok_or("flux (HFQ): cannot build a skeleton tokenizer from the trunk metadata")?
+        };
+        Ok(LoadedModel {
+            arch_id,
+            state: Some(Box::new(
+                hipfire_arch_diffusion::arch_model::FluxPipeModel { bundle },
+            )),
+            ..LoadedModel::skeleton(
+                arch_id,
+                skeleton_tokenizer,
+                4096,
+                4096,
+                ctx.path.to_string(),
+                None,
+            )
+        })
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        // Component only: no chat capabilities of any kind.
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+}
+
 #[cfg(test)]
 mod gemma4_route_tests {
     use super::{gemma4_use_lowered, gemma4_validate_drafter_route};

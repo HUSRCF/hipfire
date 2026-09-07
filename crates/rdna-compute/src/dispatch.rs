@@ -51,6 +51,11 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// bump — see [`Gpu::is_uma`], the only consumer.
 const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
+/// Process-wide host→device upload counter, read through [`Gpu::htod_uploads`].
+/// Diagnostics only: a per-call constant upload in a hot loop is invisible in a
+/// kernel budget but shows up here.
+static HTOD_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+
 // ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
 // GL = one codebook shared by the whole tensor plus a per-block fp16 scale,
@@ -3256,10 +3261,42 @@ impl Gpu {
     }
 
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, DType::F32)?;
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(tensor)
+    }
+
+    /// Upload host-side **f16 bit patterns** straight into an `F16` tensor.
+    ///
+    /// The counterpart to [`Self::upload_f32`] for callers that already hold
+    /// half-precision words — notably the diffusion weight streamer, which
+    /// converts a checkpoint's BF16 bytes to f16 one tensor at a time and must
+    /// never materialise a whole-model f32 host table. Uploading f32 and
+    /// casting on the device costs 2× the PCIe/fabric traffic plus a transient
+    /// f32 device allocation the size of the tensor; this path costs neither.
+    ///
+    /// `data` is little-endian f16 words, exactly `shape.iter().product()` of
+    /// them.
+    pub fn upload_f16_bits(&mut self, data: &[u16], shape: &[usize]) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bind_thread()?;
+        let tensor = self.alloc_tensor(shape, DType::F16)?;
+        let want = tensor.numel();
+        if data.len() != want {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "upload_f16_bits: {} words for a {want}-element {shape:?} tensor",
+                    data.len()
+                ),
+            ));
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(tensor)
     }
@@ -3287,6 +3324,26 @@ impl Gpu {
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(())
+    }
+
+    /// Read an `F16` tensor back as raw half words — no widening, so a
+    /// caller can compare device bytes bit-for-bit (the streaming weight
+    /// upload's parity harness does exactly that against the f32-upload +
+    /// device-cast path it replaced).
+    pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        if tensor.dtype != DType::F16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("download_f16_bits: tensor is {:?}, not F16", tensor.dtype),
+            ));
+        }
+        let numel = tensor.numel();
+        let mut data = vec![0u16; numel];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 2) };
+        self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        Ok(data)
     }
 
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
@@ -3668,6 +3725,25 @@ impl Gpu {
         self.hip.free(tensor.buf)
     }
 
+    /// Host→device `upload_f32` calls since process start. A hot loop that
+    /// re-uploads a constant vector every call shows up here; a loop that
+    /// uploads once and caches does not.
+    pub fn htod_uploads() -> usize {
+        HTOD_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Allocation counters for the buffer pool: `(new, reused, bytes_new)`.
+    /// `new` counts real `hipMalloc` calls, `reused` counts free-list hits.
+    /// A hot loop that frees what it allocates keeps `new` flat and grows
+    /// `reused`; a loop that leaks grows `new` on every iteration.
+    pub fn pool_stats(&self) -> (usize, usize, usize) {
+        (
+            self.pool.total_new,
+            self.pool.total_reused,
+            self.pool.total_allocated,
+        )
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
@@ -3824,6 +3900,166 @@ impl Gpu {
             &mut params,
             blob_builder,
         )
+    }
+
+    /// 2D strided F32 row copy, one launch for `n_rows` rows:
+    ///
+    /// ```text
+    /// dst[r * dst_row_stride + dst_col_offset + c] = src[r * src_row_stride + c]
+    /// ```
+    ///
+    /// for `r` in `0..n_rows`, `c` in `0..len`. This is the single-launch
+    /// replacement for a per-row `copy_d2d` loop — the FLUX.1 MMDiT single
+    /// block's `linear2` input assemble issued 2 × 4608 = 9216 tiny D2D
+    /// memcpys per block, which is launch-latency bound, not bandwidth bound.
+    ///
+    /// A `float4` fast path is taken automatically when `len`, both row
+    /// strides and `dst_col_offset` are multiples of 4 and both device
+    /// pointers are 16-byte aligned; every other shape falls back to the
+    /// scalar path, so correctness does not depend on the alignment.
+    ///
+    /// Both tensors must be F32. The full accessed range of each buffer is
+    /// bounds-checked here rather than left to the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows_strided_f32(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n_rows: usize,
+        len: usize,
+        src_row_stride: usize,
+        dst_row_stride: usize,
+        dst_col_offset: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if src.dtype != DType::F32 || dst.dtype != DType::F32 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: both tensors must be F32 (src {:?}, dst {:?})",
+                    src.dtype, dst.dtype
+                ),
+            ));
+        }
+        if n_rows == 0 || len == 0 {
+            return Ok(());
+        }
+        if len > src_row_stride {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: len {len} exceeds src_row_stride {src_row_stride}"
+                ),
+            ));
+        }
+        if dst_col_offset + len > dst_row_stride {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: dst_col_offset {dst_col_offset} + len {len} exceeds dst_row_stride {dst_row_stride}"
+                ),
+            ));
+        }
+        let f32_sz = DType::F32.size();
+        // Last element touched, +1, in each buffer.
+        let src_need = (n_rows - 1)
+            .checked_mul(src_row_stride)
+            .and_then(|v| v.checked_add(len))
+            .and_then(|v| v.checked_mul(f32_sz))
+            .ok_or_else(|| HipError::new(0, "copy_rows_strided_f32: src size overflow"))?;
+        let dst_need = (n_rows - 1)
+            .checked_mul(dst_row_stride)
+            .and_then(|v| v.checked_add(dst_col_offset))
+            .and_then(|v| v.checked_add(len))
+            .and_then(|v| v.checked_mul(f32_sz))
+            .ok_or_else(|| HipError::new(0, "copy_rows_strided_f32: dst size overflow"))?;
+        if src.buf.size() < src_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: src buffer too small (have {}, need {src_need} for {n_rows}×{len} stride {src_row_stride})",
+                    src.buf.size()
+                ),
+            ));
+        }
+        if dst.buf.size() < dst_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: dst buffer too small (have {}, need {dst_need} for {n_rows}×{len} @ col {dst_col_offset} stride {dst_row_stride})",
+                    dst.buf.size()
+                ),
+            ));
+        }
+
+        const KERNEL: &str = "copy_rows_strided_f32";
+        self.ensure_kernel(KERNEL, crate::kernels::COPY_ROWS_STRIDED_F32_SRC, KERNEL)?;
+
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        // float4 needs 16-byte alignment on both the base pointer and every
+        // row/column offset it derives from it.
+        let aligned = len % 4 == 0
+            && src_row_stride % 4 == 0
+            && dst_row_stride % 4 == 0
+            && dst_col_offset % 4 == 0
+            && (sp as usize) % 16 == 0
+            && (dp as usize) % 16 == 0;
+
+        let n_rows_i = i32::try_from(n_rows)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: n_rows exceeds i32"))?;
+        let len_i = i32::try_from(len)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: len exceeds i32"))?;
+        let ss_i = i32::try_from(src_row_stride)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: src_row_stride exceeds i32"))?;
+        let ds_i = i32::try_from(dst_row_stride)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_row_stride exceeds i32"))?;
+        let dco_i = i32::try_from(dst_col_offset)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_col_offset exceeds i32"))?;
+        let vec4_i = i32::from(aligned);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &n_rows_i as *const _ as *mut c_void,
+            &len_i as *const _ as *mut c_void,
+            &ss_i as *const _ as *mut c_void,
+            &ds_i as *const _ as *mut c_void,
+            &dco_i as *const _ as *mut c_void,
+            &vec4_i as *const _ as *mut c_void,
+        ];
+
+        const BLOCK: u32 = 256;
+        let cols = if aligned { len / 4 } else { len };
+        let grid_x = (cols as u32).div_ceil(BLOCK);
+        // Grid-stride on y in the kernel, so capping at the conservative
+        // 65535 launch limit stays correct for any row count.
+        let grid_y = (n_rows as u32).min(65535);
+        let bytes = n_rows * len * f32_sz * 2; // read + write
+        let timer = crate::profile::begin_timer(&self.hip, KERNEL, KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid_x, grid_y, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(sp);
+                blob.push_ptr(dp);
+                blob.push_i32(n_rows_i);
+                blob.push_i32(len_i);
+                blob.push_i32(ss_i);
+                blob.push_i32(ds_i);
+                blob.push_i32(dco_i);
+                blob.push_i32(vec4_i);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Drop captured graph state and retained Redline replay after a live KV

@@ -158,6 +158,31 @@ fn ep_vmm_refusal(arch_id: u32, kv_backend: KvBackend) -> Option<String> {
         .then(|| format!("KV backend '{}' requires tp=1", kv_backend.as_str()))
 }
 
+/// FLUX/Klein image-gen arch refusal: the trunk GEMM (`gemm_wmma_lds256`)
+/// and `attention_flux_vtk/v2_wmma` use the gfx11
+/// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` intrinsic, which hipcc
+/// rejects on gfx12 ("needs target feature wmma-256b-insts,wavefrontsize32").
+/// Admits exactly the `has_wmma_w32` set (`arch_caps.rs:143-145`: `is_rdna3`,
+/// NOT the `has_wmma_w32_gfx12` gfx12 variant) — pure on the `gpu_arch`
+/// string because admission is read-only and never inits a GPU. `None` for
+/// non-diffusion archs and for gfx11; `Some(reason)` otherwise, so the load
+/// refuses before any allocation with the prior model still loaded.
+fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
+    if !matches!(arch_id, 40 | 45) {
+        return None;
+    }
+    let gfx11_wmma_w32 = matches!(
+        gpu_arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
+    );
+    (!gfx11_wmma_w32).then(|| {
+        format!(
+            "image generation (arch 40/45) requires RDNA3/3.5 (gfx11 wave32 WMMA); \
+             detected {gpu_arch}. See docs/IMAGEGEN.md §1."
+        )
+    })
+}
+
 /// Read-only source admission: open the source, classify `arch_id` + vision,
 /// decide the effective topology, and refuse every unsupported/contradictory
 /// combination — without touching GPU state, VMM, or any prior model.
@@ -181,6 +206,13 @@ pub fn admit_source(
         .unwrap_or("contiguous")
         .parse()
         .map_err(|err| format!("{err}"))?;
+
+    // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
+    // gfx11 WMMA intrinsic hipcc rejects on gfx12). Refuse here — before the
+    // topology branch and any allocation — so the prior model stays loaded.
+    if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
+        return Err(refusal);
+    }
 
     let (topology, carrier) = if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
@@ -294,5 +326,26 @@ mod tests {
         // Non-vmm backends are never refused.
         assert!(ep_vmm_refusal(5, KvBackend::Contiguous).is_none());
         assert!(ep_vmm_refusal(9, KvBackend::Contiguous).is_none());
+    }
+
+    /// FLUX/Klein admit exactly the gfx11 wave32 WMMA set: gfx1201 (and any
+    /// non-gfx11 arch) refuses with the RDNA3/3.5 remedy before any
+    /// allocation; gfx1100/gfx1151 admit; non-diffusion archs are untouched.
+    #[test]
+    fn flux_arch_refusal_is_gfx11_only() {
+        for arch_id in [40u32, 45] {
+            let err = flux_arch_refusal(arch_id, "gfx1201")
+                .expect("gfx1201 FLUX/Klein must refuse at admission");
+            assert!(err.contains("RDNA3/3.5"), "reason names remedy: {err}");
+            assert!(err.contains("gfx11 wave32 WMMA"), "reason: {err}");
+            assert!(err.contains("gfx1201"), "reason names detected arch: {err}");
+            assert!(err.contains("IMAGEGEN.md"), "reason: {err}");
+            assert!(flux_arch_refusal(arch_id, "gfx1200").is_some());
+            assert_eq!(flux_arch_refusal(arch_id, "gfx1100"), None);
+            assert_eq!(flux_arch_refusal(arch_id, "gfx1151"), None);
+        }
+        // Non-diffusion archs never hit this gate, on any arch string.
+        assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
+        assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
     }
 }
