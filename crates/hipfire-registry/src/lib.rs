@@ -204,6 +204,12 @@ pub struct ModelEntry {
     pub vae: Option<Sidecar>,
     #[serde(default)]
     pub dflash: Option<Sidecar>,
+    /// Shared Qwen3.8-27B vision-tower sidecar (`qwen3.8-27b-vision.hfq`,
+    /// llm.cpp mmproj-style). Every `qwen3.8:27b*` tier declares the same
+    /// file so each text quant tier serves images without requantizing the
+    /// trunk; sha256/size_bytes stay absent until the pack ships.
+    #[serde(default)]
+    pub vision: Option<Sidecar>,
     #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
@@ -386,6 +392,7 @@ impl RegistryV1 {
                 &entry.mtp,
                 &entry.dspark,
                 &entry.dflash,
+                &entry.vision,
                 &entry.t5,
                 &entry.clip,
                 &entry.qwen3,
@@ -1106,6 +1113,34 @@ mod tests {
         assert!(
             paired > 0,
             "bundled registry should pair at least one dflash sidecar"
+        );
+    }
+
+    #[test]
+    fn bundled_vision_sidecar_is_shared_across_qwen38_tiers() {
+        // Every `qwen3.8:27b*` tier declares the same vision-tower sidecar
+        // (`qwen3.8-27b-vision.hfq`) so each text quant tier serves images
+        // without requantizing the trunk. Unlike dflash, the vision file is
+        // standalone: no registry entry's `file` names it.
+        let registry = bundled().unwrap();
+        let mut declared = 0;
+        for (tag, entry) in &registry.models {
+            if !tag.starts_with("qwen3.8:27b") {
+                continue;
+            }
+            let sidecar = entry
+                .vision
+                .as_ref()
+                .unwrap_or_else(|| panic!("model '{tag}' must declare the shared vision sidecar"));
+            assert_eq!(
+                sidecar.file, "qwen3.8-27b-vision.hfq",
+                "model '{tag}' must share qwen3.8-27b-vision.hfq"
+            );
+            declared += 1;
+        }
+        assert!(
+            declared > 0,
+            "bundled registry should declare a vision sidecar"
         );
     }
 
