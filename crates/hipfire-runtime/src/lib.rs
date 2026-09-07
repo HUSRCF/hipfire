@@ -40,6 +40,7 @@ pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_parallel;
+pub mod imagedec;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
