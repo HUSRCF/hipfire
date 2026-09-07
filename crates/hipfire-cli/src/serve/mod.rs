@@ -1160,14 +1160,8 @@ impl ServeRuntime {
                 false,
             )?;
             if let Some(vision) = self.vision_override.as_ref() {
-                if params["vision_mode"].as_str() == Some("off") {
-                    eprintln!(
-                        "[hipfire] vision_mode=off — skipping explicit tower sidecar ({})",
-                        vision.display()
-                    );
-                } else {
-                    params["vision"] = serde_json::json!(vision.display().to_string());
-                }
+                // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
+                params["vision"] = serde_json::json!(vision.display().to_string());
             }
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);

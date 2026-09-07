@@ -720,6 +720,10 @@ fn main() {
     // Lives alongside `model` so unload_model + this state are paired
     // teardowns.
     let mut pflash_state: Option<hipfire_pflash::pflash::PflashState> = None;
+    // Set when the most recent load had a tower sidecar available but
+    // `vision_mode=off` skipped it, so an image request can name the knob
+    // instead of claiming the model has no vision encoder at all.
+    let mut vision_gated_off: Option<String> = None;
     // The PflashConfig captured at load time. Per-request `prefill_*`
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
@@ -1200,11 +1204,13 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                vision_gated_off = None;
                 if vision_mode == "off" {
                     if let Some(v) = raw_vision.as_deref() {
                         eprintln!(
                             "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
                         );
+                        vision_gated_off = Some(v.to_string());
                     }
                 }
                 let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
@@ -2614,7 +2620,16 @@ fn main() {
                 let has_vl = m.has_vision_encoder();
 
                 if has_image && !has_vl {
-                    write_error(&mut stdout, id, "model has no vision encoder");
+                    match vision_gated_off.as_deref() {
+                        Some(sidecar) => write_error(
+                            &mut stdout,
+                            id,
+                            &format!(
+                                "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+                            ),
+                        ),
+                        None => write_error(&mut stdout, id, "model has no vision encoder"),
+                    }
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw
@@ -3566,6 +3581,7 @@ fn main() {
                 // drafter buffers cached in the just-emptied pool with
                 // no drain to follow, so the VRAM stays resident until
                 // the next load message arrives. Order matters here.
+                vision_gated_off = None;
                 if let Some(mut pf) = pflash_state.take() {
                     if let Some(mut dg) = pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();

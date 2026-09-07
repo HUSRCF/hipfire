@@ -2153,14 +2153,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         canonical.as_deref(),
     )?;
     if let Some(vision) = &args.vision {
-        if params["vision_mode"].as_str() == Some("off") {
-            eprintln!(
-                "[hipfire] vision_mode=off — skipping explicit tower sidecar ({})",
-                vision.display()
-            );
-        } else {
-            params["vision"] = serde_json::json!(vision.display().to_string());
-        }
+        // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
+        // and can then name the sidecar it declined on an image request.
+        params["vision"] = serde_json::json!(vision.display().to_string());
     }
     if let Some(window) = args.draft_max {
         if !(1..=32).contains(&window) {
@@ -3103,13 +3098,11 @@ fn resolve_vision_sidecar(
     model_path: &Path,
     tag: Option<&str>,
 ) -> Result<()> {
-    if params["vision_mode"].as_str() == Some("off") {
-        if let Some(obj) = params.as_object_mut() {
-            obj.remove("vision");
-        }
-        return Ok(());
-    }
-    if !matches!(params["vision_mode"].as_str(), Some("auto" | "on")) {
+    // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
+    // override and the only place that decides; leaving the resolved path in
+    // the params lets it tell an image request which sidecar it declined.
+    let mode = params["vision_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "off" | "auto" | "on") {
         return Ok(());
     }
     if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
@@ -3148,7 +3141,7 @@ fn resolve_vision_sidecar(
         params["vision"] = serde_json::json!(hit.display().to_string());
         return Ok(());
     }
-    if params["vision_mode"].as_str() == Some("on") {
+    if mode == "on" {
         if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
             let tag = tag.unwrap_or("<model>");
             bail!(
@@ -7974,7 +7967,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn load_params_vision_off_never_loads_tower() {
+    pub(crate) fn load_params_vision_off_still_forwards_sidecar_for_daemon_gate() {
         // `off` is a hard override: a pulled sidecar is never wired, and an
         // explicitly projected path is stripped, mirroring `dflash_mode=off`.
         let paths = test_paths("vision-mode-off");
@@ -7997,11 +7990,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["vision_mode"], "off");
-        assert!(
-            params.get("vision").is_none(),
-            "off must not resolve the sidecar"
+        // `off` still resolves the sidecar into the params: the daemon's gate
+        // is the hard override and needs the path to name what it declined.
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
         );
-        // An explicitly projected path is stripped under `off`.
+        // An explicitly projected path is forwarded untouched under `off`.
         let mut params = serde_json::json!({"vision_mode": "off", "vision": "/custom/tower.hfq"});
         resolve_vision_sidecar(
             &mut params,
@@ -8011,7 +8010,7 @@ mod tests {
             Some("qwen3.8:27b"),
         )
         .unwrap();
-        assert!(params.get("vision").is_none());
+        assert_eq!(params["vision"], "/custom/tower.hfq");
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
