@@ -361,12 +361,18 @@ fn main() {
         (129, 192, 2, 2, "128-row tile + 1 live row"),
     ];
 
-    // `SKIP_VTK` (name kept for the existing invocations) drops every kernel
-    // that is gfx11-wave32-only, so the example still runs on a gfx12 part
-    // where only `vt` has a sibling. That is `vtk` *and* `v2`: both refuse to
-    // launch on gfx12, so leaving `v2` outside this guard would turn a clean
-    // skip into a panic.
-    let skip_gfx11_only = std::env::var("SKIP_VTK").is_ok();
+    // `vtk` and `v2` are gfx11-wave32-only (the gfx11 WMMA intrinsic hipcc
+    // rejects on gfx12), so on a non-gfx11 arch those arms skip — announced
+    // below — while the arms that do run (`vt`, the router, the v5
+    // cross-check) still execute. `SKIP_VTK` (name kept for the existing
+    // invocations) is the manual opt-out of the same arms.
+    let gfx11_wmma_w32 = gpu.arch_caps.has_wmma_w32();
+    let skip_gfx11_only = std::env::var("SKIP_VTK").is_ok() || !gfx11_wmma_w32;
+    if !gfx11_wmma_w32 {
+        for k in ["attention_flux_vtk_wmma", "attention_flux_v2_wmma"] {
+            println!("skip: {k} is gfx11 wave32 WMMA only (arch={})", gpu.arch);
+        }
+    }
     let mut failures = 0usize;
     // Every row printed below is one check. Reported at the end so a silently
     // shrinking suite (a `continue` that skips a whole kernel, say) is visible

@@ -182,6 +182,15 @@ const PARITY_SHAPES: &[Shape] = &[
 fn main() {
     let bench = std::env::args().any(|a| a == "--bench");
     let mut gpu = Gpu::init().expect("GPU init failed");
+    // The conv-route arms need the gfx11 wave32 WMMA GEMM (the gfx11
+    // intrinsic hipcc rejects on gfx12). On other archs they skip —
+    // announced here — while the im2col/transpose/gnorm arms still run.
+    let gfx11_wmma_w32 = gpu.arch_caps.has_wmma_w32();
+    if !gfx11_wmma_w32 {
+        for k in ["gemm_f16_x_f16_wmma_lds", "gemm_f16_x_f16_wmma"] {
+            println!("skip: {k} is gfx11 wave32 WMMA only (arch={})", gpu.arch);
+        }
+    }
     let mut failures = 0usize;
 
     // ── 1 + 2: im2col map and banding exactness ─────────────────────────
@@ -242,59 +251,76 @@ fn main() {
         failures += usize::from(!ok);
 
         // ── 3: full conv route vs the f32 direct convolution ────────────
-        let wdata = fill(s.c_out * k, 0xc04f ^ s.c_out as u64);
-        let bdata = fill(s.c_out, 0xb1a5);
-        let w32 = gpu.upload_f32(&wdata, &[s.c_out, k]).expect("upload w f32");
-        let bias = gpu.upload_f32(&bdata, &[s.c_out]).expect("upload bias");
-        let direct = gpu
-            .alloc_tensor(&[s.c_out * hw], DType::F32)
-            .expect("alloc direct");
-        gpu.vae_conv3x3_f32(&x, &w32, &bias, &direct, s.c_in, s.c_out, s.h, s.w)
-            .expect("direct conv");
-        let want_conv = gpu.download_f32(&direct).expect("download direct");
+        // Needs the gfx11 wave32 WMMA GEMM (skipped on other archs, announced
+        // at startup); the im2col/banding checks above run everywhere.
+        if gfx11_wmma_w32 {
+            let wdata = fill(s.c_out * k, 0xc04f ^ s.c_out as u64);
+            let bdata = fill(s.c_out, 0xb1a5);
+            let w32 = gpu.upload_f32(&wdata, &[s.c_out, k]).expect("upload w f32");
+            let bias = gpu.upload_f32(&bdata, &[s.c_out]).expect("upload bias");
+            let direct = gpu
+                .alloc_tensor(&[s.c_out * hw], DType::F32)
+                .expect("alloc direct");
+            gpu.vae_conv3x3_f32(&x, &w32, &bias, &direct, s.c_in, s.c_out, s.h, s.w)
+                .expect("direct conv");
+            let want_conv = gpu.download_f32(&direct).expect("download direct");
 
-        let w16 = upload_f16(&mut gpu, &wdata, &[s.c_out, k]);
-        let pos = gpu
-            .alloc_tensor(&[hw, s.c_out], DType::F32)
-            .expect("alloc pos");
-        if k % 64 == 0 {
-            gpu.gemm_f16_x_f16_wmma_lds_auto(&w16, &lds_cols, &pos, Some(&bias), s.c_out, k, hw)
+            let w16 = upload_f16(&mut gpu, &wdata, &[s.c_out, k]);
+            let pos = gpu
+                .alloc_tensor(&[hw, s.c_out], DType::F32)
+                .expect("alloc pos");
+            if k % 64 == 0 {
+                gpu.gemm_f16_x_f16_wmma_lds_auto(
+                    &w16,
+                    &lds_cols,
+                    &pos,
+                    Some(&bias),
+                    s.c_out,
+                    k,
+                    hw,
+                )
                 .expect("gemm lds");
-        } else {
-            gpu.gemm_f16_x_f16_wmma(&w16, &lds_cols, &pos, s.c_out, k, hw)
-                .expect("gemm 16");
-            gpu.bias_add_f32(&pos, &bias, hw, s.c_out)
-                .expect("bias add");
+            } else {
+                gpu.gemm_f16_x_f16_wmma(&w16, &lds_cols, &pos, s.c_out, k, hw)
+                    .expect("gemm 16");
+                gpu.bias_add_f32(&pos, &bias, hw, s.c_out)
+                    .expect("bias add");
+            }
+            let gemm_out = gpu
+                .alloc_tensor(&[s.c_out * hw], DType::F32)
+                .expect("alloc gemm out");
+            gpu.vae_transpose_f32(&pos, &gemm_out, hw, s.c_out)
+                .expect("transpose");
+            let got_conv = gpu.download_f32(&gemm_out).expect("download gemm");
+            let r = rel_l2(&got_conv, &want_conv);
+            let ok = r <= CONV_REL_L2_TOL && r.is_finite();
+            println!(
+                "conv route    c_in={:<4} -> {:<4} {:>4}x{:<4} rel_l2 vs direct f32 = {r:.3e}  {}",
+                s.c_in,
+                s.c_out,
+                s.h,
+                s.w,
+                if ok { "PASS" } else { "FAIL" }
+            );
+            failures += usize::from(!ok);
+            for (t, what) in [
+                (w32, "w32"),
+                (w16, "w16"),
+                (bias, "bias"),
+                (direct, "direct"),
+                (pos, "pos"),
+                (gemm_out, "gemm_out"),
+            ] {
+                gpu.free_tensor(t)
+                    .unwrap_or_else(|e| panic!("free {what}: {e:?}"));
+            }
         }
-        let gemm_out = gpu
-            .alloc_tensor(&[s.c_out * hw], DType::F32)
-            .expect("alloc gemm out");
-        gpu.vae_transpose_f32(&pos, &gemm_out, hw, s.c_out)
-            .expect("transpose");
-        let got_conv = gpu.download_f32(&gemm_out).expect("download gemm");
-        let r = rel_l2(&got_conv, &want_conv);
-        let ok = r <= CONV_REL_L2_TOL && r.is_finite();
-        println!(
-            "conv route    c_in={:<4} -> {:<4} {:>4}x{:<4} rel_l2 vs direct f32 = {r:.3e}  {}",
-            s.c_in,
-            s.c_out,
-            s.h,
-            s.w,
-            if ok { "PASS" } else { "FAIL" }
-        );
-        failures += usize::from(!ok);
 
         for (t, what) in [
             (x, "x"),
             (ref_cols, "ref"),
             (lds_cols, "lds"),
             (band_buf, "band"),
-            (w32, "w32"),
-            (w16, "w16"),
-            (bias, "bias"),
-            (direct, "direct"),
-            (pos, "pos"),
-            (gemm_out, "gemm_out"),
         ] {
             gpu.free_tensor(t)
                 .unwrap_or_else(|e| panic!("free {what}: {e:?}"));
@@ -308,49 +334,52 @@ fn main() {
     // reading the neighbouring band's image rows rather than padding. Each
     // shape below is chosen so the band count is several and the LAST band
     // is ragged.
-    for (c_in, c_out, h, w, band) in [
-        (128usize, 128usize, 37usize, 53usize, 8usize), // 5 bands, last = 5
-        (256, 256, 20, 64, 6),                          // 4 bands, last = 2
-        (512, 512, 15, 32, 4),                          // 4 bands, last = 3
-    ] {
-        let k = c_in * 9;
-        let hw = h * w;
-        let x = gpu
-            .upload_f32(&fill(c_in * hw, 0xba7d ^ c_in as u64), &[c_in * hw])
-            .expect("upload x");
-        let wdata = fill(c_out * k, 0xba7e ^ c_out as u64);
-        let w16 = upload_f16(&mut gpu, &wdata, &[c_out, k]);
-        let bias = gpu
-            .upload_f32(&fill(c_out, 0xba7f), &[c_out])
-            .expect("upload bias");
+    // Skipped with section 3: the banded assembly runs the WMMA GEMM.
+    if gfx11_wmma_w32 {
+        for (c_in, c_out, h, w, band) in [
+            (128usize, 128usize, 37usize, 53usize, 8usize), // 5 bands, last = 5
+            (256, 256, 20, 64, 6),                          // 4 bands, last = 2
+            (512, 512, 15, 32, 4),                          // 4 bands, last = 3
+        ] {
+            let k = c_in * 9;
+            let hw = h * w;
+            let x = gpu
+                .upload_f32(&fill(c_in * hw, 0xba7d ^ c_in as u64), &[c_in * hw])
+                .expect("upload x");
+            let wdata = fill(c_out * k, 0xba7e ^ c_out as u64);
+            let w16 = upload_f16(&mut gpu, &wdata, &[c_out, k]);
+            let bias = gpu
+                .upload_f32(&fill(c_out, 0xba7f), &[c_out])
+                .expect("upload bias");
 
-        // Single band = the whole image in one GEMM, i.e. the unbanded route.
-        let whole = conv_route_banded(&mut gpu, &x, &w16, &bias, c_in, c_out, h, w, h);
-        let banded = conv_route_banded(&mut gpu, &x, &w16, &bias, c_in, c_out, h, w, band);
+            // Single band = the whole image in one GEMM, i.e. the unbanded route.
+            let whole = conv_route_banded(&mut gpu, &x, &w16, &bias, c_in, c_out, h, w, h);
+            let banded = conv_route_banded(&mut gpu, &x, &w16, &bias, c_in, c_out, h, w, band);
 
-        let bands = h.div_ceil(band);
-        let diff = whole
-            .iter()
-            .zip(&banded)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        // Not asserted bit-exact by construction: the LDS GEMM picks its
-        // macro-tile from the batch size, which IS the band's row count, and
-        // candidate tiles differ in k-step. Bit-exactness here is a measured
-        // property of these shapes. The gate is the magnitude either way.
-        let r = rel_l2(&banded, &whole);
-        let ok = r <= CONV_REL_L2_TOL && r.is_finite();
-        println!(
-            "conv banded   c_in={c_in:<4} -> {c_out:<4} {h:>3}x{w:<3} band={band} ({bands} bands, \
-             last {}): {diff} of {} f32 differ, rel_l2 {r:.3e}  {}",
-            h - band * (bands - 1),
-            whole.len(),
-            if ok { "PASS" } else { "FAIL" }
-        );
-        failures += usize::from(!ok);
+            let bands = h.div_ceil(band);
+            let diff = whole
+                .iter()
+                .zip(&banded)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            // Not asserted bit-exact by construction: the LDS GEMM picks its
+            // macro-tile from the batch size, which IS the band's row count, and
+            // candidate tiles differ in k-step. Bit-exactness here is a measured
+            // property of these shapes. The gate is the magnitude either way.
+            let r = rel_l2(&banded, &whole);
+            let ok = r <= CONV_REL_L2_TOL && r.is_finite();
+            println!(
+                "conv banded   c_in={c_in:<4} -> {c_out:<4} {h:>3}x{w:<3} band={band} ({bands} bands, \
+                 last {}): {diff} of {} f32 differ, rel_l2 {r:.3e}  {}",
+                h - band * (bands - 1),
+                whole.len(),
+                if ok { "PASS" } else { "FAIL" }
+            );
+            failures += usize::from(!ok);
 
-        for t in [x, w16, bias] {
-            gpu.free_tensor(t).expect("free banded conv");
+            for t in [x, w16, bias] {
+                gpu.free_tensor(t).expect("free banded conv");
+            }
         }
     }
 
