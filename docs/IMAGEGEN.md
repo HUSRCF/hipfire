@@ -45,9 +45,11 @@ tests and what to do when something fails.
 ## 1. Requirements
 
 - An RDNA3 or RDNA3.5 GPU with the ROCm HIP runtime installed. hipfire
-  `dlopen`s HIP at run time, so the build needs no ROCm.
-  Measured: gfx1151 (Radeon 8060S, unified memory), gfx1150 (Radeon 890M,
-  Klein only), gfx1100 (RX 7900 XT).
+  `dlopen`s HIP at run time, so the build needs no ROCm. RDNA4 (gfx12) is
+  refused at load: the FLUX kernels use the gfx11 wave32 WMMA intrinsics.
+  Measured: gfx1151 (Radeon 8060S, unified memory; FLUX.1 schnell and
+  Klein), gfx1150 (Radeon 890M, Klein only), gfx1100 (RX 7900 XT: kernels
+  pass, FLUX.1 schnell does not fit in 24 GB — see § 10).
 - Rust stable and disk for the pipe plus its packs: about 90 GB for FLUX.1
   schnell (54 GB pipe + 34 GB packs), 30 GB for Klein 4B.
 - `huggingface-cli` (or any HF download tool) for the weights.
@@ -228,6 +230,8 @@ the table in the crate README lists them.
   `HOME=/tmp/hipfire-home`.
 - A very slow first image — kernel JIT plus the weight upload. Run once more
   before you read any timing.
-- Out of device memory on FLUX.1 with a 16 GB card — the T5 encoder falls
-  back to the host (slow, correct); the transformer itself needs about 24 GB.
-  Klein 4B fits.
+- Out of device memory on FLUX.1 — the T5 and CLIP encoders fall back to
+  the host (slow, correct), but the transformer itself needs about 24.3 GB
+  resident (23.8 GB f16 weights + row padding + activations), so a 24 GB
+  card (RX 7900 XT/XTX) fails at the first activation alloc. FLUX.1 needs a
+  unified-memory APU (Strix Halo) or a 32 GB+ RDNA3 card; Klein 4B fits.
