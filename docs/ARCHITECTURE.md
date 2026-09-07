@@ -122,6 +122,7 @@ hipfire-loader
   Carrier registry probe on arch_id (+ is_dir namespace)
   carrier.load → LoadedModel { arch_id, state: ModelState::…, tokenizer, … }
   optional: draft/speculator, VL weights, EP/PP scaffolding
+  Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
         │
         ▼
 generate(…) ladder (daemon.rs)

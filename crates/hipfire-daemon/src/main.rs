@@ -1157,6 +1157,23 @@ fn main() {
                 } else {
                     raw_draft
                 };
+                // Shared Qwen3.5-VL tower sidecar (`qwen3.8-27b-vision.hfq`).
+                // Same override ladder as the DFlash draft: `HIPFIRE_VISION_SIDECAR`
+                // non-empty wins over `params.vision`; explicitly EMPTY opts out;
+                // unset → `params.vision` as sent. Arch-free string plumbing —
+                // admission validates (arch 5|6, tower tensor present) and the
+                // Qwen35 carrier loads the tower from it.
+                let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
+                let vision_path: Option<String> = match env_vision.as_deref() {
+                    Some("") => None,
+                    Some(p) => Some(p.to_string()),
+                    None => msg
+                        .get("params")
+                        .and_then(|p| p.get("vision"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                };
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -1600,6 +1617,7 @@ fn main() {
                     kv_backend_override.as_deref(),
                     draft_path.as_deref(),
                     gpu.arch.as_str(),
+                    vision_path.as_deref(),
                 ) {
                     Ok(a) => a,
                     Err(e) => {

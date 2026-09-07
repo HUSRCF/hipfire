@@ -2381,6 +2381,7 @@ pub fn load_model_with_kv_backend(
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
         draft_path,
+        vision_path: None,
         kv_mode_override,
         kv_backend,
         kv_adaptive_override,
@@ -2479,6 +2480,7 @@ pub fn load_model_with_gemma4_drafter(
         kv_backend_override,
         draft_path,
         gpu.arch.as_str(),
+        None,
     )?;
     load_admitted_with_gemma4_drafter(
         admission,
@@ -2525,6 +2527,7 @@ pub fn load_admitted_with_gemma4_drafter(
         source,
         kv_backend,
         carrier,
+        vision_path,
         ..
     } = admission;
     let carrier =
@@ -2540,6 +2543,7 @@ pub fn load_admitted_with_gemma4_drafter(
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
         draft_path,
+        vision_path,
         kv_mode_override,
         kv_backend,
         kv_adaptive_override,
@@ -3046,7 +3050,7 @@ pub fn load_model_ep_with_kv_mode(
     // Classify once and admit before any side effect. EP is HFQ-only and
     // dispatches on arch_id, so the admission retains the arch_id decision and
     // the per-rank file re-open happens inside the EP load (unchanged).
-    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "")?;
+    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None)?;
     load_model_ep_admitted(
         admission,
         path,

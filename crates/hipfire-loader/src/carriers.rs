@@ -534,26 +534,63 @@ impl Carrier for Qwen35Carrier {
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
-                // VL detection — loads weights from hfq_file in-place
+                // VL detection — tower loads from the trunk in-place, or from
+                // the shared sidecar when the trunk is tower-less. The sidecar
+                // opens as a SEPARATE HfqFile (never attach_overlay: REAP
+                // rejects additive tensor names); the tower always sizes from
+                // the trunk's vision_config_from_hfq, falling back to the
+                // sidecar's metadata (text-only trunks predate the embedded
+                // blob). Admission already refused tower-less / wrong-arch
+                // sidecars, so a sidecar failure here fails the load closed —
+                // an explicitly requested tower must never silently serve text.
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
                     let has_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
-                    let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
-                    match vc {
-                        Some(vc) if has_vision => {
-                            let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
-                                .map_err(|e| eprintln!("  VL weight load failed: {e}"))
-                                .ok();
-                            eprintln!(
-                                "  VL model: vision encoder (hidden={}, layers={})",
-                                vc.hidden_size, vc.num_layers
-                            );
-                            (Some(vc), vw)
+                    if has_vision {
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
+                        match vc {
+                            Some(vc) => {
+                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                    .map_err(|e| eprintln!("  VL weight load failed: {e}"))
+                                    .ok();
+                                eprintln!(
+                                    "  VL model: vision encoder (hidden={}, layers={})",
+                                    vc.hidden_size, vc.num_layers
+                                );
+                                (Some(vc), vw)
+                            }
+                            _ => (None, None),
                         }
-                        _ => (None, None),
+                    } else if let Some(p) = ctx.vision_path.as_ref() {
+                        let mut sidecar =
+                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
+                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
+                            )?;
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file)
+                            .ok()
+                            .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
+                            .ok_or_else(|| {
+                                "qwen35-vl: vision tower requested but no vision_config in \
+                                 trunk or sidecar metadata — requantize the trunk or pack \
+                                 the sidecar with --include-vision"
+                                    .to_string()
+                            })?;
+                        let vw =
+                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
+                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
+                            })?;
+                        eprintln!(
+                            "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
+                            p.display(),
+                            vc.hidden_size,
+                            vc.num_layers
+                        );
+                        (Some(vc), Some(vw))
+                    } else {
+                        (None, None)
                     }
                 };
 
@@ -2652,9 +2689,11 @@ impl Carrier for FluxDiffusionCarrier {
                     vae: reopen(&vae_path)?,
                 }
             }
-            other => return Err(format!(
+            other => {
+                return Err(format!(
                 "flux (HFQ): arch {other} is not a FLUX trunk pack (40 FLUX.1 / 45 FLUX.2 Klein)"
-            )),
+            ))
+            }
         };
         // Reopen the trunk fresh: the loader's copy may have been prepared
         // (mmap dropped) for a UMA device, and the streaming load needs the
