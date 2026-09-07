@@ -82,7 +82,9 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
 EP topology is different: `init_tp` sets every device’s layer map as “all layers
 on rank 0” for PP helpers, while the EP forward ignores bands and shards experts.
 RCCL all-reduce is used unless `HIPFIRE_TP_USE_RCCL=0` (host fallback not
-implemented — that opt-out errors).
+implemented — that opt-out errors). Non-standard ROCm layouts (e.g. nixpkgs
+splitting `librccl` out of the ROCm root) set `HIPFIRE_RCCL_LIB` to the full
+`librccl.so` path; the loader tries that before the ROCm root candidates.
 
 ### Peer / fabric checks (host)
 
@@ -144,6 +146,7 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
 | `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
+| `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
 | `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
 | `HIPFIRE_PP_DFLASH=1` | **Experimental** — accept DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text) |
 
@@ -397,7 +400,7 @@ Direct daemon JSON (driving without the CLI):
 | `HIPFIRE_DETERMINISTIC=1` | Force k2 WMMA reduction (no atomicAdd) — bit-identical across processes/pp configs at ~33% perf cost on small-batch decode |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=N` | Pre-flight VRAM-asymmetry tolerance for `Gpus::init_uniform` (default 2.0) |
 | `HIPFIRE_PREFILL_BATCHED=0` | Disable batched WMMA prefill (per-token fallback). Diagnostic for ksplit non-det isolation |
-| `HIPFIRE_PREFILL_MAX_BATCH=N` | Override per-chunk prefill batch (default `PREFILL_MAX_BATCH`); chunks > N split with peer-copy at boundary |
+| `HIPFIRE_PREFILL_MAX_BATCH=N` | Override per-chunk prefill batch. When unset/invalid: arch defaults are **512** on exact `gfx1100`, **384** on exact `gfx1201`, else **256** (`PREFILL_MAX_BATCH`). Under TP, `prefill_max_batch_tp` uses default×`tp` (cap **2048**). An explicit `HIPFIRE_PREFILL_MAX_BATCH` wins over both the arch default and the TP scale. Chunks > N split with peer-copy at the boundary |
 | `HIPFIRE_WO_WMMA_VARIANT={k2,ksplit,k4,…}` | Manual override of the wo-residual GEMM variant — see `dispatch.rs` auto-dispatch |
 
 ### Refusal matrix at load (`pp > 1`)
