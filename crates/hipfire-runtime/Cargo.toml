@@ -55,6 +55,14 @@ hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
+image.workspace = true
+# JPEG decode for every vision carrier (`imagedec`): pure-Rust
+# libjpeg-turbo reimplementation, byte-identical pixels to C
+# libjpeg-turbo/PIL. Default features keep the SSE2/AVX2/NEON SIMD
+# kernels on (scalar fallbacks otherwise). Replaces the `image`
+# crate's zune-jpeg path, whose `jpeg` feature stays off so zune-jpeg
+# drops out of the lock.
+libjpeg-turbo-rs.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
 half.workspace = true
@@ -102,6 +110,8 @@ tracing = "0.1"
 # edge, which is what allows hipfire-runtime to list arch crates here
 # despite each arch crate already depending on hipfire-runtime.
 [dev-dependencies]
+# SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
+sha2.workspace = true
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }

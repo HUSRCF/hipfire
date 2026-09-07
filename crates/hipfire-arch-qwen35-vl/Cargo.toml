@@ -20,7 +20,14 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde_json.workspace = true
-# image preprocessing (PNG/JPEG decode + resize) for the vision encoder
-# input pipeline lives in this crate (`crate::image`). Same default-feature
-# gating as runtime had pre-PR-9.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# image preprocessing (PNG decode + resize) for the vision encoder input
+# pipeline lives in this crate (`crate::image`); JPEG decode is
+# `hipfire_runtime::imagedec` (libjpeg-turbo-rs). Same default-feature
+# gating as runtime had pre-PR-9, minus the `jpeg` feature so zune-jpeg
+# stays out of the lock.
+image.workspace = true
+
+[dev-dependencies]
+# Encodes the synthetic JPEG fixtures in `tests/image_from_bytes.rs`
+# (the `image` crate's JPEG encoder left with its `jpeg` feature).
+libjpeg-turbo-rs.workspace = true

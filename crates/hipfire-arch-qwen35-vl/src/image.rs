@@ -187,8 +187,7 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let img =
-        image::open(path).map_err(|e| format!("failed to open image {}: {e}", path.display()))?;
+    let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
     Ok(preprocess_dynamic_image(
         img,
         patch_size,
@@ -210,11 +209,7 @@ pub fn load_and_preprocess_from_bytes(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| format!("failed to read image: {e}"))?;
-
-    let (orig_w, orig_h) = reader.into_dimensions().map_err(map_image_err)?;
+    let (orig_w, orig_h) = hipfire_runtime::imagedec::probe_dimensions(data)?;
     let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
     if orig_w * orig_h > MAX_DIMENSION_PIXELS {
         return Err(format!(
@@ -222,21 +217,12 @@ pub fn load_and_preprocess_from_bytes(
         ));
     }
 
-    let img = image::load_from_memory(data).map_err(map_image_err)?;
+    let img = hipfire_runtime::imagedec::decode_dynamic(data)?;
     Ok(preprocess_dynamic_image(
         img,
         patch_size,
         spatial_merge_size,
     ))
-}
-
-fn map_image_err(e: image::ImageError) -> String {
-    match e {
-        image::ImageError::Unsupported(_) => {
-            "unsupported image format — supported: png, jpeg".to_string()
-        }
-        other => format!("failed to decode image: {other}"),
-    }
 }
 
 /// Extract non-overlapping patches from a CHW image.

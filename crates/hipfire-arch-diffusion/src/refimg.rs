@@ -78,16 +78,17 @@ pub fn decode_reference(bytes: &[u8]) -> Result<RefImage, String> {
             bytes.len()
         ));
     }
-    let img = image::load_from_memory(bytes).map_err(|e| format!("reference image: {e}"))?;
-    Ok(prepare_reference(&img.to_rgb8()))
+    let rgb = hipfire_runtime::imagedec::decode_rgb8(bytes)
+        .map_err(|e| format!("reference image: {e}"))?;
+    Ok(prepare_reference(&rgb))
 }
 
 /// [`decode_reference`] on a file — for the lab gates and examples, which
 /// read fixtures from disk. Not a daemon path.
 pub fn load_reference(path: &Path) -> Result<RefImage, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("reference image {}: {e}", path.display()))?;
-    decode_reference(&bytes).map_err(|e| format!("{e} ({})", path.display()))
+    let rgb = hipfire_runtime::imagedec::decode_rgb8_path(path)
+        .map_err(|e| format!("{e} ({})", path.display()))?;
+    Ok(prepare_reference(&rgb))
 }
 
 #[cfg(test)]
