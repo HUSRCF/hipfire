@@ -217,6 +217,12 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "PREFIX")]
     pub include_prefix: Option<String>,
 
+    /// Vision-tower-only sidecar shorthand: `--include-vision` plus
+    /// `--include-prefix model.visual.` (an explicit `--include-prefix`
+    /// still wins). Emits the shared `qwen3.8-27b-vision.hfq` sidecar.
+    #[arg(long)]
+    pub vision_only: bool,
+
     /// Product tier for Qwen3.8 ladder: xt keeps lm_head at base codec, base lifts lm_head, pro also lifts ssm_out (linear_attn.out_proj).
     /// embed_tokens and linear_attn.conv1d.weight remain Q8 at every rung; structural tensors remain F16.
     #[arg(long, value_name = "TIER")]

@@ -38,6 +38,10 @@ use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use hipfire_quantize::hessian_io;
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::vision_sidecar::{
+    is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix, resolve_vision_prefix,
+    vision_dtype, VisionDtype,
+};
 
 // ── Per-tensor grouping for disposition helpers ──────────────────────────
 struct PerTensorCtx<'a> {
@@ -1652,7 +1656,8 @@ pub(crate) fn run() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
-    let include_vision = args.include_vision;
+    // --vision-only implies --include-vision (tower-only sidecar build).
+    let include_vision = args.include_vision || args.vision_only;
     // Set when a vision-module tensor is actually emitted (loop-level F16
     // short-circuit) — spill-safe input for the has_vision metadata flag.
     let mut emitted_vision = false;
@@ -1663,7 +1668,7 @@ pub(crate) fn run() {
     // MTP-only addon that pairs with an existing base HFQ via the loader's
     // `.mtp-addon.hfq` discovery). When unset (default), all tensors pass
     // this gate and the usual mtp/vision skip rules below apply.
-    let include_prefix = args.include_prefix.as_deref();
+    let include_prefix = resolve_vision_prefix(args.include_prefix.as_deref(), args.vision_only);
     if let Some(p) = include_prefix {
         eprintln!(
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
@@ -1691,33 +1696,25 @@ pub(crate) fn run() {
 
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
-        if let Some(p) = include_prefix {
-            if !name.starts_with(p) {
-                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
-                let n: usize = meta.shape.iter().product();
-                skipped_params += n as u64;
-                continue;
-            }
+        if !passes_include_prefix(name, include_prefix) {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
-        // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
-        // dots.ocr names them `vision_tower.*`; Glimmer names them
-        // `model.vision_tower.*`, `model.vision_adapter.*`,
-        // `model.vision_projection.*`. All fall through to the F16 fallback
-        // path (see should_quantize) when --include-vision is set.
-        let is_vision = name.starts_with("model.visual.")
-            || name.starts_with("visual.")
-            || name.starts_with("vision_tower.")
-            || name.starts_with("model.vision_tower.")
-            || name.starts_with("model.vision_adapter.")
-            || name.starts_with("model.vision_projection.");
+        // Tower prefixes live in `vision_sidecar::is_vision_tower_tensor`
+        // (Qwen3.5-VL `model.visual.*`, dots.ocr, Glimmer aliases). All fall
+        // through to the F16 fallback path (see should_quantize) when
+        // --include-vision is set.
+        let is_vision = is_vision_tower_tensor(name);
         // VL artifact contract: the vision group is the tower/adapter/projection
         // tensors plus the LFM2/Idefics-style multi_modal_projector MLP. With
         // --include-vision they ride the existing F16 fallback path
         // (should_quantize() == false); without it they are skipped with the
         // rest of the module. Towers always behaved this way — the projector
         // is the fix (it used to land on the text-quantize tail).
-        let vision_group = is_vision || name.starts_with("model.multi_modal_projector.");
+        let vision_group = is_vision_group_tensor(name);
         if vision_group && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
@@ -4928,6 +4925,57 @@ fn handle_moe_expert_3d(
     true
 }
 
+/// Vision-sidecar dtype policy: vision vectors (norm weights/biases,
+/// projection biases) and the learned pos-embed table ride F32 (qt=2,
+/// lossless widen from the BF16/F16 source); matrices stay on the F16
+/// fallback below. Returns true when the tensor was emitted — the caller
+/// must not fall through to F16.
+///
+/// Applies to every `--include-vision` build, full VL artifacts and
+/// vision-only sidecars alike. The loader's `load_f32_*` arms consume qt=2
+/// directly, so this is strictly more faithful than F16 truncation for
+/// ~6 MB extra on the 222 Qwen3.8 tower vectors. Name-selected by
+/// `vision_sidecar::vision_dtype`, not rank-selected: `pos_embed.weight`
+/// is a 2-D table but loads through `load_f32_cpu`.
+fn emit_vision_f32_vector(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    state: &mut MainQuantState,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+) -> bool {
+    if vision_dtype(ctx.name, meta.shape.len()) != Some(VisionDtype::F32Vector) {
+        return false;
+    }
+    let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+    let f32_data =
+        tensor_to_f32_with_optional_fp8_scale(ctx.name, raw_data, meta, fp8_scale_for, st_files);
+    let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    *state.quantized_params += ctx.n_elements as u64;
+    eprintln!(
+        "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 vision vector]",
+        "F32",
+        ctx.name,
+        meta.shape,
+        ctx.n_elements,
+        raw_data.len() as f64 / 1024.0,
+        bytes.len() as f64 / 1024.0
+    );
+    state.hfq_tensors.push(HfqTensor {
+        name: ctx.name.to_string(),
+        quant_type: QuantType::F32,
+        shape,
+        group_size: 0,
+        data: bytes,
+        spilled_len: 0,
+    });
+    if let Some(sp) = state.spill.as_mut() {
+        maybe_spill(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+    }
+    true
+}
+
 fn handle_main_quant(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
@@ -6618,6 +6666,11 @@ fn handle_main_quant(
             }
         } // end else (non-Q8HFQ path)
     } else {
+        // Vision-sidecar dtype policy (F32 norms/biases/pos-embed) takes
+        // precedence over the F16 fallback; matrices fall through.
+        if emit_vision_f32_vector(ctx, meta, raw_data, state, fp8_scale_for, st_files) {
+            return;
+        }
         // ── F16 fallback for non-quantizable tensors ───────────────────────
         // Every included tensor not handled by `should_quantize(name) && n_elements >= 32`
         // must still be emitted so the dense artifact is loadable. Historical

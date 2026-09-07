@@ -199,6 +199,52 @@ hipfire-quantize --input ./qwen3.8-27b --output qwen3.8-27b.mq4v2.base.hfq \
 #   --format mq2v2 --tier pro --fixed-tier lm_head:mq6v2,ssm_out:mq6v2
 ```
 
+### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)
+
+The Qwen3.8-27B vision tower ships as a shared sidecar (llama.cpp
+mmproj-style) beside the trunk so every text quant tier serves images
+without requantizing the trunk. Build it from the tower HF dir (needs
+`config.json` + the `model.visual.*` shard, e.g.
+`model-00001-of-00018.safetensors`):
+
+```bash
+hipfire-quantize --input /home/kaden/.hipfire/hf/Qwen3.8-27B-tower \
+    --include-vision --include-prefix model.visual. \
+    --output ~/.hipfire/models/qwen3.8-27b-vision.hfq
+# shorthand for the same two flags:
+# hipfire-quantize --input <tower-dir> --vision-only \
+#     --output ~/.hipfire/models/qwen3.8-27b-vision.hfq
+```
+
+Pack contract (pinned by `cargo test -p hipfire-quantize --lib vision`):
+
+- ONLY the 333 `model.visual.*` tensors: `patch_embed.proj.{weight,bias}`
+  (2), `pos_embed.weight` (1), 12 per block × 27, merger 6.
+- Matrices → F16 (qt=1, 111 tensors); norms/biases/`pos_embed` → F32
+  (qt=2, lossless widen — 222 tensors). `--format` is ignored for vision:
+  `should_quantize` is false for the whole group, so tower tensors never
+  enter an MQ/HFQ branch. The loader's `load_f16_gpu` / `load_f32_*` arms
+  consume qt=1/qt=2 directly.
+- `arch_id` 5, `has_vision: true`, `config.vision_config` carried from the
+  source `config.json` (metadata is built before the include-prefix filter
+  runs, so the filter cannot strip the config) plus pixel-budget keys merged
+  from `preprocessor_config.json` when present.
+
+Census the artifact (CPU-only, no GPU):
+
+```bash
+cargo build -p hipfire-quantize --example hfq_dump --release
+target/release/examples/hfq_dump ~/.hipfire/models/qwen3.8-27b-vision.hfq | head -5
+# arch_id   : 5, n_tensors : 333, metadata carries has_vision + config.vision_config
+target/release/examples/hfq_dump ~/.hipfire/models/qwen3.8-27b-vision.hfq | grep -c 'qt=1 '
+# 111 (F16 matrices)
+target/release/examples/hfq_dump ~/.hipfire/models/qwen3.8-27b-vision.hfq | grep -c 'qt=2 '
+# 222 (F32 norms/biases/pos_embed)
+target/release/examples/hfq_dump ~/.hipfire/models/qwen3.8-27b-vision.hfq \
+  | grep 'qt=' | grep -cv 'model\.visual\.'
+# 0 tensor rows outside the tower
+```
+
 Graded MoE and E8 recipes are intentionally outside the thin `hipfire quantize`
 help surface so accidental low-quality artifacts are harder to produce.
 
