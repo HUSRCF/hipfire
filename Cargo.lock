@@ -1393,7 +1393,6 @@ version = "0.3.0"
 dependencies = [
  "base64",
  "hip-bridge",
- "hipfire-arch-diffusion",
  "hipfire-arch-qwen35",
  "hipfire-config",
  "hipfire-engine",
@@ -1471,6 +1470,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
+ "hipfire-arch-diffusion",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2-vl",
