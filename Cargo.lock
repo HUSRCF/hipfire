@@ -1455,6 +1455,7 @@ name = "hipfire-engine"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-loader",
  "hipfire-runtime",
  "rdna-compute",

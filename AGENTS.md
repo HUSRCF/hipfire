@@ -518,29 +518,29 @@ For dataclass benches:
 
 ### Pinned Hugging Face bench fixture
 
-For dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify the
+For dense Qwen3.8-27B MQ4V2/DFlash perf work, do not identify the
 canonical trunk by local filename. Local filenames drift and lookalike
-AWQ/MQ4 files are not comparable.
+MQ4/MQ4V2 files are not comparable.
 
-The canonical trunk is whichever local artifact byte-matches the current
-Hugging Face `.mq4` artifact:
+The canonical dense trunk is whichever local artifact byte-matches
+`qwen3.8-27b.mq4-xt` from HF repo `hipfire-models/qwen3.8-27b`
+(registry tag `qwen3.8:27b-mq4-xt`):
 
-- HF repo: `hipfire-models/qwen3.6-27b` (moved from `schuttdev/hipfire-qwen3.6-27b`
-  on 2026-08-14; HF redirects the old path, and the commit/digest pins below are
-  unchanged by the move)
-- HF file: `qwen3.6-27b.mq4`
-- HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
-- File size: `14984158208`
-- SHA-256 / HF `x-linked-etag`:
-  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`
+- HF repo: `hipfire-models/qwen3.8-27b`
+- HF / local file: `qwen3.8-27b.mq4-xt`
+- File size: `14980361216`
+- SHA-256: `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`
+- Paired draft (measured with the canonical fixture identity):
+  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
+  (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
-Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
-trunk with `sha256sum` and require the digest above. If Hugging Face has
-published a newer `.mq4`, refresh the HF headers first and pin the new
-`x-linked-etag`/size in the report.
+Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
+trunk with `sha256sum` and require the digest above. Reports that use a
+trunk with a different digest are not comparable and should be discarded.
 
-Reports that use a trunk with a different digest are not comparable and
-should be discarded.
+Historical: the prior dense pin was Qwen3.6-27B
+(`hipfire-models/qwen3.6-27b` / `qwen3.6-27b.mq4`, size `14984158208`,
+sha256 `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`).
 
 ### Pinned A3B MoE DFlash fixtures
 
@@ -604,6 +604,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
 | `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
+| `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
 |`HIPFIRE_DFLASH_CTX_CAP`|Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring). Bounds draft-side VRAM on large-`max_seq` serve loads; over-cap requests fall back to AR (identical output, slower). `0` = uncapped legacy.|8192|
 |`HIPFIRE_DFLASH_WINDOW`|Windowed draft context (NInfer pattern): SWA over the last W rows on draft layers 0..n-2 + full-attention last layer reaching min(physical_cap, 4W). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Refused with CASK eviction. `0`/unset = Legacy (cap + AR fallback).|0 (off)|
