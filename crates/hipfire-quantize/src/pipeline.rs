@@ -529,7 +529,10 @@ pub(crate) fn run() {
     // pair does NOT: MQ2G256Lloyd / MQ3G256Lloyd both have grouped-WMMA GEMMs on
     // gfx11 and gfx12 and are batched-prefill admissible. Choosing GL therefore
     // trades ~0.19 bpw against prefill throughput, not just KLD.
-    let routed_gl = std::env::var("HIPFIRE_ROUTED_GL").ok().as_deref() == Some("1");
+    let routed_gl = hipfire_config::developer_var("HIPFIRE_ROUTED_GL")
+        .ok()
+        .as_deref()
+        == Some("1");
     if routed_gl {
         eprintln!(
             "note: HIPFIRE_ROUTED_GL=1 — routed experts ship the GLOBAL-codebook\n\
@@ -1105,8 +1108,11 @@ pub(crate) fn run() {
     // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
     // smaller on disk, and why `.mq4r` — which needs this flag off — is not
     // byte-reproducible from HEAD without it.
-    let no_q8_router_flag =
-        args.no_q8_router || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
+    let no_q8_router_flag = args.no_q8_router
+        || hipfire_config::developer_var("HIPFIRE_NO_Q8_ROUTER")
+            .ok()
+            .as_deref()
+            == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
     // Muse Glimmer (arch 14): untied lm_head defaults to Q8, like embed.
     //
@@ -1129,7 +1135,7 @@ pub(crate) fn run() {
     // (gfx1201, 64 tok greedy). Both artifacts decode coherently.
     let glimmer_q8_head = arch_id == 14 && !no_q8_router_flag;
     if glimmer_q8_head {
-        if std::env::var("HIPFIRE_Q8_CLASSES").is_err() {
+        if hipfire_config::developer_var("HIPFIRE_Q8_CLASSES").is_err() {
             // SAFETY: single-threaded CLI setup, before any worker threads spawn.
             unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
         }

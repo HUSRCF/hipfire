@@ -4296,7 +4296,7 @@ fn open_bench_engine(
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
     }
-    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+    if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
         if let Ok(n) = n.parse::<u64>() {
             params["continuous_batch_size"] = serde_json::json!(n);
         }

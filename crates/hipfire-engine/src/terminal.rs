@@ -423,7 +423,11 @@ pub fn batch_lane_at_capacity(seq_pos: usize, lane_capacity: usize) -> bool {
 /// `lane_capacity`. Uses `saturating_add` so `u64::MAX` never wraps under the cap.
 /// Returns `true` when the request exceeds capacity (must be rejected before
 /// `gen_start`/GPU).
-pub fn batch_lfm_exceeds_capacity(prompt_len: usize, max_tokens: usize, lane_capacity: usize) -> bool {
+pub fn batch_lfm_exceeds_capacity(
+    prompt_len: usize,
+    max_tokens: usize,
+    lane_capacity: usize,
+) -> bool {
     prompt_len.saturating_add(max_tokens) > lane_capacity
 }
 
@@ -688,7 +692,10 @@ pub fn await_client_terminal_commit(
 
 /// Emit a previously staged `done` envelope after Commit. Payload must be the
 /// same value passed to [`await_client_terminal_commit`] as `pending_done`.
-pub fn emit_staged_terminal_done(stdout: &mut impl std::io::Write, pending_done: &serde_json::Value) {
+pub fn emit_staged_terminal_done(
+    stdout: &mut impl std::io::Write,
+    pending_done: &serde_json::Value,
+) {
     let _ = writeln!(stdout, "{}", pending_done);
     let _ = stdout.flush();
 }
@@ -725,5 +732,6 @@ pub fn check_force_answer(req_id: &str) -> bool {
 /// `HIPFIRE_THINK_CONTINUATION` to inject a richer "now produce the
 /// answer" nudge (keep it short — it's prepended to the visible answer).
 pub fn think_continuation() -> String {
-    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
+    hipfire_config::developer_var("HIPFIRE_THINK_CONTINUATION")
+        .unwrap_or_else(|_| "</think>\n\n".to_string())
 }
