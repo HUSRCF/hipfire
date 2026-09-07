@@ -109,7 +109,7 @@ Stable/default-on and safety controls:
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
-| `memory.oom_guard` | `auto` | Memory preflight OOM guard (`kv_slots::preflight_alloc` and the bench-sweep headroom check). Refuses oversized allocations before they are made. `auto` decides by deployment class: on for unified-memory APU archs (gfx1035/1036/1103/1150/1151/1152 — GPU allocations come out of system RAM, so an overshoot is a global OOM that kills the desktop), off for discrete GPUs (an overshoot is a plain failed hipMalloc), and for GPU-less processes by host swap state (no swap → on). `true`/`false` force the decision. |
+| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host `MemAvailable` headroom check; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
 The following default-off keys are experimental kernel-route overrides. They
 are typed booleans, process-scoped, and visible in `hipfire config list` with
@@ -304,7 +304,8 @@ Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 | `flash_mode` | `"auto"` | `auto` \| `always` \| `never` |
 
 Lowered directly into the daemon snapshot. `HIPFIRE_ATTN_FLASH` remains a
-legacy one-shot alias.
+legacy one-shot alias. The Qwen3.5 MTP head inherits the trunk
+`flash_mode` / `attention_flash_mode` (it does not pin a separate non-flash path).
 
 ---
 
@@ -429,11 +430,57 @@ runtime PFlash module — not restated here.
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
 | `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
 | `experimental_budget_alert` | `false` | bool |
+| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
+| `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |
+| `serve.multi_slot_ctx` | `8192` | int 512–1048576 per-slot context capacity (tokens). |
+| `serve.multi_slot_prefill_chunk` | `1024` | int 1–1048576. Prefill tokens taken from one slot per multi-slot step; batch scratch is sized `n_slots ×` this. Env: `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK`. |
 
 Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,
 `HIPFIRE_IDLE_TIMEOUT`, `HIPFIRE_MAX_REQUEST_BYTES`,
-`HIPFIRE_SERVE_MAX_QUEUE`, and `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` names are
-legacy one-shot aliases.
+`HIPFIRE_SERVE_MAX_QUEUE`, `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS`, and
+`HIPFIRE_SERVE_MULTI_SLOT*` names are legacy one-shot aliases.
+
+---
+
+## Memory
+
+### `memory.oom_guard`
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.oom_guard` | `auto` | `auto` \| `true`/`on`/`1` \| `false`/`off`/`0` |
+
+Compat env: `HIPFIRE_OOM_GUARD`. Used by `kv_slots::preflight_alloc`, the
+`SlotPool` arena check, and the CLI bench-sweep headroom path.
+
+Two checks exist; only one is gated:
+
+- **Host `MemAvailable` headroom** — gated by `memory.oom_guard`. Default
+  `auto` turns it **on** for unified-memory APU arches (`gfx1035` / `gfx1036` /
+  `gfx1103` / `gfx1150`–`gfx1152`: GPU allocations come from system RAM, so an
+  overshoot is a desktop-killing OOM), **off** for discrete GPUs (overshoot is
+  a failed `hipMalloc`), and for GPU-less processes by host swap state (no
+  swap → on). Explicit `true`/`false` force either way; `auto` logs its
+  decision once.
+- **R9700 deployment-target VRAM budget** (32 GiB class ceiling in
+  `preflight_alloc`) — **always runs**, on every arch, whether the host
+  headroom guard is active or not. A configuration that does not fit the
+  deployment target is refused regardless of this box's RAM.
+
+`scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
+
+### Prompt / assistant-turn cache
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
+| `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
+
+Multi-turn DFlash and the prefix cache: when a DFlash turn ends on EOS (or the
+think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
+state and replays only the consumed prefix so the prompt/prefix cache stays
+warm. The next turn prefills only the new suffix instead of a full cold
+prefill (the previous fail-closed path reset and invalidated the cache).
 
 ---
 

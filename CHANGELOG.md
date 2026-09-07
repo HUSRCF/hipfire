@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.1 — DFlash cache repair, admission hardening, image gen
+
+- Source-aware admission and refusal-before-teardown (#682, #687).
+- Registry-declared DFlash draft sidecars: `pull` fetches them, `auto`/`on` semantics, shared-sidecar-aware `rm` (#686).
+- DFlash prompt-cache repair on terminal overshoot (`RepairForTerminal`) (#695).
+- Template-aware primer splice (#692).
+- Transactional DFlash constructors with emitter rollback (#691).
+- MQ-V2 prefill admit rule (#690).
+- gfx1100 DFlash launch fusion and split-K residual tiers (#702 body, S1–S8).
+- Dense-TP prefill chunking equals arch batch × tp (#725).
+- MTP head inherits trunk flash policy; tile-sized partials (#726).
+- XML tool calls parsed with grammar off (#729).
+- `HIPFIRE_RCCL_LIB` for non-standard ROCm layouts (#728).
+- `memory.oom_guard` (default `auto`; env `HIPFIRE_OOM_GUARD`) (#697).
+- `ornith-1.5:fast` alias → `ornith-1.5:35b-a3b-mq4r` (#680).
+- `moe_topk_renorm_k8` barrier (partial #670, nwoolmer).
+- Image generation: FLUX.1 schnell / FLUX.2 Klein via `hipfire img`, `POST /v1/images/generations` + `/edits`, `hipfire-quantize --flux-pipe` (philhug; first release; RDNA3/3.5 measured).
+- Gate overhaul: `change_gate` / agentic-review retired (#700); hw-gate pins Qwen3.8 MQ4-XT and drops qwen3.6 as current fixture.
+- S1+S2 dependency hygiene and panic-free config CLI (#701).
+- All production `HIPFIRE_*` reads are config-owned.
+
+### Validation
+
+Fixture: `qwen3.8-27b.mq4-xt` (sha256 `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`) with paired draft sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`. Routes run: battery / chain / session AR+DFlash, ornith `.mq4r` PM4 route proof, tp=2, MTP@8192.
+
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 
 ### Quant wire schema (Bonsai + Magnum V2)

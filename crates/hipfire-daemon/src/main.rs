@@ -495,7 +495,10 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_env("HIPFIRE_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("off"));
-    let json = developer_var("HIPFIRE_LOG_FORMAT")
+    // Ambient env on purpose: this runs before the CLI has sent the process
+    // config, and a developer_var read here would install the local fallback
+    // snapshot and make the real install_process_config fail.
+    let json = std::env::var("HIPFIRE_LOG_FORMAT")
         .map(|value| value.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
 

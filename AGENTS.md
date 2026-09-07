@@ -224,25 +224,34 @@ works, what to measure, what counts as pass/fail.
 DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 
 ```bash
-# 27B Qwen 3.5 (the canonical perf-test target):
-hipfire pull qwen3.5:27b           # 15 GB target + 0.92 GB DFlash draft sidecar
+# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XT):
+hipfire pull qwen3.8:27b-mq4-xt    # ~15 GB target + MQ4 DFlash draft sidecar
+# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xt
+# measured draft identity (acceptance/perf pin):
+#   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+#   (see §5 "Pinned Hugging Face bench fixture")
 
-# 27B Qwen 3.6 (refresh):
-hipfire pull qwen3.6:27b           # 15 GB target + 0.92 GB DFlash draft sidecar
-
-# 9B Qwen 3.5 (smaller, faster sanity-check):
+# Smaller / faster smoke only (not the acceptance fixture):
 hipfire pull qwen3.5:9b            # 5.3 GB target + 0.55 GB DFlash draft sidecar
+hipfire pull qwen3.5:4b            # even smaller bring-up smoke
 ```
 
-Standalone `*-draft` tags (`hipfire pull qwen3.5:27b-draft`) still work —
-they address the same file for anyone who wants the draft alone.
+Standalone `*-draft` tags (`hipfire pull qwen3.8:27b-draft`) still work —
+they address the registry draft file for anyone who wants the draft alone.
+Legacy `qwen3.{5,6}:{9b,27b}-draft` tags remain pullable.
 
 Files land at `~/.hipfire/models/<canonical-name>`.
 **Do not rename.** Load resolves the draft by its registry-declared
 filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
 (one warning line), `on` fails the load.
 
-### Verify md5s after pull (paranoid mode)
+### Verify hashes after pull (paranoid mode)
+
+For the **canonical dense fixture** (`qwen3.8-27b.mq4-xt`), verify
+SHA-256 against the pin in §5 — do not trust filename alone.
+
+Registry-present smoke / historical artifacts (still in
+`registry/models.json`; md5):
 
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
@@ -255,6 +264,7 @@ Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
 checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
 file was re-uploaded since the original manifest; verify against the
 current `204c4c4c…`.)
+
 
 > **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
 > Hugging Face's reported sizes and the `hipfire pull` progress bar.**
@@ -313,7 +323,8 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
-- Per-model: `hipfire config qwen3.5:27b set prompt_normalize false`
+- Per-model: `hipfire config qwen3.8:27b-mq4-xt set prompt_normalize false`
+
 
 **Verify:** see §3 prompt-shape A/B test.
 
@@ -325,13 +336,26 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 
 ### E. DFlash draft endpoints (HuggingFace)
 
+**Current acceptance fixture** (dense Qwen3.8-27B MQ4XT):
+
+- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`
+  (registry tag `qwen3.8:27b-mq4-xt` → `~/.hipfire/models/qwen3.8-27b.mq4-xt`)
+- Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
+  (`hipfire pull qwen3.8:27b-mq4-xt` or `hipfire pull qwen3.8:27b-draft`)
+- Measured draft identity (acceptance/perf pin):
+  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
+
+Still pullable (smaller smoke / historical):
+
 - `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
 - `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
 - `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
   target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
 
 `hipfire pull <target>` fetches the target plus its draft sidecar;
-standalone drafts stay pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft`.
+standalone drafts stay pullable via `hipfire pull qwen3.8:27b-draft`
+(and legacy `qwen3.{5,6}:{9b,27b}-draft`).
+
 
 ---
 
@@ -431,12 +455,15 @@ reassurance.
 If you're testing an actual user UX flow:
 
 ```bash
-hipfire pull qwen3.5:9b                # target + draft sidecar in one pull
+hipfire pull qwen3.8:27b-mq4-xt    # target + registry draft sidecar
 hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
-hipfire run qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
+# Acceptance draft pin when measuring (optional override of registry sidecar):
+# export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+hipfire run qwen3.8:27b-mq4-xt "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
-# response generates at ≥250 tok/s on a 9B target with a paired draft
+# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xt
 ```
+
 
 Without the `dflash_mode auto` config, `hipfire run` runs pure AR
 even when a paired draft is on disk. `dflash_mode on` instead requires
@@ -506,7 +533,8 @@ For dataclass benches:
 - ≥3 fresh-process runs
 - Prompt md5 recorded
 - Binary md5 recorded
-- Coherence-gate-dflash pass
+- Claim-scoped `serve_harness` / VALIDATION route pass (retired coherence-gate scripts are **not** acceptance)
+
 - Eyeball check on decoded output (especially when τ is unusually high)
 
 ### Don't claim a perf regression without
@@ -587,10 +615,11 @@ against the A3B MoE DFlash perfmaxx line.
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
-| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.5:9b set dflash_mode on` |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xt set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
-| `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+| `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+
 
 ---
 
@@ -645,8 +674,9 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-06-22. When this doc gets stale (more than 1-2
-releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-09-07 (v0.3.1 fixture pin: Qwen3.8-27B MQ4XT). When this
+doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
+
 
 # Code intelligence — CodeGraph
 

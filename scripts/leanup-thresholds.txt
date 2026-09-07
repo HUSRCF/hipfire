@@ -31,11 +31,7 @@ required_features_daemon    == 0
 # G2 block (28 net lines once the DS4 tp>1 refusal moved before admission)
 # with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
 # (351c326e0). See commit message.
-# Raised 4204 -> 4300 on 2026-09-07: the imggen port (f941f7f98) added the
-# img_generate wire at 4619; this refactor moves 319 of those lines into
-# hipfire_generate::img, and the ceiling now covers the port's remainder.
-# The daemon keeps only id/refusal dispatch (~40 lines). See commit message.
-daemon_lines                <= 4300
+daemon_lines                <= 4208
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -104,7 +100,4 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-# Raised 247 -> 257 on the imggen port: the +10 is the new hipfire-arch-diffusion
-# ledger row (arch 40/45 trunk, direct f16 WMMA LDS GEMM + VAE/text-encoder calls,
-# recorded as debt), not growth in any existing crate.
-bypass_total                <= 257
+bypass_total                <= 247

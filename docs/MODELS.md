@@ -113,7 +113,7 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 | `qwen3.8:27b-draft-mq6` | `qwen38-27b-dflash-mq6.hfq` | 1.66 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
 
-Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — `auto` uses the sidecar when present (AR otherwise), `on` requires it (load fails without it), `off` never drafts. Default `dflash_mode` is **off**. `developer.dflash_draft` / `run --model-draft` override the sidecar. Watch for `DFlash draft loaded:` in load output.
+Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — default `dflash_mode` is **`off`** (pull ≠ enable); `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
 ### Qwen3 (non-3.5) dense HF4
 
@@ -139,7 +139,7 @@ Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sid
 | `qwopus3.6:27b-coder` | `qwopus3.6-27b-coder.mq4` | 15.0 | 16 | q8 default KV; agentic coder finetune |
 | `nex-n2:mini` | `nex-n2-mini.mq4p` | 19.82 | 22 | q8 default KV; Qwen3.5-35B-A3B agentic MoE finetune |
 | `ornith-1.5:35b-a3b` | `ornith-1.5-35b-a3b.mq4` | 19.02 | 22 | q8 default KV; MQ4G256V2 quality trunk with selective MQ6/Q8 protection; semantic `low`/`medium`/`xhigh` effort (default `xhigh`), uncapped unless an explicit integer cap is set |
-| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk |
+| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk. Speed SKU aliases: `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` → this tag (Muse/Qwen3.8 `:fast` pattern) |
 
 ### Other families (registry)
 
@@ -258,6 +258,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:large` | `qwen3.5:27b` |
 | `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
 | `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
+| `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` | `ornith-1.5:35b-a3b-mq4r` |
 | `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
 | `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
 | `qwen3.8:27b-mq4` | `qwen3.8:27b` |
