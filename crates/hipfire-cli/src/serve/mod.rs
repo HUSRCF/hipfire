@@ -90,6 +90,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
+    /// Explicit vision-tower sidecar (`serve --vision`) projected as
+    /// `params["vision"]` on every model load, winning over the registry
+    /// `vision` slot and `HIPFIRE_VISION_SIDECAR`.
+    pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
     /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
@@ -652,9 +656,13 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     if args.detach && !args.foreground_child {
         return detach_serve(paths, &args, &host, port);
     }
+    if let Some(vision) = args.vision.as_ref() {
+        if !vision.is_file() {
+            bail!("vision sidecar not found: {}", vision.display());
+        }
+    }
     serve_foreground(paths, &args, &host, port, resolved)
 }
-
 pub(crate) fn resolve_serve_positionals(
     paths: &Paths,
     values: &[String],
@@ -905,6 +913,7 @@ pub(crate) fn serve_foreground(
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
+            vision_override: args.vision.clone(),
             tp: args.tp,
             continuous_batch_size,
             multi_slot_enabled,
@@ -1149,6 +1158,9 @@ impl ServeRuntime {
                 tag.as_deref(),
                 false,
             )?;
+            if let Some(vision) = self.vision_override.as_ref() {
+                params["vision"] = serde_json::json!(vision.display().to_string());
+            }
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }

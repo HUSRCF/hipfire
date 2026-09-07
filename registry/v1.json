@@ -847,7 +847,10 @@
       "sha256": "3e04fc8db80bda557b965ec60ac876cf2500fced7f340624f3fcbeae134af5c5",
       "size_bytes": 11777616896,
       "arch_id": 5,
-      "quant": "mq3"
+      "quant": "mq3",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq3": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -884,7 +887,10 @@
       "sha256": "09c3544690aceca29e1822d79adab6ffcc8fd9e4b58359fe8dfb185ef49811c9",
       "size_bytes": 12618796032,
       "arch_id": 5,
-      "quant": "mq3"
+      "quant": "mq3",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq3-pro": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -921,7 +927,10 @@
       "sha256": "394c50966bf4f68172df8eb34cd7ded8f9d0576c9ef24ea6ba639a88c184f795",
       "size_bytes": 13184433152,
       "arch_id": 5,
-      "quant": "mq3"
+      "quant": "mq3",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq4-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -958,7 +967,10 @@
       "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
       "size_bytes": 14980361216,
       "arch_id": 5,
-      "quant": "mq4"
+      "quant": "mq4",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -995,7 +1007,10 @@
       "sha256": "5bb556a6cc84035234995c017c9791aa3951ad1eae4cf8c8172b0eaef399e507",
       "size_bytes": 15662615552,
       "arch_id": 5,
-      "quant": "mq4"
+      "quant": "mq4",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq4-pro": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1032,7 +1047,10 @@
       "sha256": "e6f2ac87042b9e314c323f00bc499a6304cd5624021ae501ce90b12a3a7ea3fa",
       "size_bytes": 16464182272,
       "arch_id": 5,
-      "quant": "mq4"
+      "quant": "mq4",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq5-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1064,7 +1082,10 @@
       "sha256": "f4760c159f80d5d3ca237593a191dd553790cba0f89de59827f430b23109b39b",
       "size_bytes": 18183105536,
       "arch_id": 5,
-      "quant": "mq5"
+      "quant": "mq5",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq5": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1096,7 +1117,10 @@
       "sha256": "c018a0d7510bffbb3788844d5d8f72694464244e16f128b7e34804045324cf25",
       "size_bytes": 18706435072,
       "arch_id": 5,
-      "quant": "mq5"
+      "quant": "mq5",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq5-pro": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1128,7 +1152,10 @@
       "sha256": "7a46204f5ce16b260ebb028359a945c8c02f5abe87c040df063db782a99ee7cd",
       "size_bytes": 19319258112,
       "arch_id": 5,
-      "quant": "mq5"
+      "quant": "mq5",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq6-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1160,7 +1187,10 @@
       "sha256": "9d472ddc5b4e11a1986bfc83c54c0dac979a8e1d7186613dd7c7436f69ec8b2f",
       "size_bytes": 21385849856,
       "arch_id": 5,
-      "quant": "mq6"
+      "quant": "mq6",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq6": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1192,7 +1222,10 @@
       "sha256": "b798ea1166fc03a568f6daf8090b20b7d6314af7429951c03d86540385568db8",
       "size_bytes": 21750254592,
       "arch_id": 5,
-      "quant": "mq6"
+      "quant": "mq6",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-mq6-pro": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1224,7 +1257,10 @@
       "sha256": "58ac3ee645ede2bad2f6f833db1d4abbfdc1850047fdadef036d35a023bb9401",
       "size_bytes": 22174333952,
       "arch_id": 5,
-      "quant": "mq6"
+      "quant": "mq6",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.5:0.8b-mq6": {
       "repo": "hipfire-models/qwen3.5-0.8b",
@@ -1419,7 +1455,10 @@
       "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
       "size_bytes": 984978432,
       "arch_id": 20,
-      "quant": "mq3"
+      "quant": "mq3",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-draft-mq4": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1430,7 +1469,10 @@
       "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
       "size_bytes": 1209603072,
       "arch_id": 20,
-      "quant": "mq4"
+      "quant": "mq4",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-draft-mq5": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1441,7 +1483,10 @@
       "sha256": "8a8d3daeaa3788743ef9aedfa1a6cd9961395ecbd88e9b5e2eb981e0506a861f",
       "size_bytes": 1434227712,
       "arch_id": 20,
-      "quant": "mq5"
+      "quant": "mq5",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.8:27b-draft-mq6": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1452,7 +1497,10 @@
       "sha256": "d190ef2faa953252ac40e9706cf2c6763d095f7817c2c7a0466792fd6dfa9015",
       "size_bytes": 1658852352,
       "arch_id": 20,
-      "quant": "mq6"
+      "quant": "mq6",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq"
+      }
     },
     "qwen3.5:9b-draft": {
       "repo": "hipfire-models/qwen3.5-9b",
