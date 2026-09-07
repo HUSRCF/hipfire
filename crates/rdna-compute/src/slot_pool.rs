@@ -231,13 +231,14 @@ mod tests {
         // panicked. The test's comment said "8.7 TB", off by 1000x; the
         // refusal it is checking was never actually being exercised.
         //
-        // Calls `preflight_checks` directly (not `SlotPool::new`) because
-        // `SlotPool::new` goes through the config-gated `preflight_alloc`,
-        // whose `auto` default stands down on discrete GPUs and GPU-less CI
-        // runners. The unguarded checks are deterministic on every machine.
+        // Calls `preflight_checks` directly (not `SlotPool::new`) with the
+        // guard on so the refusal is deterministic on every machine,
+        // regardless of this box's arch or oom_guard setting. The
+        // over-budget refusal itself is unconditional — `SlotPool::new`
+        // refuses it too, via `preflight_alloc`, even with the guard off.
         let cap = 4_000_000usize.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
         let total = (cap * PPB) as u64 * 8 * 2;
-        let e = crate::kv_slots::preflight_checks(total, R9700_VRAM_BYTES, "SlotPool arena")
+        let e = crate::kv_slots::preflight_checks(total, R9700_VRAM_BYTES, "SlotPool arena", true)
             .unwrap_err();
         assert!(e.contains("budget") || e.contains("GiB"), "unexpected: {e}");
     }

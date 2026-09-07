@@ -745,9 +745,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 println!();
                 for schema in fields() {
-                    let item = resolved.get(schema.key).ok_or_else(|| {
-                        anyhow!("configuration key '{}' is not set", schema.key)
-                    })?;
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
                     let marker = if loaded.layer.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -854,8 +854,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             if is_developer_key(&canonical) {
-                let env_compat = developer_env_for_key(&canonical)
-                    .ok_or_else(|| anyhow!("developer key '{canonical}' has no legacy env spelling"))?;
+                let env_compat = developer_env_for_key(&canonical).ok_or_else(|| {
+                    anyhow!("developer key '{canonical}' has no legacy env spelling")
+                })?;
                 if output.json {
                     println!(
                         "{}",
@@ -1144,9 +1145,9 @@ fn model_config_command(
                     catalog.format
                 );
                 for schema in fields() {
-                    let item = resolved.get(schema.key).ok_or_else(|| {
-                        anyhow!("configuration key '{}' is not set", schema.key)
-                    })?;
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
                     let marker = if overrides.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -1172,9 +1173,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).ok_or_else(|| {
-                anyhow!("configuration key '{}' is not set", schema.key)
-            })?;
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
                 println!(
                     "{}",
@@ -1211,8 +1212,8 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema = field(&key)
-                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema =
+                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
                 let saved = record
                     .overrides
                     .get(schema.key)
@@ -1264,9 +1265,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).ok_or_else(|| {
-                anyhow!("configuration key '{}' is not set", schema.key)
-            })?;
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
                 println!(
                     "{}",
@@ -7660,7 +7661,11 @@ mod tests {
         let foreign = foreign_dir.join("qwen3.8-27b.mq4-xt");
         fs::write(&foreign, b"lookalike").unwrap();
         let registry = rm_test_registry(&[("qwen3.8:27b-mq4-xt", "qwen3.8-27b.mq4-xt", None)]);
-        let installed = paths.models.join("qwen3.8-27b.mq4-xt").display().to_string();
+        let installed = paths
+            .models
+            .join("qwen3.8-27b.mq4-xt")
+            .display()
+            .to_string();
         let (tag, _) = registry_entry_for_path(&paths, &registry, &installed)
             .expect("symlinked installed artifact must match by canonical target");
         assert_eq!(tag, "qwen3.8:27b-mq4-xt");
@@ -7710,7 +7715,10 @@ mod tests {
         )
         .expect_err("on without registry identity must fail closed");
         let message = format!("{error:#}");
-        assert!(message.contains("not a registry-managed artifact"), "{message}");
+        assert!(
+            message.contains("not a registry-managed artifact"),
+            "{message}"
+        );
         assert!(message.contains("developer.dflash_draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
@@ -7732,7 +7740,6 @@ mod tests {
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
-
 
     #[test]
     fn run_spec_dflash_projects_inherited_draft_after_config_off() {
