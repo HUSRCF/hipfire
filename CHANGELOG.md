@@ -7,6 +7,7 @@
 - DFlash prompt-cache repair on terminal overshoot (`RepairForTerminal`) (#695).
 - Template-aware primer splice (#692).
 - Transactional DFlash constructors with emitter rollback (#691).
+- Qwen35 prefill scratch construction retains owning tensors until publication, reclaiming partial allocations on failure so an immediate retry can reuse them.
 - MQ-V2 prefill admit rule (#690).
 - gfx1100 DFlash launch fusion and split-K residual tiers (#702 body, S1–S8).
 - Dense-TP prefill chunking equals arch batch × tp (#725).
