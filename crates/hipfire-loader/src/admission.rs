@@ -39,6 +39,11 @@ pub struct SourceAdmission {
     /// The resolved carrier (single/pp path). `None` for expert-parallel, which
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
+    /// Validated vision-tower sidecar (`params.vision` / `HIPFIRE_VISION_SIDECAR`).
+    /// `Some` only when the sidecar opened, carries arch_id 5|6, and holds the
+    /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
+    /// `None` = trunk-only (or explicit opt-out via empty string).
+    pub vision_path: Option<std::path::PathBuf>,
 }
 
 /// Pure text-vs-VL decision. The vision tower tensor decides; configuration
@@ -98,6 +103,55 @@ fn probe_vision(src: &ModelSource, arch_id: u32) -> Result<bool, String> {
         _ => (false, false),
     };
     classify_vision(arch_id, has_tensor, has_config)
+}
+
+/// Tower probe tensor shared by the trunk and the vision sidecar.
+const VISION_PROBE_TENSOR: &str = "model.visual.patch_embed.proj.weight";
+
+/// Validate the optional vision-tower sidecar and return its resolved path.
+/// Fail-closed: an unopenable, non-5|6, or tower-less sidecar refuses with a
+/// message naming the remedy. The sidecar opens read-only as a SEPARATE
+/// `HfqFile` (never `attach_overlay` — REAP rejects additive tensor names,
+/// hfq.rs:391-427). Empty string counts as unset (explicit opt-out, same
+/// semantics as `HIPFIRE_DFLASH_DRAFT`).
+fn resolve_vision_sidecar(
+    vision: Option<&str>,
+    arch_id: u32,
+    is_dir: bool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let path = match vision.filter(|s| !s.is_empty()) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    if is_dir {
+        return Err(format!(
+            "vision sidecar '{path}' requires an HFQ trunk: safetensors directory \
+             sources cannot carry a sidecar tower"
+        ));
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return Err(format!(
+            "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
+             only serve Qwen3.5-VL trunks (arch_id 5|6)"
+        ));
+    }
+    let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
+        .map_err(|e| format!("vision sidecar '{path}': open failed: {e}"))?;
+    if !matches!(sidecar.arch_id, 5 | 6) {
+        return Err(format!(
+            "vision sidecar '{path}' has arch_id={} (expected 5|6): pack the tower \
+             with `hipfire-quantize <hf-dir> --include-vision --include-prefix model.visual.`",
+            sidecar.arch_id
+        ));
+    }
+    if sidecar.tensor_data(VISION_PROBE_TENSOR).is_none() {
+        return Err(format!(
+            "vision sidecar '{path}' carries no vision tower tensor \
+             '{VISION_PROBE_TENSOR}': pack the tower with `hipfire-quantize <hf-dir> \
+             --include-vision --include-prefix model.visual.`"
+        ));
+    }
+    Ok(Some(std::path::PathBuf::from(path)))
 }
 
 /// Resolve the single carrier that claims a source, refusing no-carrier and
@@ -196,6 +250,7 @@ pub fn admit_source(
     kv_backend_override: Option<&str>,
     draft_path: Option<&str>,
     gpu_arch: &str,
+    vision: Option<&str>,
 ) -> Result<SourceAdmission, String> {
     let source = ModelSource::from_path(path)?;
     let arch_id = source
@@ -260,7 +315,14 @@ pub fn admit_source(
         };
         (topology, Some(carrier))
     };
-    let has_vision = probe_vision(&source, arch_id)?;
+    let mut has_vision = probe_vision(&source, arch_id)?;
+    // Shared tower sidecar (registry `vision` slot / `params.vision` /
+    // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
+    // sidecar promotes a tower-less trunk to VL.
+    let vision_path = resolve_vision_sidecar(vision, arch_id, is_dir)?;
+    if vision_path.is_some() {
+        has_vision = true;
+    }
     if let ModelSource::Hfq(hfq) = &source {
         df_lash_lm_head_admission(hfq, draft_path, gpu_arch)?;
     }
@@ -273,6 +335,7 @@ pub fn admit_source(
         topology,
         kv_backend,
         carrier,
+        vision_path,
     })
 }
 
@@ -347,5 +410,113 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    /// Vision-sidecar fixtures: minimal HFQ files via the in-memory writer.
+    /// The trunk is a tower-less arch-5 text pack; the sidecar carries just
+    /// the probe tensor. Admission is read-only — no GPU needed.
+    mod vision_sidecar {
+        use super::super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        fn write_hfq(name: &str, arch_id: u32, with_tower: bool) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-vision-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            let mut tensors = vec![HfqMemTensor {
+                name: "model.embed_tokens.weight".into(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            }];
+            if with_tower {
+                tensors.push(HfqMemTensor {
+                    name: super::super::VISION_PROBE_TENSOR.into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                });
+            }
+            write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+            path
+        }
+
+        fn cleanup(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        /// Tower-less trunk + tower-bearing sidecar admits as VL on qwen35.
+        #[test]
+        fn sidecar_promotes_tower_less_trunk_to_vl() {
+            let trunk = write_hfq("a-trunk", 5, false);
+            let sidecar = write_hfq("a-sidecar", 5, true);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+            )
+            .expect("tower sidecar must admit");
+            assert!(admitted.has_vision, "sidecar tower promotes trunk to VL");
+            assert_eq!(admitted.vision_path, Some(sidecar.clone()));
+            assert!(
+                admitted.carrier.is_some_and(|c| c.name() == "qwen35"),
+                "trunk still routes to qwen35"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// A sidecar without the tower tensor refuses with the pack remedy.
+        #[test]
+        fn sidecar_without_tower_refuses() {
+            let trunk = write_hfq("b-trunk", 5, false);
+            let sidecar = write_hfq("b-sidecar", 5, false);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("tower-less sidecar must refuse");
+            assert!(err.contains("no vision tower tensor"), "remedy: {err}");
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// A sidecar stamped with the wrong arch refuses.
+        #[test]
+        fn sidecar_with_wrong_arch_refuses() {
+            let trunk = write_hfq("c-trunk", 5, false);
+            let sidecar = write_hfq("c-sidecar", 9, true);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("wrong-arch sidecar must refuse");
+            assert!(err.contains("arch_id=9"), "names the sidecar arch: {err}");
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
     }
 }
