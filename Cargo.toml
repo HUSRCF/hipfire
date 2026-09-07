@@ -24,6 +24,7 @@ members = [
     "crates/hipfire-arch-cohere2moe",
     "crates/hipfire-arch-maple",
     "crates/hipfire-arch-dots-ocr",
+    "crates/hipfire-arch-diffusion",
     "crates/hipfire-quantize",
     "crates/saddle-quant",
     "crates/hipfire-detect",
@@ -54,13 +55,19 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = "4.6"
+fancy-regex = "0.14"
 half = "2.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 libloading = "0.9"
+libm = "0.2"
 memmap2 = "0.9"
 minijinja = "2"
 minijinja-contrib = "2"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
+rayon = "1"
+regex = "1"
 safetensors = "0.8"
 serde = "1"
 serde_json = "1"

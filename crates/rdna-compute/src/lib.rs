@@ -17,6 +17,7 @@ pub mod embedding;
 pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
+pub mod flux_fused;
 pub mod gemm;
 mod gemma4_ops;
 pub mod gemv;
@@ -37,6 +38,8 @@ pub mod replay;
 pub mod sampling;
 pub mod scratch;
 pub mod slot_pool;
+pub mod text_encoder;
+pub mod vae;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{

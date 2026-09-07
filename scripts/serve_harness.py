@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, base64, errno, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, urllib.error, urllib.request, zlib
 from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
@@ -513,7 +513,9 @@ def show_config(cfg):
     _note = ('no think block emitted' if _thinking_off
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
-             else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
+             else ('n/a for --mode images (diffusion pipe, no chat completion)'
+                   if cfg['mode'] == 'images'
+                   else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail'))
     print(f"  max_tokens     : {cfg['max_tokens']}"
           f" [{cfg.get('max_tokens_source', 'unknown')}]  ({_note})")
     print("  sampling (what IS set):")
@@ -1989,6 +1991,10 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
                  "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    if cfg.get("mode") == "images":
+        # Pre-warm the diffusion pipe at serve start and pin it (no idle
+        # eviction) so the images battery is deterministic start to finish.
+        serve_cmd.extend(["--model", cfg["model"], "--idle-timeout", "0"])
     if cfg.get("tp"):
         serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
@@ -2569,11 +2575,248 @@ def turn_line(i, r, recall=""):
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
+def _decode_png(data):
+    """Minimal dependency-free PNG decoder: 8-bit, non-interlaced, color
+    types 2 (RGB) / 6 (RGBA), all filter types. Returns (w, h, RGB bytes)."""
+    pos = 8
+    w = h = 0
+    color = 2
+    idat = bytearray()
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if ctype == b"IHDR":
+            w, h, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or interlace != 0 or color not in (2, 6):
+                raise ValueError(
+                    f"unsupported PNG for images battery: depth={depth} "
+                    f"color={color} interlace={interlace}"
+                )
+        elif ctype == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(bytes(idat))
+    ch = 3 if color == 2 else 4
+    stride = w * ch
+    out = bytearray(w * h * 3)
+    prev = bytearray(stride)
+    row_len = stride + 1
+    for y in range(h):
+        f = raw[y * row_len]
+        cur = bytearray(raw[y * row_len + 1:(y + 1) * row_len])
+        if f == 1:  # Sub
+            for i in range(ch, stride):
+                cur[i] = (cur[i] + cur[i - ch]) & 0xFF
+        elif f == 2:  # Up
+            for i in range(stride):
+                cur[i] = (cur[i] + prev[i]) & 0xFF
+        elif f == 3:  # Average
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                cur[i] = (cur[i] + ((a + prev[i]) >> 1)) & 0xFF
+        elif f == 4:  # Paeth
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (cur[i] + pr) & 0xFF
+        for x in range(w):
+            base = (y * w + x) * 3
+            src = x * ch
+            out[base] = cur[src]
+            out[base + 1] = cur[src + 1]
+            out[base + 2] = cur[src + 2]
+        prev = cur
+    return w, h, out
+
+
+def _img_psnr_ssim(a, b):
+    """PSNR in dB (inf for identical) and global SSIM over equal-length RGB
+    byte arrays. The 1e-3 relative tolerance is enforced at the
+    call site as ssim >= 0.999; byte-identical images score inf / 1.0."""
+    n = len(a)
+    mse = 0.0
+    for x, y in zip(a, b):
+        d = x - y
+        mse += d * d
+    mse /= n
+    psnr = float("inf") if mse == 0.0 else 10.0 * math.log10(255.0 * 255.0 / mse)
+    ma = sum(a) / n
+    mb = sum(b) / n
+    va = sum((x - ma) ** 2 for x in a) / n
+    vb = sum((x - mb) ** 2 for x in b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / n
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    ssim = ((2 * ma * mb + c1) * (2 * cov + c2)) / (
+        (ma * ma + mb * mb + c1) * (va + vb + c2)
+    )
+    return psnr, ssim
+
+
+def _image_request(cfg, prompt, seed, width, height, steps, extra=None):
+    """One POST to /v1/images/generations; returns status + decoded payload.
+
+    On 200: png bytes/md5, size echo, hipfire metadata. On HTTP error: status
+    and the OpenAI error message. Request bytes are md5-stamped per AGENTS.md
+    discipline so a run is byte-identified."""
+    body = {"model": "ignored", "prompt": prompt, "n": 1,
+            "size": f"{width}x{height}", "steps": steps, "seed": seed}
+    if extra:
+        body.update(extra)
+    body_bytes = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{cfg['port']}/v1/images/generations",
+        data=body_bytes, headers={"Content-Type": "application/json"}, method="POST")
+    t0 = time.time()
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    try:
+        with urllib.request.urlopen(req, timeout=900) as raw:
+            resp = json.load(raw)
+    except urllib.error.HTTPError as err:
+        text = err.read().decode("utf-8", "ignore")
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = {"error": {"message": text[:200]}}
+        return {"http_status": err.code,
+                "error_message": payload.get("error", {}).get("message", ""),
+                "request_md5": request_md5}
+    png = base64.b64decode(resp["data"][0]["b64_json"])
+    return {"http_status": 200, "png": png,
+            "png_md5": hashlib.md5(png).hexdigest(), "png_bytes": len(png),
+            "size_echo": resp["data"][0].get("size"),
+            "request_md5": request_md5,
+            "hipfire": resp.get("hipfire", {}) or {},
+            "model_echo": resp.get("model"), "ms": time.time() - t0}
+
+
+def _run_images_battery(cfg, args):
+    """Image battery: deterministic seeded txt2img over the
+    live serve path.
+
+    Gates: (1) every valid request is 200 and echoes the requested size;
+    (2) same seed repeats byte-identically within one process (self PSNR =
+    inf, SSIM = 1.0, asserted >= 60 dB / >= 0.999); (3) refuse cases fail
+    closed with 400 + message; (4) same seed across a second fresh serve
+    process is byte-identical (cross-process determinism).
+
+    PSNR/SSIM against the committed diffusers golden are recorded as eyeball
+    metrics only: the golden was generated with torch noise and hipfire's
+    seeded noise is its own xorshift64*/Box-Muller generator, so
+    golden-identity is not a pass criterion and must never be asserted."""
+    prompt = args.img_prompt
+    width, height, steps = args.img_width, args.img_height, args.img_steps
+    seeds = [int(s) for s in re.split(r"[,\s]+", args.img_seeds) if s.strip()]
+    if not seeds:
+        sys.exit("serve_harness: --img-seeds must contain at least one seed")
+    gold = {}
+    rows = []
+    refuse = [
+        ("bad-size", {"size": "31x32"}),
+        ("n2", {"n": 2}),
+        ("missing-prompt", {"prompt": ""}),
+        ("bad-format", {"response_format": "png"}),
+        ("bad-steps", {"steps": 0}),
+        ("negative-prompt", {"negative_prompt": "ugly"}),
+        ("bad-sampler", {"sampler": "dpmpp"}),
+        # Reference images never ride the JSON generations body (and never as
+        # server paths): they are multipart file parts on /v1/images/edits.
+        ("images-on-generations", {"images": ["/etc/hostname"]}),
+    ]
+    for seed in seeds:
+        r1 = _image_request(cfg, prompt, seed, width, height, steps)
+        r2 = _image_request(cfg, prompt, seed, width, height, steps)
+        if r1["http_status"] != 200 or r2["http_status"] != 200:
+            sys.exit(f"serve_harness: images battery seed {seed} failed: "
+                     f"{r1.get('error_message') or r2.get('error_message')}")
+        parity = r1["png"] == r2["png"]
+        psnr, ssim = _img_psnr_ssim(r1["png"], r2["png"])
+        if not parity or psnr < 60.0 or ssim < 0.999:
+            sys.exit(
+                f"serve_harness: images battery seed {seed} within-process "
+                f"determinism FAILED (parity={parity} psnr={psnr:.1f}dB ssim={ssim:.4f})"
+            )
+        gold[seed] = r1["png"]
+        # Keep the actual pixels for a human eyeball: one PNG per seed beside
+        # the serve log (append-only log dir; the artifact is a new file).
+        img_artifact = f"{args.serve_log}.img-seed-{seed}.png"
+        try:
+            with open(img_artifact, "wb") as fh:
+                fh.write(r1["png"])
+            print(f"  [img artifact] {img_artifact}", flush=True)
+        except OSError as err:
+            print(f"  [img artifact] could not write {img_artifact}: {err}", flush=True)
+        rows.append({
+            "mode": "images", "seed": seed, "width": width, "height": height,
+            "steps": steps, "png_md5": r1["png_md5"], "png_bytes": r1["png_bytes"],
+            "within_parity": parity, "self_psnr_db": psnr, "self_ssim": ssim,
+            "ms": r1["ms"], "request_md5": r1["request_md5"],
+            "size_echo": r1["size_echo"], "model_echo": r1["model_echo"],
+            "runaway": False, "empty": False, "attractor": False,
+        })
+        print(f"  [img seed={seed}] 200 in {r1['ms'] * 1000:.0f}ms "
+              f"{r1['png_bytes']}B md5={r1['png_md5'][:12]} "
+              f"within-parity={parity} self-psnr={psnr:.1f}dB self-ssim={ssim:.4f}",
+              flush=True)
+    for name, extra in refuse:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps, extra)
+        ok = r["http_status"] == 400 and bool(r.get("error_message"))
+        rows.append({"mode": "images-refusal", "case": name,
+                     "http_status": r["http_status"],
+                     "error_message": r.get("error_message", ""), "ok": ok})
+        print(f"  [img refuse {name}] {r['http_status']} ok={ok} :: "
+              f"{r.get('error_message', '')[:70]}", flush=True)
+    if not all(r["ok"] for r in rows if r.get("mode") == "images-refusal"):
+        sys.exit("serve_harness: images battery fail-closed refusal gate failed")
+    golden_path = os.path.abspath(args.img_golden)
+    if os.path.isfile(golden_path):
+        gw, gh, gpx = _decode_png(open(golden_path, "rb").read())
+        for seed, png in gold.items():
+            w, h, px = _decode_png(png)
+            if (w, h) != (gw, gh):
+                print(f"  [img golden seed={seed}] size {w}x{h} vs golden "
+                      f"{gw}x{gh}; eyeball metrics skipped", flush=True)
+                continue
+            psnr, ssim = _img_psnr_ssim(px, gpx)
+            print(f"  [img golden seed={seed}] golden-vs-seeded psnr={psnr:.1f}dB "
+                  f"ssim={ssim:.4f} (different noise sources; report-only, "
+                  f"not a gate)", flush=True)
+    else:
+        print(f"  [img golden] fixture not found at {golden_path}; "
+              f"eyeball metrics skipped", flush=True)
+    # Cross-process determinism: same seed, second fresh serve process.
+    second = spawn_serve(cfg, args.home, args.serve_log)
+    if second is None:
+        sys.exit("serve_harness: images battery second serve span failed to warm")
+    cross = None
+    try:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps)
+        cross = r["http_status"] == 200 and r["png"] == gold[seeds[0]]
+        rows.append({"mode": "images-cross-process", "seed": seeds[0],
+                     "cross_parity": cross, "png_md5": r.get("png_md5", ""),
+                     "http_status": r.get("http_status")})
+        print(f"  [img cross-process seed={seeds[0]}] http={r['http_status']} "
+              f"byte-parity={cross}", flush=True)
+    finally:
+        _kill_serve()
+    if not cross:
+        sys.exit("serve_harness: images battery cross-process byte parity "
+                 "FAILED (same seed across processes must be byte-identical)")
+    return rows
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
     feedback_shape = getattr(args, "feedback_shape", None) or "rich"
+    if cfg["mode"] == "images":
+        return _run_images_battery(cfg, args)
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
@@ -2872,13 +3115,35 @@ def main():
                     help="context length; omitted resolves canonical-tag policy then 32768")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
-    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
+    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images"])
     ap.add_argument(
         "--session",
         default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
         help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
     )
     ap.add_argument("--port", type=int, default=11520)
+    # --mode images battery knobs.
+    ap.add_argument(
+        "--img-prompt",
+        default="a tiny cat sitting on a tiny table",
+        help="Prompt for --mode images (tiny diffusion pipe fixture).",
+    )
+    ap.add_argument(
+        "--img-golden",
+        default=os.path.join(
+            REPO, "crates", "hipfire-arch-diffusion", "tests", "fixtures",
+            "tiny-pipeline", "golden.png",
+        ),
+        help="Committed diffusers golden PNG for eyeball PSNR/SSIM metrics "
+             "(report-only; the golden is torch noise, not hipfire's seeded noise).",
+    )
+    ap.add_argument("--img-width", type=int, default=32,
+                    help="Pixel width for --mode images (must be divisible by the VAE upscale).")
+    ap.add_argument("--img-height", type=int, default=32)
+    ap.add_argument("--img-steps", type=int, default=2,
+                    help="Denoise steps for --mode images (1..128).")
+    ap.add_argument("--img-seeds", default="0,7",
+                    help="Comma/space separated seeds exercised in --mode images.")
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
     ap.add_argument(
@@ -2963,7 +3228,7 @@ def main():
         return
     # `off` resolves to the sentinel cap 1, which is not a real think budget — no
     # think block is emitted at all, so the think-only-output guard does not apply.
-    if (cfg['thinking_cap_tokens'] != 1
+    if args.mode != "images" and (cfg['thinking_cap_tokens'] != 1
             and cfg['thinking_cap_tokens']
             and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(

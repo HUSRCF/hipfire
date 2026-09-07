@@ -140,6 +140,24 @@ struct FormatFlags {
 pub(crate) fn run() {
     let args = QuantizeArgs::parse();
 
+    // ── FLUX.1 component pack (HFQM) — separate surface from quantizing ────
+    // Packs a diffusers FLUX.1 pipe into per-component HFQ files instead of
+    // running the quantize pipeline (--format is ignored on this path).
+    if let Some(pipe) = &args.flux_pipe {
+        let result = crate::pipeline_flux::run_flux_pack(
+            std::path::Path::new(pipe),
+            &args.flux_component,
+            std::path::Path::new(&args.output),
+        );
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: flux pack: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ── Strict validation before worker threads ──────────────────────────
     // Unknown class/dtype tokens must fail before rayon spawn, and CLI/env
     // parsers must share the same strict set.
@@ -177,7 +195,10 @@ pub(crate) fn run() {
 
     setup_thread_pool(&args);
 
-    let input_dir = args.input.as_str();
+    let input_dir = args
+        .input
+        .as_deref()
+        .expect("--input is required unless --flux-pipe is given");
     let output_path = args.output.as_str();
     let format = args.format.as_str();
 
@@ -2968,7 +2989,10 @@ fn setup_thread_pool(args: &QuantizeArgs) {
 }
 
 fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
-    let input_dir = args.input.as_str();
+    let input_dir = args
+        .input
+        .as_deref()
+        .expect("--input is required unless --flux-pipe is given");
     let output_path = args.output.as_str();
     let format = args.format.as_str();
     // ── maple: Maple-Preview native-ternary onboarding ──────────────────────
@@ -3042,7 +3066,11 @@ fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
 }
 
 fn run_qwen3_dspark(args: &QuantizeArgs) {
-    let input_dir = Path::new(args.input.as_str());
+    let input_dir = Path::new(
+        args.input
+            .as_deref()
+            .expect("--input is required unless --flux-pipe is given"),
+    );
     let output_path = Path::new(args.output.as_str());
 
     // Read config

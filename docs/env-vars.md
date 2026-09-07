@@ -518,6 +518,16 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
+| `HIPFIRE_FLUX_ATTN` | crates/hipfire-arch-diffusion/src/flux_gpu.rs, crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLUX_ATTN_GRID` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLUX_F16_ACT` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GEMM_LDS` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GEMM_PIPE` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_FLUX_GEMM_WIDE` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GUIDANCE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_FLUX_MOD_GEMV` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_ROPE_FAST` | crates/rdna-compute/src/norm.rs |
+| `HIPFIRE_FLUX_WPAD` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs, scripts/install.sh |
 | `HIPFIRE_FORCE_SPEC_GATE` | scripts/coherence-gate-dflash.sh |
@@ -685,6 +695,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh |
+| `HIPFIRE_IMG_COND_CACHE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_IMG_PROFILE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_JINJA_CHAT` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh |
@@ -998,6 +1010,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh |
 | `HIPFIRE_SWEEP_RUNS` | scripts/ddtree_budget_sweep.sh |
+| `HIPFIRE_T5_GPU` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_TEST_MODEL` | scripts/test-qwen35-abort-resume.sh, scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs |
@@ -1010,6 +1023,15 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
+| `HIPFIRE_VAE_CONFIG_ONLY` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_VAE_CONV` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_FUSE_NORM` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_GPU` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_VAE_IM2COL_MAP` | crates/rdna-compute/src/vae.rs |
+| `HIPFIRE_VAE_IM2COL_MB` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_IM2COL_TILE` | crates/rdna-compute/src/vae.rs |
+| `HIPFIRE_VAE_PROFILE` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_TRANSPOSE` | crates/rdna-compute/src/vae.rs |
 | `HIPFIRE_VERIFY_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_probe.rs, crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/tree_graph_bench.sh |

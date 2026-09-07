@@ -25,10 +25,12 @@ hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
 saddle-core = { path = "../saddle-core" }
+rdna-compute = { path = "../rdna-compute" }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+base64.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"

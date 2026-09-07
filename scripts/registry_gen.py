@@ -276,6 +276,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 15
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
+    # FLUX.1 MMDiT trunk packs (per-component HFQ, arch 40; sidecar ids
+    # 41/42/43 live in the packs' own headers, not the registry entry).
+    if family in ("flux", "flux.schnell", "flux.dev"):
+        return 40
     return None
 
 
@@ -393,12 +397,23 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
+    # Image-component (diffusion) repos publish AFTER their packs exist, so a
+    # missing repo is expected until the first upload: sizes/digests stay TBD
+    # on those entries. Fail-closed stays for text-model repos, where a probe
+    # failure means a typo or a broken upload.
+    image_repos = {e["repo"] for e in models.values() if e.get("arch_id") == 40}
     trees: dict[str, dict[str, dict]] = {}
     for repo in repos:
         try:
             trees[repo] = repo_tree(repo, token)
             log(f"probed {repo}: {len(trees[repo])} files")
         except Exception as e:  # noqa: BLE001 — collected, run fails closed
+            if repo in image_repos:
+                log(
+                    f"repo {repo}: image-component repo not published yet ({e}); "
+                    f"sizes/digests stay TBD"
+                )
+                continue
             errors.append(f"repo {repo}: tree probe failed: {e}")
 
     out_models: dict = {}
@@ -482,7 +497,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp", "dflash"):
+            for kind in ("triattn", "mtp", "dflash", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
         # repo probe already failed → error recorded above; entry still gets
