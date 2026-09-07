@@ -390,7 +390,7 @@ struct RunArgs {
     #[arg(long, alias = "md")]
     model_draft: Option<PathBuf>,
     /// Explicit vision-tower sidecar (overrides the registry `vision` slot
-    /// and `HIPFIRE_VISION_SIDECAR`).
+    /// and `HIPFIRE_VISION_SIDECAR`; skipped while `vision_mode=off`).
     #[arg(long)]
     vision: Option<PathBuf>,
     /// Override the active MTP/n-gram draft window.
@@ -628,7 +628,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     kv_backend: Option<String>,
     /// Vision-tower sidecar wired into every model load (`params["vision"]`);
-    /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`.
+    /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
+    /// skipped while `vision_mode=off`.
     #[arg(long)]
     vision: Option<PathBuf>,
     /// Idle model-unload timeout in seconds; zero disables eviction.
@@ -2152,6 +2153,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         canonical.as_deref(),
     )?;
     if let Some(vision) = &args.vision {
+        // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
+        // and can then name the sidecar it declined on an image request.
         params["vision"] = serde_json::json!(vision.display().to_string());
     }
     if let Some(window) = args.draft_max {
@@ -2958,6 +2961,7 @@ pub(crate) fn load_params(
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
+        "vision_mode": config_string(resolved, "vision.mode")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
         "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
@@ -3001,7 +3005,7 @@ pub(crate) fn load_params(
         // bail — when one was given.
         resolve_dflash_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     }
-    resolve_vision_sidecar(&mut params, entry, models_dir, model_path)?;
+    resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     Ok(params)
 }
 
@@ -3070,21 +3074,37 @@ fn resolve_dflash_sidecar(
 
 /// Resolve a registry-declared vision-tower sidecar into `params["vision"]`.
 ///
-/// Priority: an already-projected `params["vision"]` (e.g. `run --vision`)
-/// always wins; then `HIPFIRE_VISION_SIDECAR` (empty string opts out, the
-/// same semantics as `HIPFIRE_DFLASH_DRAFT`); then `entry.vision`, looked up
-/// in `models_dir` first — `find_model_path` canonicalizes, so a symlinked
-/// target's parent is wherever the artifact really lives, not the models
-/// directory the sidecar was pulled into — then next to the target, then as
-/// the `<trunk-stem>-vision.hfq` sibling convention beside any trunk. A
-/// declared-but-unpulled sidecar is silently skipped: vision is an opt-in
-/// enhancement, never a load gate, so text-only runs stay quiet.
+/// Call only once the final `vision_mode` is known (`load_params` projects it
+/// from `vision.mode`). `off` is a hard override mirroring the daemon's
+/// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
+/// one. `auto` uses the registry/sibling sidecar when present and runs
+/// silently text-only when absent. `on` requires the declared sidecar and
+/// fails the load closed when it cannot be resolved (same shape as the
+/// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
+/// and is unaffected by this key under every mode.
+///
+/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
+/// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
+/// `entry.vision`, looked up in `models_dir` first — `find_model_path`
+/// canonicalizes, so a symlinked target's parent is wherever the artifact
+/// really lives, not the models directory the sidecar was pulled into —
+/// then next to the target, then as the `<trunk-stem>-vision.hfq` sibling
+/// convention beside any trunk.
 fn resolve_vision_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
     models_dir: &Path,
     model_path: &Path,
+    tag: Option<&str>,
 ) -> Result<()> {
+    // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
+    // override and the only place that decides; leaving the resolved path in
+    // the params lets it tell an image request which sidecar it declined.
+    let mode = params["vision_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "off" | "auto" | "on") {
+        return Ok(());
+    }
     if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
         if projected.is_empty() {
             if let Some(obj) = params.as_object_mut() {
@@ -3119,6 +3139,16 @@ fn resolve_vision_sidecar(
     }
     if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
         params["vision"] = serde_json::json!(hit.display().to_string());
+        return Ok(());
+    }
+    if mode == "on" {
+        if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
+            let tag = tag.unwrap_or("<model>");
+            bail!(
+                "Vision tower {} is not pulled; run `hipfire pull {tag}` or pass --vision",
+                sidecar.file
+            );
+        }
     }
     Ok(())
 }
@@ -7556,6 +7586,18 @@ mod tests {
         .unwrap()
     }
 
+    fn resolved_with_vision_mode(mode: &str) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("vision.mode", mode).unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("vision.mode={mode}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
     #[test]
     pub(crate) fn load_params_resolves_registry_dflash_sidecar_when_present() {
         // (b) auto + pulled draft file → params["draft"] points at it.
@@ -7792,8 +7834,8 @@ mod tests {
 
     #[test]
     pub(crate) fn load_params_resolves_registry_vision_sidecar_when_present() {
-        // Registry `vision.file` pulled into the models dir wires
-        // `params["vision"]` for the daemon load.
+        // `auto` + pulled registry `vision.file` wires `params["vision"]`
+        // for the daemon load.
         let paths = test_paths("vision-sidecar-present");
         fs::create_dir_all(&paths.models).unwrap();
         let model_path = paths.models.join("qwen3.8-27b.mq4");
@@ -7801,7 +7843,7 @@ mod tests {
         let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
         fs::write(&vision_path, b"vision").unwrap();
         let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
-        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let resolved = resolved_with_vision_mode("auto");
         let params = load_params(
             &resolved,
             Some(&entry),
@@ -7820,14 +7862,14 @@ mod tests {
 
     #[test]
     pub(crate) fn load_params_skips_vision_sidecar_when_unpulled() {
-        // A declared but unpulled sidecar is silently skipped: vision never
-        // gates a text-only load.
+        // `auto` + declared but unpulled sidecar is silently skipped: vision
+        // never gates a text-only load.
         let paths = test_paths("vision-sidecar-absent");
         fs::create_dir_all(&paths.models).unwrap();
         let model_path = paths.models.join("qwen3.8-27b.mq4");
         fs::write(&model_path, b"model").unwrap();
         let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
-        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let resolved = resolved_with_vision_mode("auto");
         let params = load_params(
             &resolved,
             Some(&entry),
@@ -7846,8 +7888,8 @@ mod tests {
 
     #[test]
     pub(crate) fn load_params_discovers_stem_vision_sibling_beside_trunk() {
-        // No registry identity at all: `<trunk-stem>-vision.hfq` beside the
-        // trunk is still discovered.
+        // `auto` with no registry identity at all: `<trunk-stem>-vision.hfq`
+        // beside the trunk is still discovered.
         let paths = test_paths("vision-stem-sibling");
         let elsewhere = paths.root.join("artifacts");
         fs::create_dir_all(&elsewhere).unwrap();
@@ -7855,7 +7897,7 @@ mod tests {
         fs::write(&model_path, b"model").unwrap();
         let vision_path = elsewhere.join("qwen3.8-27b-vision.hfq");
         fs::write(&vision_path, b"vision").unwrap();
-        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let resolved = resolved_with_vision_mode("auto");
         let params = load_params(
             &resolved,
             None,
@@ -7882,8 +7924,15 @@ mod tests {
         fs::write(&model_path, b"model").unwrap();
         fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
         let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
-        let mut params = serde_json::json!({});
-        resolve_vision_sidecar(&mut params, Some(&entry), &paths.models, &model_path).unwrap();
+        let mut params = serde_json::json!({"vision_mode": "auto"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
         assert_eq!(
             params["vision"],
             paths
@@ -7894,11 +7943,154 @@ mod tests {
         );
         // An explicit override survives a second resolution pass.
         params["vision"] = serde_json::json!("/custom/tower.hfq");
-        resolve_vision_sidecar(&mut params, Some(&entry), &paths.models, &model_path).unwrap();
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
         assert_eq!(params["vision"], "/custom/tower.hfq");
         // Empty string opts out: the key is dropped, never re-resolved.
         params["vision"] = serde_json::json!("");
-        resolve_vision_sidecar(&mut params, Some(&entry), &paths.models, &model_path).unwrap();
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_off_still_forwards_sidecar_for_daemon_gate() {
+        // `off` is a hard override: a pulled sidecar is never wired, and an
+        // explicitly projected path is stripped, mirroring `dflash_mode=off`.
+        let paths = test_paths("vision-mode-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("off");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "off");
+        // `off` still resolves the sidecar into the params: the daemon's gate
+        // is the hard override and needs the path to name what it declined.
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
+        );
+        // An explicitly projected path is forwarded untouched under `off`.
+        let mut params = serde_json::json!({"vision_mode": "off", "vision": "/custom/tower.hfq"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_wires_sidecar_when_present() {
+        // `on` + pulled sidecar wires it like `auto`.
+        let paths = test_paths("vision-mode-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "on");
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_fails_closed_when_sidecar_missing() {
+        // `on` + declared but unpulled sidecar fails closed with a pull hint
+        // naming the tag — same shape as the DFlash `on` refusal.
+        let paths = test_paths("vision-mode-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+        )
+        .expect_err("on without a pulled tower must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen3.8-27b-vision.hfq"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_leaves_bare_trunk_alone() {
+        // `on` with no declared sidecar never fails: a trunk with an embedded
+        // tower is unaffected by this key, so the load proceeds without one.
+        let paths = test_paths("vision-mode-on-bare");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+        )
+        .unwrap();
         assert!(params.get("vision").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }

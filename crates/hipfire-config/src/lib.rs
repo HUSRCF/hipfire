@@ -265,6 +265,7 @@ pub enum ConfigCategory {
     Memory,
     Attention,
     Speculation,
+    Vision,
     Replay,
     Fusions,
     Prompt,
@@ -1102,6 +1103,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DFLASH_MODE"),
         "DFlash eligibility policy."
+    ),
+    field!(
+        "vision.mode",
+        "vision_mode",
+        Vision,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        Some("HIPFIRE_VISION_MODE"),
+        "Vision-tower sidecar policy."
     ),
     field!(
         "speculation.dflash_ngram_block",
@@ -4826,6 +4839,20 @@ mod tests {
         assert_eq!(field.parse_cli("4").unwrap(), ConfigValue::Integer(4));
         assert!(field.parse_cli("0").is_err());
         assert!(field.parse_cli("7").is_err());
+    }
+    #[test]
+    fn vision_mode_defaults_off_with_auto_on_off_values() {
+        let field = field("vision.mode").expect("vision.mode schema field");
+        assert_eq!(field.legacy_key, "vision_mode");
+        assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
+        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
+        for mode in ["off", "auto", "on"] {
+            assert_eq!(
+                field.parse_cli(mode).unwrap(),
+                ConfigValue::String(mode.into())
+            );
+        }
+        assert!(field.parse_cli("sometimes").is_err());
     }
 
     #[test]

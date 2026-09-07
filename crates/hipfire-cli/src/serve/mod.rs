@@ -92,7 +92,8 @@ pub(crate) struct ServeRuntime {
     pub(crate) kv_backend_override: Option<String>,
     /// Explicit vision-tower sidecar (`serve --vision`) projected as
     /// `params["vision"]` on every model load, winning over the registry
-    /// `vision` slot and `HIPFIRE_VISION_SIDECAR`.
+    /// `vision` slot and `HIPFIRE_VISION_SIDECAR`; skipped while
+    /// `vision_mode=off`.
     pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
@@ -1159,6 +1160,7 @@ impl ServeRuntime {
                 false,
             )?;
             if let Some(vision) = self.vision_override.as_ref() {
+                // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
                 params["vision"] = serde_json::json!(vision.display().to_string());
             }
             if let Some(tp) = self.tp {

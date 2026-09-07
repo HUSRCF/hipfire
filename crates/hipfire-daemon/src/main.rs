@@ -450,6 +450,21 @@ fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool 
     load_tp > 1 && !model_present
 }
 
+/// Daemon-side `vision_mode` gate for the tower sidecar path.
+///
+/// `off` (the default) is a hard override that drops even an explicit
+/// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
+/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
+/// ladder result through untouched. Pure string plumbing — no arch or
+/// tensor knowledge; admission still validates the surviving path.
+fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
+    if vision_mode == "off" {
+        None
+    } else {
+        raw_vision
+    }
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -705,6 +720,10 @@ fn main() {
     // Lives alongside `model` so unload_model + this state are paired
     // teardowns.
     let mut pflash_state: Option<hipfire_pflash::pflash::PflashState> = None;
+    // Set when the most recent load had a tower sidecar available but
+    // `vision_mode=off` skipped it, so an image request can name the knob
+    // instead of claiming the model has no vision encoder at all.
+    let mut vision_gated_off: Option<String> = None;
     // The PflashConfig captured at load time. Per-request `prefill_*`
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
@@ -1163,8 +1182,19 @@ fn main() {
                 // unset → `params.vision` as sent. Arch-free string plumbing —
                 // admission validates (arch 5|6, tower tensor present) and the
                 // Qwen35 carrier loads the tower from it.
+                //
+                // `vision_mode=off` (the default) is a hard daemon-side override,
+                // mirroring the `dflash_mode=off` guard above: even an explicit
+                // sidecar is skipped, so a default load never pays the +~1 GB
+                // tower VRAM. CLI-side gating is the primary path; this guard
+                // makes the flag durable for non-hipfire-CLI clients.
+                let vision_mode = msg
+                    .get("params")
+                    .and_then(|p| p.get("vision_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("off");
                 let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let vision_path: Option<String> = match env_vision.as_deref() {
+                let raw_vision: Option<String> = match env_vision.as_deref() {
                     Some("") => None,
                     Some(p) => Some(p.to_string()),
                     None => msg
@@ -1174,6 +1204,16 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                vision_gated_off = None;
+                if vision_mode == "off" {
+                    if let Some(v) = raw_vision.as_deref() {
+                        eprintln!(
+                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
+                        );
+                        vision_gated_off = Some(v.to_string());
+                    }
+                }
+                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -2580,7 +2620,16 @@ fn main() {
                 let has_vl = m.has_vision_encoder();
 
                 if has_image && !has_vl {
-                    write_error(&mut stdout, id, "model has no vision encoder");
+                    match vision_gated_off.as_deref() {
+                        Some(sidecar) => write_error(
+                            &mut stdout,
+                            id,
+                            &format!(
+                                "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+                            ),
+                        ),
+                        None => write_error(&mut stdout, id, "model has no vision encoder"),
+                    }
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw
@@ -3532,6 +3581,7 @@ fn main() {
                 // drafter buffers cached in the just-emptied pool with
                 // no drain to follow, so the VRAM stays resident until
                 // the next load message arrives. Order matters here.
+                vision_gated_off = None;
                 if let Some(mut pf) = pflash_state.take() {
                     if let Some(mut dg) = pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();
@@ -4316,6 +4366,33 @@ fn main() {
                 );
                 let _ = stdout.flush();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_vision_mode_gate;
+
+    #[test]
+    fn vision_mode_off_drops_even_an_explicit_sidecar() {
+        // Hard override, mirroring the `dflash_mode=off` draft guard: a
+        // default load never pays the tower VRAM, however the path arrived.
+        assert_eq!(
+            apply_vision_mode_gate("off", Some("/models/qwen3.8-27b-vision.hfq".into())),
+            None
+        );
+        assert_eq!(apply_vision_mode_gate("off", None), None);
+    }
+
+    #[test]
+    fn vision_mode_auto_and_on_pass_the_ladder_result_through() {
+        for mode in ["auto", "on"] {
+            assert_eq!(
+                apply_vision_mode_gate(mode, Some("/models/qwen3.8-27b-vision.hfq".into())),
+                Some("/models/qwen3.8-27b-vision.hfq".to_owned())
+            );
+            assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
     }
 }

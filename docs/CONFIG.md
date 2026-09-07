@@ -328,6 +328,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
+| `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when weights present (DeepSeek path primary). Separate Qwen35 MTP env gate may apply — see env doc. |
@@ -342,6 +343,25 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 Legacy compatibility input still wins at the top of the startup ladder for
 the corresponding knobs, but the engine receives only the resolved immutable
 snapshot. Full aliases: [`env-vars.md`](env-vars.md).
+
+---
+## Vision tower
+
+| Key | Default | Values / range |
+|---|---|---|
+| `vision_mode` | `"off"` | `off` \| `auto` \| `on` |
+
+- **`off`** (default) — never load a tower sidecar. The registry/sibling file is not wired, and even an explicit `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR` path is skipped with one stderr line. The daemon enforces the same hard override for non-CLI clients, mirroring `dflash_mode=off`. Text loads pay no tower VRAM (~1 GB).
+- **`auto`** — use the registry `vision` slot (or the `<trunk-stem>-vision.hfq` sibling beside the trunk) when present; silently text-only when absent.
+- **`on`** — require the declared sidecar: the load fails closed with a pull hint when it cannot be resolved. A trunk with an embedded tower declares no sidecar and is unaffected by this key.
+
+```bash
+hipfire config set vision_mode auto
+hipfire config qwen3.8:27b set vision_mode auto   # per-model overlay
+HIPFIRE_VISION_MODE=auto hipfire run qwen3.8:27b  # one-shot
+```
+
+Loading detail: [`MODELS.md`](MODELS.md). Env inventory: [`env-vars.md`](env-vars.md).
 
 ---
 
@@ -544,6 +564,7 @@ uses ambient variables in engine hot paths.
 | `prompt_heat_json` | `diagnostic.prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | off unless `1` |
 | `prompt_heat_limit` | `diagnostic.prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | 64 |
 | `dflash_mode` | `speculation.dflash` | `HIPFIRE_DFLASH_MODE` | `"off"` |
+| `vision_mode` | `vision.mode` | `HIPFIRE_VISION_MODE` | `"off"` |
 | `draft_f16` | `speculation.draft_f16` | `HIPFIRE_DRAFT_F16` | true unless `0` |
 | `draft_gemm_dump` | `diagnostic.draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | off unless `1` |
 | `draft_subphase` | `diagnostic.draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | off unless `1` |
