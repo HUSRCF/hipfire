@@ -17,6 +17,7 @@
 - `ornith-1.5:fast` alias → `ornith-1.5:35b-a3b-mq4r` (#680).
 - `moe_topk_renorm_k8` barrier (partial #670, nwoolmer).
 - Image generation: FLUX.1 schnell / FLUX.2 Klein via `hipfire img`, `POST /v1/images/generations` + `/edits`, `hipfire-quantize --flux-pipe` (philhug; first release; RDNA3/3.5 measured).
+- Qwen3.8-27B vision as a shared sidecar: `qwen3.8-27b-vision.hfq` (F16 tower, mmproj-style) pairs with every text quant tier — `hipfire pull` fetches it, `run`/`serve` accept `--vision`, `hipfire-quantize --vision-only` packs it. No trunk requantization. Validated on the committed 6-image desc/OCR battery; tower parity vs HF is decoder-bounded (zune-jpeg vs libjpeg chroma), see `benchmarks/vision/`.
 - Gate overhaul: `change_gate` / agentic-review retired (#700); hw-gate pins Qwen3.8 MQ4-XT and drops qwen3.6 as current fixture.
 - S1+S2 dependency hygiene and panic-free config CLI (#701).
 - All production `HIPFIRE_*` reads are config-owned.
