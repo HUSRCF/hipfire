@@ -1265,6 +1265,11 @@ pub trait WeightBackend {
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
     /// Load a bias vector (f32). Only qwen2 attention biases use this today.
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
+    /// Return an already allocated tensor to this backend's GPU pool.
+    ///
+    /// Layer loading uses this narrow seam to roll back staged owners without
+    /// exposing the backend's device handle to arch crates.
+    fn free_tensor(&mut self, tensor: GpuTensor);
 }
 
 /// HFQ backend. `norm_bias`: `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
@@ -1320,6 +1325,9 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         );
         Ok(t)
     }
+    fn free_tensor(&mut self, tensor: GpuTensor) {
+        let _ = self.gpu.free_tensor(tensor);
+    }
 }
 
 /// Resolve `name` via `candidates` and return the first tensor's `(info, bytes)`.
@@ -1372,6 +1380,9 @@ impl<'a> WeightBackend for ParoBackend<'a> {
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
+    }
+    fn free_tensor(&mut self, tensor: GpuTensor) {
+        let _ = self.gpu.free_tensor(tensor);
     }
     fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
         Err(hip_bridge::HipError::new(

@@ -1339,67 +1339,109 @@ impl MmqScreenable for Qwen35Weights {
     }
 }
 
-fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
-    ffn.router.free_all(gpu);
-    ffn.shared_expert_gate.free_all(gpu);
-    ffn.shared_expert.gate.free_all(gpu);
-    ffn.shared_expert.up.free_all(gpu);
-    ffn.shared_expert.down.free_all(gpu);
-    let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
-    let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+/// Free a [`WeightTensor`] through a caller-supplied GPU-tensor cleanup seam.
+/// The callback receives every owned sidecar and the weight buffer exactly once.
+pub(crate) fn free_weight_with<F>(weight: WeightTensor, free: &mut F)
+where
+    F: FnMut(GpuTensor),
+{
+    if let Some(paro) = weight.paro {
+        if !paro.is_alias {
+            free(paro.pairs);
+            free(paro.theta);
+            free(paro.channel_scales);
+        }
+    }
+    if let Some(awq) = weight.awq_scale {
+        free(awq);
+    }
+    free(weight.buf);
+}
+
+/// Free a [`WeightTensor`]'s owning sidecars without freeing its weight buffer.
+/// Used only for non-owning views into [`PackedExpertOwners`].
+fn free_weight_metadata_with<F>(weight: WeightTensor, free: &mut F)
+where
+    F: FnMut(GpuTensor),
+{
+    if let Some(paro) = weight.paro {
+        if !paro.is_alias {
+            free(paro.pairs);
+            free(paro.theta);
+            free(paro.channel_scales);
+        }
+    }
+    if let Some(awq) = weight.awq_scale {
+        free(awq);
+    }
+}
+
+/// Free a staged MoE owner through a caller-supplied GPU-tensor cleanup seam.
+///
+/// The ownership branches here are authoritative for all current routed-expert
+/// layouts: ordinary per-expert weights, packed uniform-MQ4 owners, ParoQuant
+/// shared sidecars, EP dummy buffers, and paged-mode's empty expert vector.
+/// Each callback invocation consumes one actual owning buffer exactly once.
+pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTensor)) {
+    free_weight_with(ffn.router, free);
+    free_weight_with(ffn.shared_expert_gate, free);
+    free_weight_with(ffn.shared_expert.gate, free);
+    free_weight_with(ffn.shared_expert.up, free);
+    free_weight_with(ffn.shared_expert.down, free);
+    free(ffn.expert_gate_up_ptrs);
+    free(ffn.expert_down_ptrs);
     // Non-owning pointer table — free the buffer only; the per-expert scales it
     // points into are owned by `experts[i].down.awq_scale` and freed below via
-    // `e.down.free_all`.
+    // `free_weight_with`.
     if let Some(t) = ffn.expert_down_awq_ptrs {
-        let _ = gpu.free_tensor(t);
+        free(t);
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.
     if let Some(t) = ffn.expert_dtype_tags {
-        let _ = gpu.free_tensor(t);
+        free(t);
     }
     if let Some(owners) = ffn.packed_expert_owners {
         // Packed expert WeightTensors are non-owning views. Free only metadata
         // that remains individually owned, then return each layer blob once.
         for e in ffn.experts {
-            free_weight_metadata_only(gpu, e.gate_up);
-            free_weight_metadata_only(gpu, e.down);
+            free_weight_metadata_with(e.gate_up, free);
+            free_weight_metadata_with(e.down, free);
         }
-        let _ = gpu.free_tensor(owners.gate_up);
-        let _ = gpu.free_tensor(owners.down);
+        free(owners.gate_up);
+        free(owners.down);
     } else {
         for e in ffn.experts {
-            e.gate_up.free_all(gpu);
-            e.down.free_all(gpu);
+            free_weight_with(e.gate_up, free);
+            free_weight_with(e.down, free);
         }
     }
     // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
     // alias these and must NOT be freed separately — they're non-owning views).
     if let Some(s) = ffn.paro_shared {
-        let _ = gpu.free_tensor(s.gate_up_pairs);
-        let _ = gpu.free_tensor(s.gate_up_theta);
-        let _ = gpu.free_tensor(s.gate_up_channel_scales);
-        let _ = gpu.free_tensor(s.down_pairs);
-        let _ = gpu.free_tensor(s.down_theta);
-        let _ = gpu.free_tensor(s.down_channel_scales);
+        free(s.gate_up_pairs);
+        free(s.gate_up_theta);
+        free(s.gate_up_channel_scales);
+        free(s.down_pairs);
+        free(s.down_theta);
+        free(s.down_channel_scales);
     }
     for d in ffn.ep_dummy_buffers {
-        let _ = gpu.free_tensor(d);
+        free(d);
     }
 }
 
-/// Free a [`WeightTensor`]'s owning sidecars without freeing its weight buffer.
-/// Used only for non-owning views into [`PackedExpertOwners`].
+fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    let mut free = |tensor| {
+        let _ = gpu.free_tensor(tensor);
+    };
+    free_moe_ffn_with(ffn, &mut free);
+}
+
 fn free_weight_metadata_only(gpu: &mut Gpu, weight: WeightTensor) {
-    if let Some(paro) = weight.paro {
-        if !paro.is_alias {
-            let _ = gpu.free_tensor(paro.pairs);
-            let _ = gpu.free_tensor(paro.theta);
-            let _ = gpu.free_tensor(paro.channel_scales);
-        }
-    }
-    if let Some(awq) = weight.awq_scale {
-        let _ = gpu.free_tensor(awq);
-    }
+    let mut free = |tensor| {
+        let _ = gpu.free_tensor(tensor);
+    };
+    free_weight_metadata_with(weight, &mut free);
 }
 
 // ─── State ──────────────────────────────────────────────────────────────

@@ -580,6 +580,24 @@ impl Qwen35DecodeBatchState {
         lane_capacity: usize,
         sample_repeat_capacity: usize,
     ) -> HipResult<Self> {
+        Self::new_with_output_alloc(
+            gpu,
+            config,
+            max_batch,
+            lane_capacity,
+            sample_repeat_capacity,
+            Gpu::zeros,
+        )
+    }
+
+    fn new_with_output_alloc(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        lane_capacity: usize,
+        sample_repeat_capacity: usize,
+        mut allocate_output: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
         if max_batch == 0 || lane_capacity == 0 || sample_repeat_capacity == 0 {
             return Err(HipError::new(
                 0,
@@ -607,10 +625,8 @@ impl Qwen35DecodeBatchState {
         // GpuTensor / KvCache / DeltaNetState / PrefillBatchScratch have no
         // freeing Drop (free needs &mut Gpu). A mid-`new` `?` would leak every
         // prior stage while the daemon falls back to sequential with the leak
-        // still resident. Stage each compound owner, then ordinary tensors
-        // through a ledger of non-owning aliases (same pattern as
-        // PrefillBatchScratch::new_opt): on error free aliases + compound
-        // owners before propagating; on success aliases drop as no-ops.
+        // still resident. Stage each compound owner, then stage ordinary
+        // tensors as actual owners until the struct is published.
         let kv_cache = llama::KvCache::new_gpu_q8_filtered(
             gpu,
             &is_kv_layer,
@@ -635,42 +651,53 @@ impl Qwen35DecodeBatchState {
             }
         };
 
-        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(7);
-        macro_rules! zeros {
-            ($shape:expr) => {
-                match gpu.zeros($shape, DType::F32) {
+        // Keep the actual output owners in the ledger. Borrowed aliases cannot
+        // be passed to free_tensor, so they are not useful for rollback.
+        let mut outputs: Vec<Option<GpuTensor>> = Vec::with_capacity(7);
+        macro_rules! output {
+            ($shape:expr) => {{
+                match allocate_output(gpu, $shape, DType::F32) {
                     Ok(t) => {
-                        // SAFETY: alias lives only inside `new`. On error it is
-                        // freed below (original field drops without freeing);
-                        // on success it drops untouched while the original
-                        // moves into Self.
-                        ledger.push(GpuTensor {
-                            buf: unsafe { t.buf.alias() },
-                            shape: t.shape.clone(),
-                            dtype: t.dtype,
-                        });
-                        t
+                        outputs.push(Some(t));
+                        outputs.len() - 1
                     }
                     Err(e) => {
-                        for prev in ledger.drain(..) {
-                            let _ = gpu.free_tensor(prev);
+                        while let Some(slot) = outputs.pop() {
+                            if let Some(t) = slot {
+                                let _ = gpu.free_tensor(t);
+                            }
                         }
-                        pbs.free_gpu(gpu);
+                        let _ = pbs.free_gpu(gpu);
                         dn_state.free_gpu(gpu);
                         let _ = kv_cache.free_gpu(gpu);
                         return Err(e);
                     }
                 }
+            }};
+        }
+        macro_rules! take_output {
+            ($index:expr) => {
+                outputs[$index]
+                    .take()
+                    .expect("decode batch output staged twice or missing")
             };
         }
 
-        let final_hidden = zeros!(&[max_batch * config.dim]);
-        let logits = zeros!(&[max_batch * config.vocab_size]);
-        let lm_rot = zeros!(&[max_batch * config.dim]);
-        let sample_out = zeros!(&[max_batch * 2]);
-        let sample_repeat_tokens = zeros!(&[repeat_tokens_len]);
-        let sample_repeat_lengths = zeros!(&[max_batch]);
-        let sample_rng_states = zeros!(&[max_batch]);
+        let i_final_hidden = output!(&[max_batch * config.dim]);
+        let i_logits = output!(&[max_batch * config.vocab_size]);
+        let i_lm_rot = output!(&[max_batch * config.dim]);
+        let i_sample_out = output!(&[max_batch * 2]);
+        let i_sample_repeat_tokens = output!(&[repeat_tokens_len]);
+        let i_sample_repeat_lengths = output!(&[max_batch]);
+        let i_sample_rng_states = output!(&[max_batch]);
+
+        let final_hidden = take_output!(i_final_hidden);
+        let logits = take_output!(i_logits);
+        let lm_rot = take_output!(i_lm_rot);
+        let sample_out = take_output!(i_sample_out);
+        let sample_repeat_tokens = take_output!(i_sample_repeat_tokens);
+        let sample_repeat_lengths = take_output!(i_sample_repeat_lengths);
+        let sample_rng_states = take_output!(i_sample_rng_states);
         Ok(Self {
             max_batch,
             lane_capacity,
@@ -1828,6 +1855,95 @@ mod allocation_tests {
             "failed construction lost reusable allocations instead of rolling them back",
         );
         eprintln!("late failure at allocation {allocations}: retry reused the complete warm pool");
+        gpu.drain_pool();
+    }
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises decode batch final-output rollback and retry"]
+    fn decode_batch_final_output_failure_preserves_reusable_allocations() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        let config = super::super::config::config_from_metadata_json(
+            &serde_json::json!({"config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "vocab_size": 64,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 2,
+                "layer_types": ["full_attention", "full_attention"]
+            }})
+            .to_string(),
+        )
+        .expect("decode batch fixture config");
+
+        let mut output_allocations = 0;
+        let warm = Qwen35DecodeBatchState::new_with_output_alloc(
+            &mut gpu,
+            &config,
+            1,
+            2,
+            2,
+            |gpu, shape, dtype| {
+                output_allocations += 1;
+                gpu.zeros(shape, dtype)
+            },
+        )
+        .expect("warm decode batch");
+        warm.free_gpu(&mut gpu).expect("release warm decode batch");
+        assert_eq!(
+            output_allocations, 7,
+            "constructor must stage seven outputs"
+        );
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let mut attempted = 0;
+        let failure = Qwen35DecodeBatchState::new_with_output_alloc(
+            &mut gpu,
+            &config,
+            1,
+            2,
+            2,
+            |gpu, shape, dtype| {
+                attempted += 1;
+                if attempted == 7 {
+                    Err(HipError::new(
+                        2,
+                        "injected final decode batch output allocation failure",
+                    ))
+                } else {
+                    gpu.zeros(shape, dtype)
+                }
+            },
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(state) => {
+                state
+                    .free_gpu(&mut gpu)
+                    .expect("release unexpected decode batch success");
+                panic!("allocation fault did not trigger");
+            }
+        }
+        assert_eq!(attempted, 7, "failure must occur on the final output");
+
+        let retry = Qwen35DecodeBatchState::new(&mut gpu, &config, 1, 2, 2)
+            .expect("immediate retry after allocation failure");
+        retry
+            .free_gpu(&mut gpu)
+            .expect("release retried decode batch");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed construction lost reusable allocations instead of rolling them back",
+        );
+        eprintln!(
+            "late failure at output allocation {attempted}: retry reused the complete warm pool"
+        );
         gpu.drain_pool();
     }
 }
