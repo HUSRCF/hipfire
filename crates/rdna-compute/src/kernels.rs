@@ -2017,6 +2017,17 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Gemma4 lowered decode specialization: K=2816 is eleven HFQ4-G256 groups,
+/// including a three-group tail. Exposing that count to LLVM keeps the kernel
+/// correct without introducing private scratch on retained-PM4 routes.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1151 structural gate producer for MQ4R A3B decode. Gate and up are
 /// intentionally compiled as separate fixed-K=2048 kernels so Redline can
 /// overlap their independent weight streams on retained PM4 queues.
@@ -2232,6 +2243,33 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC: &str = concat!
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_DLC_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
     "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_GLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_DLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
@@ -7476,6 +7514,17 @@ mod dispatch_tests {
                 .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1100"));
             assert!(q24k4.contains("constexpr int NQ = 24;"));
         }
+    }
+
+    #[test]
+    fn hfq4_moe_gate_up_specializes_gemma4_tail_at_compile_time() {
+        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
+            .contains("#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11"));
+        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
+            .contains("const int tail = HIPFIRE_MOE_GATE_UP_FIXED_GROUPS & 3;"));
+        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC
+            .contains("#define HIPFIRE_WEIGHT_CPOL_AUX 2"));
+        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC.contains("const int tail = 0;"));
     }
 
     #[test]

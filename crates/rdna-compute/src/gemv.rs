@@ -10285,6 +10285,7 @@ impl Gpu {
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
+            let fixed_k2816 = k == 2_816;
             let gfx1151_k2048 = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_K2048", false);
@@ -10463,18 +10464,33 @@ impl Gpu {
                     },
                 )
             } else if matches!(cpol, "glc" | "slc" | "dlc") {
-                let (module, source, func) = match cpol {
-                    "glc" => (
+                let (module, source, func) = match (k, cpol) {
+                    (2_816, "glc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_GLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
+                    ),
+                    (2_816, "slc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+                    ),
+                    (2_816, "dlc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_DLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
+                    ),
+                    (_, "glc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_glc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_GLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
                     ),
-                    "slc" => (
+                    (_, "slc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_slc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
                     ),
-                    "dlc" => (
+                    (_, "dlc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_dlc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_DLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
@@ -10540,6 +10556,21 @@ impl Gpu {
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
                     [32u32, 1, 1],
                     ((m as u32) + 1) / 2,
+                )
+            } else if fixed_k2816 {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if fixed_k2048 {
                 self.ensure_kernel(
