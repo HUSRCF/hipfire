@@ -3713,9 +3713,15 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
-        // Graph-safe: use max_tiles so the grid is position-independent.
+        // Keep the recorded grid's tile count separate from the partials row
+        // stride. Q8 scratch is allocated with min(tile_size, 128), so a
+        // larger runtime tile must not compact the partial row layout seen by
+        // the reducer and retained PM4 tape.
+        let partial_tile_size = tile_size.min(128);
+        let partial_max_tiles = (max_seq + partial_tile_size - 1) / partial_tile_size;
+        let grid_max_tiles = (max_seq + tile_size - 1) / tile_size;
+        // Graph-safe: use grid_max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
-        let max_tiles = (max_seq + tile_size - 1) / tile_size;
         // For profiling / non-graph code paths, the actual tile count:
         let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
         // Redline records an immutable launch sequence independently of
@@ -3724,7 +3730,7 @@ impl Gpu {
         // recording pass must capture the same max_tiles superset as hipGraph.
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
-            max_tiles,
+            grid_max_tiles,
             self.graphs.capture_mode,
             self.replay.is_recording(),
         );
@@ -3811,10 +3817,17 @@ impl Gpu {
             let hd = head_dim as i32;
             let pos_ptr = pos_buf.as_ptr();
             let ts = tile_size as i32;
-            let mt = max_tiles as i32;
+            let mt = partial_max_tiles as i32;
             if let Some(gate) = output_gate {
                 self.attention_flash_reduce_gated_mq_rotate_gfx1100(
-                    partials, out, gate, pos_buf, n_heads, head_dim, tile_size, max_tiles,
+                    partials,
+                    out,
+                    gate,
+                    pos_buf,
+                    n_heads,
+                    head_dim,
+                    tile_size,
+                    partial_max_tiles,
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
@@ -3832,7 +3845,7 @@ impl Gpu {
                     KERNEL,
                     [n_heads as u32, 1, 1],
                     [256, 1, 1],
-                    (max_tiles * 4) as u32,
+                    (partial_max_tiles * 4) as u32,
                     &mut params,
                     || {
                         let mut b = hip_bridge::KernargBlob::new();

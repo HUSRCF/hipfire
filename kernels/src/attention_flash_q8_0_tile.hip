@@ -295,7 +295,11 @@ __global__ void attention_flash_q8_0_tile(
     // wrong-head stale partials), poisoning every subsequent layer and
     // producing 100% NaN logits at the first single-token decode step
     // after a long prefill (see fix/long-decode-nan).
-    const int max_tiles = (max_seq + tile_size - 1) / tile_size;
+    // Keep partial-row addressing compatible with the Qwen scratch
+    // allocation: tile sizes above 128 reduce the active tile count but do
+    // not compact the row stride used by the reducer/retained tape.
+    const int partial_tile_size = min(tile_size, 128);
+    const int max_tiles = (max_seq + partial_tile_size - 1) / partial_tile_size;
     float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
     if (tid == 0) {
         p[0] = tile_max;
