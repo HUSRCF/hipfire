@@ -58,7 +58,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first_pattern = pattern(first_bytes, 1, 0);
     hip.memcpy_htod(&first, &first_pattern)?;
 
-    arena.map_next(&hip, second_bytes, &access)?;
+    if cfg!(windows) {
+        assert_eq!(
+            arena.mapped_bytes(),
+            arena.reserved_bytes(),
+            "Windows must commit the reservation in one physical mapping"
+        );
+    } else {
+        arena.map_next(&hip, second_bytes, &access)?;
+    }
     let full = arena.buffer(first_bytes + second_bytes)?;
     let second_pattern = pattern(second_bytes, 17, 3);
     hip.memcpy_htod_offset(&full, first_bytes, &second_pattern)?;

@@ -180,11 +180,11 @@ impl VmmArena {
                 ),
             ));
         }
-        let next_mapped = self
+        let requested_next_mapped = self
             .mapped_bytes
             .checked_add(size)
             .ok_or_else(|| HipError::new(0, "VMM mapped byte count overflowed"))?;
-        if next_mapped > self.reserved_bytes {
+        if requested_next_mapped > self.reserved_bytes {
             return Err(HipError::new(
                 0,
                 &format!(
@@ -193,6 +193,16 @@ impl VmmArena {
                 ),
             ));
         }
+        let size = windows_single_mapping_size(
+            self.mapped_bytes,
+            size,
+            self.reserved_bytes,
+            cfg!(windows),
+        )?;
+        let next_mapped = self
+            .mapped_bytes
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM mapped byte count overflowed"))?;
 
         let count = hip.device_count()?;
         let mut devices = Vec::with_capacity(access_devices.len() + 1);
@@ -422,6 +432,24 @@ fn offset_ptr(base: *mut c_void, offset: usize) -> *mut c_void {
     unsafe { (base as *mut u8).add(offset) as *mut c_void }
 }
 
+fn windows_single_mapping_size(
+    mapped: usize,
+    requested: usize,
+    reserved: usize,
+    windows: bool,
+) -> HipResult<usize> {
+    if !windows {
+        return Ok(requested);
+    }
+    if mapped != 0 {
+        return Err(HipError::new(
+            0,
+            "Windows HIP VMM arena cannot add a second physical mapping",
+        ));
+    }
+    Ok(reserved)
+}
+
 fn round_up(value: usize, alignment: usize) -> HipResult<usize> {
     if alignment == 0 {
         return Err(HipError::new(0, "VMM alignment must be greater than zero"));
@@ -490,6 +518,27 @@ mod tests {
             handle: Some(1usize as HipMemGenericAllocationHandle),
             mapped,
         }
+    }
+
+    #[test]
+    fn windows_vmm_maps_the_whole_reservation_on_first_growth() {
+        assert_eq!(
+            windows_single_mapping_size(0, 4096, 16384, true).unwrap(),
+            16384
+        );
+        assert!(windows_single_mapping_size(4096, 4096, 16384, true).is_err());
+    }
+
+    #[test]
+    fn non_windows_vmm_keeps_incremental_growth() {
+        assert_eq!(
+            windows_single_mapping_size(0, 4096, 16384, false).unwrap(),
+            4096
+        );
+        assert_eq!(
+            windows_single_mapping_size(4096, 4096, 16384, false).unwrap(),
+            4096
+        );
     }
 
     #[test]
