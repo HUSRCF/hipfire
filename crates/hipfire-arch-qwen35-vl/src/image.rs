@@ -373,6 +373,70 @@ impl VcnDecoded<'_> {
         self.lease.frame()
     }
 }
+/// Typed outcome of the GPU-side VCN preprocess (`vcn_to_patches`): whether
+/// the caller may fall back to a CPU decode on the same GPU.
+///
+/// * `Recoverable` — failure proven pre-enqueue (no kernel ever submitted,
+///   e.g. unknown fourcc, kernel JIT/launch refusal, allocation refusal
+///   before the first launch) or followed by a successful terminal stream
+///   sync (all enqueued surface reads proven complete, every owned request
+///   allocation reclaimed). CPU fallback on the same GPU is safe.
+/// * `TerminalSync` — a terminal `sync_with_deadline` failed after kernels
+///   were enqueued: per its contract the work was NOT cancelled, the device
+///   is suspect, and nothing the outstanding work may still touch (pooled
+///   surface, retained request allocations) may be reused or freed. The
+///   lease is already quarantined inside; the caller MUST abort without
+///   further GPU work and without CPU fallback.
+#[cfg(feature = "vcn-jpeg")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VcnPreprocessError {
+    Recoverable(String),
+    TerminalSync(String),
+}
+
+#[cfg(feature = "vcn-jpeg")]
+impl VcnPreprocessError {
+    /// `true` ⇒ CPU fallback on the same GPU is safe; `false` ⇒ abort the
+    /// request through the existing fatal/hung-GPU handling, touching
+    /// neither the GPU nor the CPU fallback.
+    pub fn fallback_safe(&self) -> bool {
+        matches!(self, Self::Recoverable(_))
+    }
+}
+
+#[cfg(feature = "vcn-jpeg")]
+impl std::fmt::Display for VcnPreprocessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recoverable(msg) => write!(f, "{msg}"),
+            Self::TerminalSync(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+#[cfg(feature = "vcn-jpeg")]
+impl std::error::Error for VcnPreprocessError {}
+
+/// Header-dimension bomb guard shared with the CPU byte path: pixel count
+/// from header dims, `true` when over budget. u64 arithmetic — header dims
+/// are u32 and their product overflows u32 (65535² ≈ 4.3e9 > u32::MAX) and
+/// `usize` on 32-bit targets.
+#[cfg(feature = "vcn-jpeg")]
+fn header_pixels_over_limit(w: u32, h: u32) -> bool {
+    (w as u64) * (h as u64) > MAX_DIMENSION_PIXELS as u64
+}
+
+/// Probe-only gate for `vcn_decode`: `true` only when the header probe
+/// PROVES over-limit input. Probe failure returns `false`, preserving the
+/// existing VA-then-CPU behavior — the CPU path reports undecodable input
+/// with its established error.
+#[cfg(feature = "vcn-jpeg")]
+fn vcn_header_rejected(data: &[u8]) -> bool {
+    matches!(
+        hipfire_runtime::imagedec::probe_dimensions(data),
+        Ok((w, h)) if header_pixels_over_limit(w, h)
+    )
+}
 
 #[cfg(feature = "vcn-jpeg")]
 const VL_YUV_PREPROCESS_SRC: &str = include_str!("../../../kernels/src/vl_yuv_preprocess.hip");
@@ -389,6 +453,7 @@ static VCN_UNAVAILABLE_LOGGED: std::sync::Once = std::sync::Once::new();
 
 /// Pooled VCN decode + resized target dims, no GPU allocation. Returns
 /// `None` when the CPU path should be used (`image.decode = cpu`,
+/// over-limit header dimensions (the CPU path owns the rejection),
 /// non-JPEG input, VCN-unsupported streams, missing hardware, or a fourcc
 /// the preprocess kernels have no arm for). A `None` here is never an
 /// error — the CPU path is always correct.
@@ -404,6 +469,16 @@ pub fn vcn_decode(
 ) -> Option<VcnDecoded<'static>> {
     let mode = resolve_image_decode();
     if mode == ImageDecode::Cpu {
+        return None;
+    }
+    // Decompression-bomb guard BEFORE any VA surface allocation (the pool
+    // allocates at source dimensions): same header-dimension policy as the
+    // CPU byte path (`load_and_preprocess_from_bytes`). Over-limit input
+    // returns `None` so the established CPU path rejects it — never VA.
+    if vcn_header_rejected(data) {
+        if mode == ImageDecode::Vcn {
+            eprintln!("[vl-vcn] image dimensions exceed maximum — CPU rejection");
+        }
         return None;
     }
     let lease = match va_bridge::VaSession::shared_decode_jpeg_lease(data) {
@@ -482,14 +557,21 @@ fn vcn_chroma(frame: &VcnFrame) -> Option<(u32, u32, u32, u32, u32)> {
 /// before the returned patches reach the vision tower — never held across
 /// language generation.
 ///
-/// `Err` is GPU-side failure only (decode fallbacks already returned `None`
-/// above); the caller falls back to a CPU decode of the retained bytes. Any
-/// failure after the first kernel is enqueued still performs the terminal
+/// `Err` is [`VcnPreprocessError`]: `Recoverable` (no kernel ever enqueued,
+/// or a terminal sync proved every enqueued read complete and reclaimed all
+/// owned request allocations) means the caller may fall back to a CPU decode
+/// of the retained bytes on the same GPU; `TerminalSync` means the device is
+/// suspect and the caller must abort without further GPU work or fallback.
+/// Any failure after the first kernel is enqueued still performs the terminal
 /// sync first (the enqueued surface read must complete before the surface
 /// can be reused) and chains a sync failure into the returned error — sync
-/// errors are never swallowed. A failed sync leaves the device suspect per
-/// the `sync_with_deadline` contract; the error propagates like any
-/// hung-GPU error.
+/// errors are never swallowed.
+///
+/// Allocation discipline: `d_chw` is freed only after the terminal sync
+/// proves both kernels complete (freeing earlier would recycle the buffer
+/// while the patch kernel may still read it). After a failed sync nothing
+/// owned here is freed — the kernels may still be reading/writing — and the
+/// lease is quarantined instead of dropped.
 #[cfg(feature = "vcn-jpeg")]
 pub fn vcn_to_patches(
     gpu: &mut Gpu,
@@ -497,25 +579,29 @@ pub fn vcn_to_patches(
     patch_size: usize,
     temporal_patch_size: usize,
     spatial_merge_size: usize,
-) -> Result<VcnPatches, String> {
+) -> Result<VcnPatches, VcnPreprocessError> {
     let (t_h, t_w) = (dec.img_h, dec.img_w);
     let frame = dec.frame();
     let Some((u_off, v_off, step, sh_x, sh_y)) = vcn_chroma(frame) else {
         // No kernel enqueued — the lease drops with `dec`, surface untouched.
-        return Err(format!(
+        return Err(VcnPreprocessError::Recoverable(format!(
             "vcn fourcc 0x{:08x} has no kernel arm",
             frame.fourcc
-        ));
+        )));
     };
     let n_elem =
         (t_h / patch_size) * (t_w / patch_size) * temporal_patch_size * 3 * patch_size * patch_size;
     if n_elem == 0 {
-        return Err("vcn empty patch grid".to_string());
+        return Err(VcnPreprocessError::Recoverable(
+            "vcn empty patch grid".to_string(),
+        ));
     }
     // Geometry scalars outlive the frame borrow; the log below runs after
     // the lease drops.
     let (src_w, src_h) = (frame.width, frame.height);
-    let map_err = |op: &'static str| move |e: hip_bridge::HipError| format!("vcn {op}: {e}");
+    let map_err = |op: &'static str| move |e: hip_bridge::HipError| {
+        VcnPreprocessError::Recoverable(format!("vcn {op}: {e}"))
+    };
     gpu.ensure_kernel_public("vl_yuv_preprocess", VL_YUV_PREPROCESS_SRC, VL_RGB_KERNEL)
         .map_err(map_err("ensure rgb kernel"))?;
     gpu.ensure_kernel_public("vl_yuv_preprocess", VL_YUV_PREPROCESS_SRC, VL_PATCH_KERNEL)
@@ -543,25 +629,36 @@ pub fn vcn_to_patches(
     }
     b1.push_ptr(d_chw.buf.as_ptr() as *const std::ffi::c_void);
     b1.pad_to(16);
-    gpu.launch_kernel_blob(
+    if let Err(e) = gpu.launch_kernel_blob(
         VL_RGB_KERNEL,
         [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
         [16, 16, 1],
         0,
         b1.as_mut_slice(),
-    )
-    .map_err(map_err("launch rgb kernel"))?;
+    ) {
+        // Launch refused: nothing was enqueued, so completion needs no proof
+        // — but `d_chw` is already owned, so reclaim it before the caller
+        // falls back. A free failure here is secondary to the launch error.
+        let _ = gpu.free_tensor(d_chw);
+        return Err(VcnPreprocessError::Recoverable(format!(
+            "vcn launch rgb kernel: {e}"
+        )));
+    }
     // Past this point a kernel is reading the surface: every error below
     // syncs first (checked) so the read completes before the lease releases,
     // and chains a sync failure instead of swallowing it.
     let patches = match gpu.alloc_tensor(&[n_elem], DType::F32) {
         Ok(t) => t,
         Err(e) => {
+            // The rgb kernel is already reading the surface: prove its reads
+            // complete first, then reclaim `d_chw` (now unused) on success or
+            // retain it on a suspect device — see `sync_after_enqueue`.
             return Err(sync_after_enqueue(
                 gpu,
                 "rgb launch",
                 format!("vcn alloc patches: {e}"),
                 dec,
+                vec![d_chw],
             ));
         }
     };
@@ -585,32 +682,37 @@ pub fn vcn_to_patches(
         0,
         b2.as_mut_slice(),
     ) {
+        // Same proof-then-reclaim contract over both owned allocations.
         return Err(sync_after_enqueue(
             gpu,
             "rgb launch",
             format!("vcn launch patch kernel: {e}"),
             dec,
-        ));
-    }
-    if let Err(e) = gpu.free_tensor(d_chw) {
-        return Err(sync_after_enqueue(
-            gpu,
-            "patch launch",
-            format!("vcn free chw: {e}"),
-            dec,
+            vec![d_chw, patches],
         ));
     }
     // Release boundary: the pooled-surface reads are complete only when this
-    // returns `Ok` (same-stream FIFO). On failure the reads may still be
-    // outstanding: quarantine the lease (never reuse the surface) instead of
-    // dropping it — see `sync_after_enqueue`.
+    // returns `Ok` (same-stream FIFO). `d_chw` is freed only here — after the
+    // proof, never before — because the patch kernel reads it until then.
+    // On failure the reads may still be outstanding: quarantine the lease
+    // (never reuse the surface) and retain both allocations instead of
+    // freeing them — see `sync_after_enqueue`.
     if let Err(e) = gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE) {
         va_bridge::VaSession::quarantine_shared(dec.lease);
-        return Err(format!(
+        return Err(VcnPreprocessError::TerminalSync(format!(
             "vcn terminal sync: {e} (shared session quarantined)"
-        ));
+        )));
     }
     drop(dec);
+    if let Err(e) = gpu.free_tensor(d_chw) {
+        // Completion already proven, so the device is healthy — but without
+        // the intermediate there is nothing to build patches from. Reclaim
+        // `patches` too and fall back; the free error itself is the outcome.
+        let _ = gpu.free_tensor(patches);
+        return Err(VcnPreprocessError::Recoverable(format!(
+            "vcn free chw after proven sync: {e}"
+        )));
+    }
     eprintln!(
         "[vl-vcn] VCN decode {src_w}x{src_h} -> {t_w}x{t_h} ({} patches)",
         (t_h / patch_size) * (t_w / patch_size)
@@ -624,30 +726,50 @@ pub fn vcn_to_patches(
     })
 }
 
-/// Checked terminal sync after kernels were enqueued, consuming the decode.
-/// `Ok` sync ⇒ surface reads complete ⇒ the lease drops normally and the
-/// surface is reusable. Sync failure ⇒ reads may still be outstanding ⇒ the
-/// lease is quarantined, never released for reuse; the chained error (never
-/// swallowed) drives the caller's CPU fallback.
+/// Checked terminal sync after kernels were enqueued, consuming the decode
+/// and every owned request allocation listed in `owned`.
+///
+/// `Ok` sync ⇒ enqueued reads/writes are complete ⇒ the lease drops normally
+/// (surface reusable) and `owned` is reclaimed, so a transient failure never
+/// strands request VRAM across CPU-fallback retries. Sync failure ⇒ work may
+/// still be outstanding ⇒ the lease is quarantined (never released for
+/// reuse) and `owned` is deliberately retained — freeing a buffer a live
+/// kernel may still touch would corrupt whatever the pool hands it to next.
+/// The chained error (never swallowed) is `TerminalSync`: the device is
+/// suspect and the caller must abort without further GPU work or fallback.
 #[cfg(feature = "vcn-jpeg")]
-fn sync_after_enqueue(gpu: &Gpu, op: &'static str, prior: String, dec: VcnDecoded<'_>) -> String {
+fn sync_after_enqueue(
+    gpu: &mut Gpu,
+    op: &'static str,
+    prior: String,
+    dec: VcnDecoded<'_>,
+    owned: Vec<GpuTensor>,
+) -> VcnPreprocessError {
     match gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE) {
         Ok(()) => {
             drop(dec);
-            prior
+            for t in owned {
+                // Best-effort: completion is proven, so a free failure is pool
+                // bookkeeping, never device-suspect; never shadow `prior`.
+                let _ = gpu.free_tensor(t);
+            }
+            VcnPreprocessError::Recoverable(prior)
         }
         Err(e) => {
             va_bridge::VaSession::quarantine_shared(dec.lease);
-            format!(
+            // `owned` drops WITHOUT `free_tensor` here: `GpuTensor` has no
+            // RAII free, so dropping the handles strands the allocations —
+            // exactly the retain-the-suspect-buffers outcome required above.
+            VcnPreprocessError::TerminalSync(format!(
                 "{prior}; vcn terminal sync after {op} failed: {e} (shared session quarantined)"
-            )
+            ))
         }
     }
 }
 
 /// One-call VCN JPEG → device patches: [`vcn_decode`] then
-/// [`vcn_to_patches`]. `Ok(None)` = take the CPU path; `Err` = GPU-side
-/// failure after a successful decode.
+/// [`vcn_to_patches`]. `Ok(None)` = take the CPU path; `Err` carries the
+/// [`VcnPreprocessError`] typed outcome (fallback-safe or terminal).
 #[cfg(feature = "vcn-jpeg")]
 pub fn try_vcn_preprocess(
     gpu: &mut Gpu,
@@ -655,7 +777,7 @@ pub fn try_vcn_preprocess(
     patch_size: usize,
     temporal_patch_size: usize,
     spatial_merge_size: usize,
-) -> Result<Option<VcnPatches>, String> {
+) -> Result<Option<VcnPatches>, VcnPreprocessError> {
     let Some(dec) = vcn_decode(data, patch_size, spatial_merge_size) else {
         return Ok(None);
     };
@@ -765,5 +887,94 @@ mod tests {
         // c=0, dy=0, dx=0 of that patch: src y=4, x=6 → 0 + 400 + 6 = 406.
         let v = patches[11 * 12];
         assert_eq!(v, 406.0, "SMS=4 patch ordering: (py=2, px=3) → out_idx=11");
+    }
+    /// Fallback disposition: only `Recoverable` may take the CPU path on the
+    /// same GPU. A `TerminalSync` must never read as fallback-safe —
+    /// inverting this would rerun the tower on a suspect device, violating
+    /// the `sync_with_deadline` contract (outstanding work NOT cancelled).
+    #[test]
+    #[cfg(feature = "vcn-jpeg")]
+    fn vcn_preprocess_error_fallback_disposition() {
+        assert!(
+            VcnPreprocessError::Recoverable("vcn launch rgb kernel: refused".to_string())
+                .fallback_safe()
+        );
+        assert!(
+            !VcnPreprocessError::TerminalSync("vcn terminal sync: timed out".to_string())
+                .fallback_safe()
+        );
+    }
+
+    /// Bomb-guard limit boundary: header dims are u32, so the product is u64
+    /// — 65535² ≈ 4.3e9 overflows u32 and dwarfs the 16_777_216 budget, while
+    /// the exact-budget product stays admissible (it downscales, it is not
+    /// rejected).
+    #[test]
+    #[cfg(feature = "vcn-jpeg")]
+    fn vcn_header_guard_limit_boundary() {
+        assert!(header_pixels_over_limit(65_535, 65_535));
+        assert!(header_pixels_over_limit(50_000, 50_000));
+        assert!(header_pixels_over_limit(4_097, 4_096));
+        assert!(!header_pixels_over_limit(4_096, 4_096));
+        assert!(!header_pixels_over_limit(1920, 1080));
+        assert!(!header_pixels_over_limit(0, 0));
+    }
+
+    /// Rewrite the SOF width/height of a fixture JPEG in place (marker scan,
+    /// first SOF0–SOF3). Test-only helper for proving the gate against the
+    /// active header probe rather than the arithmetic alone.
+    #[cfg(feature = "vcn-jpeg")]
+    fn rewrite_jpeg_sof_dims(jpeg: &[u8], w: u16, h: u16) -> Vec<u8> {
+        assert!(
+            jpeg.len() > 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8,
+            "fixture must start with JPEG SOI"
+        );
+        let mut out = jpeg.to_vec();
+        let mut i = 2;
+        while i + 1 < out.len() {
+            assert_eq!(out[i], 0xFF, "expected marker at offset {i}");
+            let mut j = i + 1;
+            while j < out.len() && out[j] == 0xFF {
+                j += 1; // fill bytes
+            }
+            let code = out[j];
+            if (0xC0..=0xC3).contains(&code) {
+                // SOF: code, len[2], precision[1], height[2], width[2].
+                out[j + 4..j + 6].copy_from_slice(&h.to_be_bytes());
+                out[j + 6..j + 8].copy_from_slice(&w.to_be_bytes());
+                return out;
+            }
+            if code == 0xD8 || code == 0xD9 || code == 0x01 || (0xD0..=0xD7).contains(&code) {
+                i = j + 1; // standalone marker, no length
+            } else {
+                let len = u16::from_be_bytes([out[j + 1], out[j + 2]]) as usize;
+                i = j + 1 + len;
+            }
+        }
+        panic!("no SOF marker in fixture");
+    }
+
+    /// Pre-VA gate on real JPEG bytes: the committed baseline fixture probes
+    /// small and passes, while the same bytes with bomb SOF dims are rejected
+    /// — proving the ACTIVE turbo probe reports the rewritten dims (with the
+    /// current image-crate feature set) before any VA surface allocation.
+    #[test]
+    #[cfg(feature = "vcn-jpeg")]
+    fn vcn_header_gate_rejects_bomb_jpeg_before_va() {
+        let jpeg = include_bytes!("../../../benchmarks/vision/images/barney_cigar.jpg");
+        assert!(!vcn_header_rejected(jpeg));
+        let bomb = rewrite_jpeg_sof_dims(jpeg, 50_000, 50_000);
+        assert!(vcn_header_rejected(&bomb));
+    }
+
+    /// Probe-seam contract: undecodable bytes must NOT trip the pre-VA
+    /// rejection — they keep the existing VA-then-CPU path so the CPU
+    /// decoder still reports its established error.
+    #[test]
+    #[cfg(feature = "vcn-jpeg")]
+    fn vcn_header_gate_passes_through_undecodable_bytes() {
+        assert!(!vcn_header_rejected(&[]));
+        assert!(!vcn_header_rejected(b"definitely not an image"));
+        assert!(!vcn_header_rejected(&[0xFF, 0xD8, 0xFF, 0x00]));
     }
 }

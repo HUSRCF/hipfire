@@ -783,39 +783,49 @@ pub fn generate_vl(
                 vision_config.spatial_merge_size,
             ) {
                 Ok(vp) => Some(vp),
-                Err(e) => {
-                    // Last-resort CPU decode of the retained bytes.
+                Err(e) if e.fallback_safe() => {
+                    // Last-resort CPU decode of the retained bytes: a
+                    // `Recoverable` failure was proven pre-enqueue or
+                    // followed a successful terminal sync, so this GPU is
+                    // healthy and the fallback is safe.
                     eprintln!("[daemon/vl] VCN patch build failed ({e}) — CPU fallback");
                     None
+                }
+                Err(e) => {
+                    // `TerminalSync`: per the `sync_with_deadline` contract
+                    // the work was NOT cancelled and the device is suspect —
+                    // outstanding kernels may still read/write the pooled
+                    // surface and the retained request allocations. The
+                    // existing `vl_forward_fail` path is NOT safe here: it
+                    // runs HIP memset/reset/free calls against that suspect
+                    // device. Instead report the protocol error, flush, and
+                    // terminate the daemon WITHOUT destructors or GPU
+                    // cleanup (`process::exit` runs none, so no `Drop` impl
+                    // can touch the suspect device either). Later requests
+                    // cannot safely reuse this GPU; the supervisor must
+                    // restart the daemon. `bytes` is never decoded.
+                    let msg = format!(
+                        "VL vcn_terminal_sync: {e} (GPU work outstanding and uncancelled; daemon terminating)"
+                    );
+                    eprintln!("[daemon/vl] {msg}");
+                    write_error(stdout, id, &msg);
+                    let _ = stdout.flush();
+                    std::process::exit(1);
                 }
             };
             match vcn_patches {
                 Some(vp) => {
-                    let out = qwen35_vl::vision_forward_patches(
+                    // Owned input: `vision_forward_patches` frees `patches`
+                    // after patch embedding — nothing to release here, on
+                    // either outcome.
+                    match qwen35_vl::vision_forward_patches(
                         gpu,
                         vision_weights,
                         &vision_config,
-                        &vp.patches,
+                        vp.patches,
                         vp.grid_h,
                         vp.grid_w,
-                    );
-                    if let Err(e) = gpu.free_tensor(vp.patches) {
-                        vl_forward_fail(
-                            stdout,
-                            id,
-                            "vision_forward_vcn_free",
-                            e,
-                            gpu,
-                            dn,
-                            kv,
-                            &mut m.kv_adaptive,
-                            &mut m.seq_pos,
-                            &mut m.conversation_tokens,
-                            &mut m.prefill_checkpoints,
-                        );
-                        return;
-                    }
-                    match out {
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             vl_forward_fail(

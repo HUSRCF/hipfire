@@ -992,21 +992,24 @@ pub fn vision_forward(
 ) -> HipResult<Vec<f32>> {
     let n = grid_h * grid_w;
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
-    // Upload patches [n, patch_dim], then run the shared device-resident path.
+    // Upload patches [n, patch_dim], then run the shared device-resident
+    // path, which owns the upload and releases it after patch embedding.
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
-    let out = vision_forward_patches(gpu, weights, config, &x_patches, grid_h, grid_w)?;
-    gpu.free_tensor(x_patches)?;
-    Ok(out)
+    vision_forward_patches(gpu, weights, config, x_patches, grid_h, grid_w)
 }
 
 /// `vision_forward` without the host→device patch upload: encode patches
-/// already resident on the device (the VCN product path in `image`). The
-/// caller retains `x_patches` — nothing is freed here.
+/// already resident on the device (the VCN product path in `image`). Takes
+/// `x_patches` BY VALUE and frees it immediately after patch embedding —
+/// its last use — so the peak drops by the full image tensor instead of
+/// holding it through the whole tower, and no later (or embedding-error)
+/// path can strand it. Same contract for CPU-uploaded and VCN-produced
+/// input: the caller owns nothing after the call.
 pub fn vision_forward_patches(
     gpu: &mut Gpu,
     weights: &VisionWeights,
     config: &VisionConfig,
-    x_patches: &GpuTensor,
+    x_patches: GpuTensor,
     grid_h: usize,
     grid_w: usize,
 ) -> HipResult<Vec<f32>> {
@@ -1030,22 +1033,41 @@ pub fn vision_forward_patches(
         "  vision forward (GPU): {} patches, {}x{} grid",
         n, grid_h, grid_w
     );
-
     if let Some(d) = dd {
-        let host = gpu.download_f32(x_patches)?;
-        vl_dump_slice(d, "pixel_values", &host, &[n, patch_dim]);
+        // Env-gated debug dump (see `vl_dump_slice`): a download failure
+        // must still release the owned input before propagating.
+        match gpu.download_f32(&x_patches) {
+            Ok(host) => vl_dump_slice(d, "pixel_values", &host, &[n, patch_dim]),
+            Err(e) => {
+                let _ = gpu.free_tensor(x_patches);
+                return Err(e);
+            }
+        }
     }
 
-    // Patch embedding: linear_f16 → [n, h]
-    let x = linear_f16(
+    // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
+    // release it here — not at tower end — on both success and failure, so
+    // the peak drops by the full image tensor and later `?` paths cannot
+    // strand it. A free failure on the error path is secondary and never
+    // shadows the embedding error.
+    let x = match linear_f16(
         gpu,
         &weights.patch_embed_w,
-        x_patches,
+        &x_patches,
         &weights.patch_embed_b,
         h,
         patch_dim,
         n,
-    )?;
+    ) {
+        Ok(x) => {
+            gpu.free_tensor(x_patches)?;
+            x
+        }
+        Err(e) => {
+            let _ = gpu.free_tensor(x_patches);
+            return Err(e);
+        }
+    };
     vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
 
     // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the

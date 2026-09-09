@@ -25,7 +25,6 @@
 //! complete, so a same-key decode cannot overwrite the surface mid-read.
 
 mod ffi;
-mod h264;
 mod interop;
 mod jpeg;
 pub use ffi::{
@@ -33,7 +32,7 @@ pub use ffi::{
     VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
     VaJpegSliceParam, VaLib, VaSurfaceId, VA_EXPORT_SURFACE_READ_ONLY,
     VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2,
-    VA_PROFILE_AV1_PROFILE0, VA_PROFILE_H264_HIGH, VA_PROFILE_HEVC_MAIN, VA_STATUS_SUCCESS,
+    VA_STATUS_SUCCESS,
 };
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
@@ -176,12 +175,6 @@ pub struct VaSession {
     /// decoded through or torn down — and every later shared decode fails
     /// closed to the CPU fallback. Explicit-session owners never set this.
     poisoned: bool,
-    /// HIP imports backing the most recent `h264::decode_h264_annexb_zc`
-    /// frames. The video lane has no surface pool, so each zc frame's import
-    /// lives here (not in the `Copy` `VcnFrame`); frames are valid until the
-    /// next zc decode or the session drops — the video analogue of the pool
-    /// contract above.
-    video_zc: Vec<HipMapping>,
 }
 
 /// Pool key: the VA render-target format (from the SOF0 sampling factors)
@@ -236,7 +229,7 @@ impl VaSession {
     }
 
     /// Open the first working render node with a VLD config for `profile`
-    /// (see `ffi::VA_PROFILE_*`; video lane uses H.264 High = 7).
+    /// (the image path only ever requests JPEG baseline).
     #[cfg(unix)]
     pub(crate) fn open_profile(profile: i32) -> Result<Self, VaError> {
         let mut lib = Some(VaLib::load()?);
@@ -358,7 +351,6 @@ impl VaSession {
             node: node.to_string(),
             pool: HashMap::new(),
             poisoned: false,
-            video_zc: Vec::new(),
         })
     }
 
@@ -675,8 +667,11 @@ impl VaSession {
         Ok(bufs)
     }
 
-    /// Export `surf` + import into HIP, once per pool key. The export fds
-    /// are closed after import (HIP holds its own reference).
+    /// Export `surf` + import into HIP, once per pool key. The layer layout
+    /// is normalized to separate-layers form (see [`normalize_export_layers`])
+    /// before import; anything not safely consumable closes every exported
+    /// fd and falls back to CPU — never a partial import. Imported fds are
+    /// closed after import (HIP holds its own reference).
     fn export_once(
         lib: &VaLib,
         dpy: VaDisplay,
@@ -734,24 +729,30 @@ impl VaSession {
                 );
             }
         }
-        if desc.num_objects == 0 {
-            return Err(VaError::Corrupt("export yielded no objects"));
-        }
+        // Normalize BEFORE import: every consumed plane must live in the
+        // single mapped object with a checked byte range, and Y must sit at
+        // the surface base the kernel reads. Anything else is a clean CPU
+        // fallback, never a partial import.
+        let (layers, num_layers) =
+            match normalize_export_layers(&desc, p.width as u32, p.height as u32) {
+                Ok(v) => v,
+                Err(reason) => {
+                    close_export_fds(&desc);
+                    return Err(VaError::Corrupt(reason));
+                }
+            };
         let fd = desc.objects[0].fd;
         let size = desc.objects[0].size as usize;
         let mapping = HipMapping::import_dma_buf(fd, size);
         // fds came from vaExportSurfaceHandle; we own these copies.
-        libc_close(fd);
-        for i in 1..desc.num_objects.min(4) as usize {
-            libc_close(desc.objects[i].fd);
-        }
+        close_export_fds(&desc);
         let mapping = mapping?;
         Ok(CachedExport {
             max_h: p.max_h,
             max_v: p.max_v,
             fourcc: desc.fourcc,
-            layers: desc.layers,
-            num_layers: desc.num_layers,
+            layers,
+            num_layers,
             mapping,
         })
     }
@@ -960,6 +961,187 @@ impl VaSession {
     }
 }
 
+/// Planar-444 fourcc (`444P`) the driver reports for 4:4:4 surfaces.
+const FOURCC_444P: u32 = 0x5034_3434;
+
+/// Close every fd `vaExportSurfaceHandle` handed us, exactly once. Called on
+/// ALL exits after a successful export: layout rejection, import failure,
+/// and import success (HIP holds its own reference then).
+fn close_export_fds(desc: &ffi::VaDrmPrimeDescriptor) {
+    for i in 0..desc.num_objects.min(4) as usize {
+        libc_close(desc.objects[i].fd);
+    }
+}
+
+/// Every plane of `layer` must live in the mapped (first) object. Counts
+/// are validated before indexing so a corrupt `num_planes` cannot panic.
+fn check_single_object(layer: &ffi::VaDrmPrimeLayer) -> Result<(), &'static str> {
+    if layer.num_planes == 0 || layer.num_planes > 4 {
+        return Err("export plane count out of range");
+    }
+    for j in 0..layer.num_planes as usize {
+        if layer.object_index[j] != 0 {
+            return Err("export plane lives outside the mapped object");
+        }
+    }
+    Ok(())
+}
+
+/// Checked `[offset, offset + pitch * (rows - 1) + row_bytes]` containment
+/// in the mapped object (`size`). Requires `row_bytes <= pitch`; the
+/// pitch/row tail is padding the kernel never reads. All math is checked:
+/// overflow rejects, never wraps.
+fn check_plane_range(
+    offset: u32,
+    pitch: u32,
+    row_bytes: u64,
+    rows: u64,
+    size: u64,
+) -> Result<(), &'static str> {
+    if pitch == 0 {
+        return Err("export plane has zero pitch");
+    }
+    if row_bytes > pitch as u64 {
+        return Err("export plane row wider than pitch");
+    }
+    let tail = rows
+        .checked_sub(1)
+        .ok_or("export plane has zero rows")?
+        .checked_mul(pitch as u64)
+        .ok_or("export plane span overflows")?;
+    let end = (offset as u64)
+        .checked_add(tail)
+        .ok_or("export plane span overflows")?
+        .checked_add(row_bytes)
+        .ok_or("export plane span overflows")?;
+    if end > size {
+        return Err("export plane range outside mapped object");
+    }
+    Ok(())
+}
+
+/// Normalized separate-layers view of a `vaExportSurfaceHandle` descriptor.
+///
+/// Export flags do not force one layout: a driver may legally return one
+/// multi-plane (composed) layer or several single-plane (separate) layers,
+/// and may return multiple dma-buf objects. The preprocess kernel, however,
+/// reads Y at the mapping base plus pitched planes addressed by
+/// [`VcnFrame::y_pitch`]/[`VcnFrame::uv_offset`]/[`VcnFrame::uv_pitch`] (or
+/// `layers[1..3]` for planar 444). This helper accepts exactly the layouts
+/// the kernel can consume and rewrites composed single layers into
+/// separate-layers form:
+///
+/// * NV12: one 2-plane layer, or two 1-plane layers (Y, interleaved UV).
+/// * planar 444: one 3-plane layer, or three 1-plane layers (Y, U, V).
+/// * anything else: every reported plane must already sit in object 0 with
+///   a checked in-range row span (the caller falls back on the fourcc
+///   before any kernel reads it, but a cached export is never left OOB).
+///
+/// Rejection rules (every `Err` is a clean CPU fallback before import):
+/// counts are validated before any indexing; every consumed plane must have
+/// `object_index == 0` (the only object ever mapped); Y must sit at offset
+/// 0 (the kernel reads Y at the base); every consumed plane's checked byte
+/// range must lie inside the mapped object's size, with NV12 chroma sized
+/// for odd dimensions (`row = ceil(w/2)*2`, `rows = ceil(h/2)`) and 444
+/// chroma full-size.
+fn normalize_export_layers(
+    desc: &ffi::VaDrmPrimeDescriptor,
+    width: u32,
+    height: u32,
+) -> Result<([ffi::VaDrmPrimeLayer; 4], u32), &'static str> {
+    if desc.num_objects == 0 || desc.num_objects > 4 {
+        return Err("export object count out of range");
+    }
+    if desc.num_layers == 0 || desc.num_layers > 4 {
+        return Err("export layer count out of range");
+    }
+    if width == 0 || height == 0 {
+        return Err("export surface has zero geometry");
+    }
+    // Y is read at the mapping base: a nonzero Y offset has no kernel arm.
+    if desc.layers[0].offset[0] != 0 {
+        return Err("export Y plane has nonzero offset");
+    }
+    let size = desc.objects[0].size as u64;
+    let w = width as u64;
+    let h = height as u64;
+    if desc.fourcc == VA_FOURCC_NV12 {
+        // NV12 chroma with odd dimensions: ceil(w/2) pairs interleaved,
+        // ceil(h/2) rows.
+        let cw = ((w + 1) / 2) * 2;
+        let ch = (h + 1) / 2;
+        if desc.num_layers == 2 {
+            let (y, uv) = (&desc.layers[0], &desc.layers[1]);
+            check_single_object(y)?;
+            check_single_object(uv)?;
+            check_plane_range(y.offset[0], y.pitch[0], w, h, size)?;
+            check_plane_range(uv.offset[0], uv.pitch[0], cw, ch, size)?;
+            Ok((desc.layers, 2))
+        } else if desc.num_layers == 1 {
+            let l = &desc.layers[0];
+            if l.num_planes < 2 {
+                return Err("export NV12 layer has fewer than 2 planes");
+            }
+            check_single_object(l)?;
+            check_plane_range(l.offset[0], l.pitch[0], w, h, size)?;
+            check_plane_range(l.offset[1], l.pitch[1], cw, ch, size)?;
+            let mut out = desc.layers;
+            out[0].num_planes = 1;
+            out[1] = ffi::VaDrmPrimeLayer {
+                drm_format: l.drm_format,
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [l.offset[1], 0, 0, 0],
+                pitch: [l.pitch[1], 0, 0, 0],
+            };
+            Ok((out, 2))
+        } else {
+            Err("export NV12 layer count not 1 (composed) or 2 (separate)")
+        }
+    } else if desc.fourcc == FOURCC_444P {
+        if desc.num_layers == 3 {
+            for l in desc.layers.iter().take(3) {
+                check_single_object(l)?;
+                check_plane_range(l.offset[0], l.pitch[0], w, h, size)?;
+            }
+            Ok((desc.layers, 3))
+        } else if desc.num_layers == 1 {
+            let l = &desc.layers[0];
+            if l.num_planes < 3 {
+                return Err("export 444 layer has fewer than 3 planes");
+            }
+            check_single_object(l)?;
+            for j in 0..3 {
+                check_plane_range(l.offset[j], l.pitch[j], w, h, size)?;
+            }
+            let mut out = desc.layers;
+            out[0].num_planes = 1;
+            for j in 1..3 {
+                out[j] = ffi::VaDrmPrimeLayer {
+                    drm_format: l.drm_format,
+                    num_planes: 1,
+                    object_index: [0, 0, 0, 0],
+                    offset: [l.offset[j], 0, 0, 0],
+                    pitch: [l.pitch[j], 0, 0, 0],
+                };
+            }
+            Ok((out, 3))
+        } else {
+            Err("export 444 layer count not 1 (composed) or 3 (separate)")
+        }
+    } else {
+        // Unknown fourcc: the caller falls back before any kernel read, but
+        // only single-object, base-resident, span-checked planes are cached.
+        for l in desc.layers.iter().take(desc.num_layers as usize) {
+            check_single_object(l)?;
+            for j in 0..l.num_planes as usize {
+                check_plane_range(l.offset[j], l.pitch[j], l.pitch[j] as u64, h, size)?;
+            }
+        }
+        Ok((desc.layers, desc.num_layers))
+    }
+}
+
 // `libc` is not a workspace dep; close(2)/lseek(2) via direct externs.
 // Unix-only: these symbols don't exist elsewhere, so the externs and the
 // real wrappers are gated and stubbed (callers take CPU fallback there).
@@ -1072,6 +1254,14 @@ impl SharedVcnLease<'_> {
 /// consumer kernels before the next decode. Valid until the session drops.
 /// Shared-session callers never receive this directly (see
 /// [`SharedVcnLease`]); only explicit-session owners holding `&mut` do.
+///
+/// `layers`/`num_layers` are NORMALIZED to separate-layers form by
+/// [`normalize_export_layers`] before import: NV12 is exactly 2
+/// single-plane layers (Y, interleaved UV), planar 444 exactly 3 (Y, U, V);
+/// Y always sits at offset 0 and every consumed plane's checked byte range
+/// lies inside the single mapped object. The accessors below therefore read
+/// `layers` directly; anything else fell back to CPU before the frame was
+/// built.
 #[derive(Clone, Copy)]
 pub struct VcnFrame {
     pub width: u32,
@@ -1093,11 +1283,11 @@ impl VcnFrame {
     pub fn device_ptr(&self) -> *mut c_void {
         self.ptr
     }
-    /// Y-plane pitch in bytes (layer 0, plane 0).
+    /// Y-plane pitch in bytes (normalized layer 0, plane 0).
     pub fn y_pitch(&self) -> u32 {
         self.layers[0].pitch[0]
     }
-    /// UV-plane byte offset from the surface base.
+    /// UV-plane byte offset from the surface base (normalized layer 1).
     pub fn uv_offset(&self) -> u32 {
         if self.num_layers > 1 {
             self.layers[1].offset[0]
@@ -1105,7 +1295,7 @@ impl VcnFrame {
             self.height * self.y_pitch()
         }
     }
-    /// UV-plane pitch in bytes.
+    /// UV-plane pitch in bytes (normalized layer 1).
     pub fn uv_pitch(&self) -> u32 {
         if self.num_layers > 1 {
             self.layers[1].pitch[0]
@@ -1164,18 +1354,232 @@ pub struct DerivedPlanes {
     pub planes: Vec<Vec<u8>>,
 }
 
-/// The H.264 lane's derived frame (see `h264::decode_h264_collect`): packed
-/// NV12 luma + interleaved chroma read back through `vaDeriveImage`.
-/// (`experiment/vcn-video`; restored verbatim in the vcn-consolidated merge —
-/// it lived beside the old JPEG derived path the pool lane deleted.)
-pub struct DerivedFrame {
-    pub width: u32,
-    pub height: u32,
-    pub fourcc: u32,
-    pub y_pitch: u32,
-    pub uv_pitch: u32,
-    /// Packed luma, `width * height` bytes.
-    pub y: Vec<u8>,
-    /// Packed interleaved chroma, `(width/2) * (height/2) * 2` bytes.
-    pub uv: Vec<u8>,
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn mk_layer(
+        planes: u32,
+        objs: [u32; 4],
+        offs: [u32; 4],
+        pitches: [u32; 4],
+    ) -> ffi::VaDrmPrimeLayer {
+        ffi::VaDrmPrimeLayer {
+            drm_format: 0,
+            num_planes: planes,
+            object_index: objs,
+            offset: offs,
+            pitch: pitches,
+        }
+    }
+
+    fn mk_desc(
+        fourcc: u32,
+        sizes: &[u32],
+        layers: &[ffi::VaDrmPrimeLayer],
+    ) -> ffi::VaDrmPrimeDescriptor {
+        let mut d = ffi::VaDrmPrimeDescriptor {
+            fourcc,
+            width: 0,
+            height: 0,
+            num_objects: sizes.len() as u32,
+            objects: [ffi::VaDrmPrimeObject::default(); 4],
+            num_layers: layers.len() as u32,
+            layers: [ffi::VaDrmPrimeLayer::default(); 4],
+        };
+        for (i, s) in sizes.iter().enumerate().take(4) {
+            d.objects[i] = ffi::VaDrmPrimeObject {
+                fd: -1,
+                size: *s,
+                drm_format_modifier: 0,
+            };
+        }
+        for (i, l) in layers.iter().enumerate().take(4) {
+            d.layers[i] = *l;
+        }
+        d
+    }
+
+    fn frame_of(layers: [ffi::VaDrmPrimeLayer; 4], num_layers: u32) -> VcnFrame {
+        VcnFrame {
+            width: 64,
+            height: 32,
+            max_h: 2,
+            max_v: 2,
+            fourcc: VA_FOURCC_NV12,
+            layers,
+            num_layers,
+            ptr: std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn nv12_separate_even_passes_through() {
+        // 64x32, pitch 64: Y [0, 2048), UV [2048, 3072).
+        let d = mk_desc(
+            VA_FOURCC_NV12,
+            &[3072],
+            &[
+                mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]),
+                mk_layer(1, [0, 0, 0, 0], [2048, 0, 0, 0], [64, 0, 0, 0]),
+            ],
+        );
+        let (layers, n) = normalize_export_layers(&d, 64, 32).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(layers[0].pitch[0], 64);
+        assert_eq!(layers[1].offset[0], 2048);
+        let f = frame_of(layers, n);
+        assert_eq!((f.y_pitch(), f.uv_offset(), f.uv_pitch()), (64, 2048, 64));
+    }
+
+    #[test]
+    fn nv12_composed_normalizes_to_separate() {
+        // Same geometry, one 2-plane layer.
+        let d = mk_desc(
+            VA_FOURCC_NV12,
+            &[3072],
+            &[mk_layer(2, [0, 0, 0, 0], [0, 2048, 0, 0], [64, 64, 0, 0])],
+        );
+        let (layers, n) = normalize_export_layers(&d, 64, 32).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(layers[0].pitch[0], 64);
+        assert_eq!((layers[1].offset[0], layers[1].pitch[0]), (2048, 64));
+        let f = frame_of(layers, n);
+        assert_eq!((f.y_pitch(), f.uv_offset(), f.uv_pitch()), (64, 2048, 64));
+    }
+
+    #[test]
+    fn nv12_odd_dimensions_use_ceil_chroma() {
+        // 5x3, pitch 8: Y [0, 21), chroma row 6 x 2 rows, UV [24, 38).
+        let d = mk_desc(
+            VA_FOURCC_NV12,
+            &[38],
+            &[mk_layer(2, [0, 0, 0, 0], [0, 24, 0, 0], [8, 8, 0, 0])],
+        );
+        let (layers, n) = normalize_export_layers(&d, 5, 3).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(layers[1].offset[0], 24);
+        // One byte less backing store and the chroma range no longer fits.
+        let short = mk_desc(
+            VA_FOURCC_NV12,
+            &[37],
+            &[mk_layer(2, [0, 0, 0, 0], [0, 24, 0, 0], [8, 8, 0, 0])],
+        );
+        assert!(normalize_export_layers(&short, 5, 3).is_err());
+    }
+
+    #[test]
+    fn planes_outside_first_object_reject() {
+        // Composed layer whose chroma plane names object 1.
+        let d = mk_desc(
+            VA_FOURCC_NV12,
+            &[3072, 3072],
+            &[mk_layer(2, [0, 1, 0, 0], [0, 2048, 0, 0], [64, 64, 0, 0])],
+        );
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+        // Separate layers with UV in object 1.
+        let d = mk_desc(
+            VA_FOURCC_NV12,
+            &[2048, 1024],
+            &[
+                mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]),
+                mk_layer(1, [1, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]),
+            ],
+        );
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+    }
+
+    #[test]
+    fn out_of_bounds_and_overflow_reject_without_panic() {
+        let uv = mk_layer(1, [0, 0, 0, 0], [2048, 0, 0, 0], [64, 0, 0, 0]);
+        let y = mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]);
+        // UV range ends at 3072; one byte short rejects.
+        let d = mk_desc(VA_FOURCC_NV12, &[3071], &[y, uv]);
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+        // Absurd pitch blows the checked span past the object: rejects.
+        let wide = mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [u32::MAX, 0, 0, 0]);
+        let d = mk_desc(VA_FOURCC_NV12, &[u32::MAX], &[wide, uv]);
+        assert!(normalize_export_layers(&d, 64, 64).is_err());
+        // UV offset near u32::MAX: end computation overflows, rejects.
+        let far = mk_layer(
+            1,
+            [0, 0, 0, 0],
+            [u32::MAX, 0, 0, 0],
+            [64, 0, 0, 0],
+        );
+        let d = mk_desc(VA_FOURCC_NV12, &[u32::MAX], &[y, far]);
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+    }
+
+    #[test]
+    fn nonzero_y_offset_and_bad_counts_reject() {
+        let uv = mk_layer(1, [0, 0, 0, 0], [2048, 0, 0, 0], [64, 0, 0, 0]);
+        // Y must sit at the mapping base the kernel reads.
+        let shifted = mk_layer(1, [0, 0, 0, 0], [64, 0, 0, 0], [64, 0, 0, 0]);
+        let d = mk_desc(VA_FOURCC_NV12, &[3072], &[shifted, uv]);
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+        let y = mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]);
+        // No objects / no layers: nothing to map.
+        assert!(normalize_export_layers(&mk_desc(VA_FOURCC_NV12, &[], &[]), 64, 32).is_err());
+        // Layer count past the descriptor array: rejected before indexing.
+        let mut too_many = mk_desc(VA_FOURCC_NV12, &[3072], &[y, uv]);
+        too_many.num_layers = 5;
+        assert!(normalize_export_layers(&too_many, 64, 32).is_err());
+        // Zero planes, five planes, zero pitch, row wider than pitch.
+        for bad in [
+            mk_layer(0, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]),
+            mk_layer(5, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]),
+            mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]),
+            mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [8, 0, 0, 0]),
+        ] {
+            let d = mk_desc(VA_FOURCC_NV12, &[3072], &[bad, uv]);
+            assert!(normalize_export_layers(&d, 64, 32).is_err());
+        }
+        // Zero geometry rejects.
+        let d = mk_desc(VA_FOURCC_NV12, &[3072], &[y, uv]);
+        assert!(normalize_export_layers(&d, 0, 32).is_err());
+    }
+
+    #[test]
+    fn p444_separate_and_composed() {
+        // 16x8, pitch 16: Y [0, 128), U [128, 256), V [256, 384).
+        let planes = [
+            mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [16, 0, 0, 0]),
+            mk_layer(1, [0, 0, 0, 0], [128, 0, 0, 0], [16, 0, 0, 0]),
+            mk_layer(1, [0, 0, 0, 0], [256, 0, 0, 0], [16, 0, 0, 0]),
+        ];
+        let d = mk_desc(FOURCC_444P, &[384], &planes);
+        let (layers, n) = normalize_export_layers(&d, 16, 8).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!((layers[1].offset[0], layers[2].offset[0]), (128, 256));
+        // Same extents as one composed 3-plane layer.
+        let d = mk_desc(
+            FOURCC_444P,
+            &[384],
+            &[mk_layer(
+                3,
+                [0, 0, 0, 0],
+                [0, 128, 256, 0],
+                [16, 16, 16, 0],
+            )],
+        );
+        let (layers, n) = normalize_export_layers(&d, 16, 8).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!((layers[1].offset[0], layers[2].offset[0]), (128, 256));
+        // Chroma clipped by one byte rejects.
+        let d = mk_desc(FOURCC_444P, &[383], &planes);
+        assert!(normalize_export_layers(&d, 16, 8).is_err());
+    }
+
+    #[test]
+    fn unknown_fourcc_stays_single_object_and_span_checked() {
+        let one = mk_layer(1, [0, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]);
+        let d = mk_desc(0xDEAD_BEEF, &[2048], &[one]);
+        let (layers, n) = normalize_export_layers(&d, 64, 32).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(layers[0].pitch[0], 64);
+        let far = mk_layer(1, [1, 0, 0, 0], [0, 0, 0, 0], [64, 0, 0, 0]);
+        let d = mk_desc(0xDEAD_BEEF, &[2048, 2048], &[far]);
+        assert!(normalize_export_layers(&d, 64, 32).is_err());
+    }
 }
