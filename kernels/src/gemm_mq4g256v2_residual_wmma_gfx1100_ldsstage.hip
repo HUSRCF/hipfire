@@ -18,10 +18,11 @@
 //
 // Per-wave consume loop is gfx11-shaped (the whole port): each wave's 64 K =
 // 4 x 16-wide fragments; for each, a `half16_t` a_reg is built from LDS via
-// the base kernel's DQ macro (16 nibbles from two u32 loads at
-// `gp + 8 + frag*8`, header kt<8 within the group => quarter 0..1 -> s0/z0,
-// 2..3 -> s1/z1, same select as gfx12), `half16_t b_reg` is loaded from X,
-// and `acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc)`
+// packed RTZ nibble convert + __hfma2 (ksplit DEQUANT_A_FRAG_PK; 16 nibbles
+// from two u32 loads at `gp + 8 + frag*8`, header kt<8 within the group =>
+// quarter 0..1 -> s0/z0, 2..3 -> s1/z1, same select as gfx12), `half16_t
+// b_reg` is loaded from X, and
+// `acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc)`
 // (no `_gfx12` suffix; each lane holds a FULL 16-K fragment, kABKLane=1).
 // Output uses the gfx11 interleaved C mapping from the base kernel
 // (`gemm_mq4g256v2_residual_wmma.hip`): acc[j] = C[2*j + (lane>>4)][lane&15].
@@ -41,6 +42,46 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 typedef unsigned int __attribute__((ext_vector_type(4))) uint4v_t;
+
+#if defined(__gfx1100__)
+// Exact nibble integers 0..15: RTZ == RN bit-for-bit (exact in f16 and f32).
+// Packed idiom matches gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds.hip
+// (DEQUANT_A_FRAG_PK / DEQUANT_PK_H2 / pkrtz_nibble2).
+__device__ __forceinline__ __half2 pkrtz_nibble2(float a, float b) {
+    const auto v = __builtin_amdgcn_cvt_pkrtz(a, b);
+    static_assert(sizeof(v) == sizeof(__half2), "pkrtz size");
+    __half2 h2;
+    __builtin_memcpy(&h2, &v, sizeof(__half2));
+    return h2;
+}
+
+#define DEQUANT_PK_H2(pk, sc_h, zp_h, h01, h23, h45, h67)                                         \
+    do {                                                                                          \
+        const __half2 sc2 = __half2half2(sc_h);                                                   \
+        const __half2 zp2 = __half2half2(zp_h);                                                   \
+        const __half2 q01 = pkrtz_nibble2((float)(((pk) >> 0) & 0xFu),                            \
+                                          (float)(((pk) >> 4) & 0xFu));                           \
+        const __half2 q23 = pkrtz_nibble2((float)(((pk) >> 8) & 0xFu),                            \
+                                          (float)(((pk) >> 12) & 0xFu));                          \
+        const __half2 q45 = pkrtz_nibble2((float)(((pk) >> 16) & 0xFu),                           \
+                                          (float)(((pk) >> 20) & 0xFu));                          \
+        const __half2 q67 = pkrtz_nibble2((float)(((pk) >> 24) & 0xFu),                           \
+                                          (float)(((pk) >> 28) & 0xFu));                          \
+        (h01) = __hfma2(q01, sc2, zp2);                                                           \
+        (h23) = __hfma2(q23, sc2, zp2);                                                           \
+        (h45) = __hfma2(q45, sc2, zp2);                                                           \
+        (h67) = __hfma2(q67, sc2, zp2);                                                           \
+    } while (0)
+
+#define DEQUANT_A_FRAG_PK(pk0, pk1, sc_h, zp_h, frag)                                             \
+    do {                                                                                          \
+        __half2 _h[8];                                                                            \
+        DEQUANT_PK_H2((pk0), (sc_h), (zp_h), _h[0], _h[1], _h[2], _h[3]);                        \
+        DEQUANT_PK_H2((pk1), (sc_h), (zp_h), _h[4], _h[5], _h[6], _h[7]);                        \
+        static_assert(sizeof(_h) == sizeof(frag), "DEQUANT_A_FRAG_PK size mismatch");             \
+        __builtin_memcpy(&(frag), _h, sizeof(frag));                                              \
+    } while (0)
+#endif
 
 __launch_bounds__(256, 4)
 extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
@@ -123,14 +164,19 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
             const unsigned int pk0 = *(const unsigned int*)(gp + 8 + frag * 8);
             const unsigned int pk1 = *(const unsigned int*)(gp + 8 + frag * 8 + 4);
 
-            // Base-kernel DQ macro verbatim (half16, full 16-K per lane).
+            // Packed RTZ + __hfma2 fragment (ksplit sibling idiom); scalar
+            // fallback preserves the prior base-kernel DQ path off gfx1100.
             half16_t a_reg;
+#if defined(__gfx1100__)
+            DEQUANT_A_FRAG_PK(pk0, pk1, (__half)sc_h, (__half)zp_h, a_reg);
+#else
             #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
             DQ(0,  pk0,  0); DQ(1,  pk0,  4); DQ(2,  pk0,  8); DQ(3,  pk0, 12);
             DQ(4,  pk0, 16); DQ(5,  pk0, 20); DQ(6,  pk0, 24); DQ(7,  pk0, 28);
             DQ(8,  pk1,  0); DQ(9,  pk1,  4); DQ(10, pk1,  8); DQ(11, pk1, 12);
             DQ(12, pk1, 16); DQ(13, pk1, 20); DQ(14, pk1, 24); DQ(15, pk1, 28);
             #undef DQ
+#endif
 
             half16_t b_reg = *(const half16_t*)(xg + f * 16);
 

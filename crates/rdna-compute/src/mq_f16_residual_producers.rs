@@ -28,9 +28,9 @@
 //! edits). The `gemm_mq4g256v2_residual_wmma_f16` entry launches the SAME
 //! kernel symbols as `gemm_mq4g256v2_residual_wmma` (same modules, same
 //! grids) with the sidecar pointer wired directly as X, bypassing
-//! `ensure_fp16_x`. Tier selection (ldsstage opt-in, split-K table, base
-//! fallback, `residual_ksplit_off`) mirrors that function exactly; the hook
-//! falls back to the old path wherever this entry returns Err.
+//! `ensure_fp16_x`. Tier selection (default-on ldsstage on exact gfx1100,
+//! split-K table, base fallback, `residual_ksplit_off`) mirrors that
+//! function exactly; the hook falls back to the old path wherever this entry returns Err.
 
 use std::ffi::c_void;
 
@@ -569,10 +569,10 @@ impl Gpu {
     /// `gemm_mq4g256v2_residual_wmma`; the only difference is `x_f16`
     /// (DType::F16, e.g. an S4 sidecar) is wired straight in, bypassing
     /// `ensure_fp16_x` and its `convert_f32_to_f16` launch. Tier selection
-    /// mirrors that function: ldsstage opt-in, split-K table, base
-    /// fallback (`residual_ksplit_off` forces base). Any shape outside the
-    /// routed verify domain (non-gfx1100, `batch_size > 16`, `K % 256 != 0`)
-    /// returns Err so the caller keeps the old path.
+    /// mirrors that function: default-on ldsstage on exact gfx1100, split-K
+    /// table, base fallback (`residual_ksplit_off` forces base). Any shape
+    /// outside the routed verify domain (non-gfx1100, `batch_size > 16`,
+    /// `K % 256 != 0`) returns Err so the caller keeps the old path.
     pub fn gemm_mq4g256v2_residual_wmma_f16(
         &mut self,
         a_raw: &GpuTensor,

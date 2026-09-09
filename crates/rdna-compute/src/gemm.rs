@@ -318,9 +318,9 @@ enum Mq4v2QkvVariant {
 /// Shared by the F32 entry below and the F16 entry in
 /// `mq_f16_residual_producers.rs` so both precisions route identically: the
 /// `residual_ksplit_off` kill switch dominates BOTH optimized tiers and
-/// restores the base kernel; otherwise the `residual_ldsstage` opt-in wins
-/// wherever `K % 512 == 0`, else the frozen split-K table, else base. Pure
-/// so CPU tests can pin the precedence without a GPU.
+/// restores the base kernel; otherwise the `residual_ldsstage` default-on
+/// exact-gfx1100 tier wins wherever `K % 512 == 0`, else the frozen split-K
+/// table, else base. Pure so CPU tests can pin the precedence without a GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResidualVerifyTier {
     LdsStage,
@@ -29070,11 +29070,9 @@ impl Gpu {
         // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
         // and ldsstage kernels (flags.residual_ksplit_off) and restores the
         // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
-        // ldsstage design) is opt-in via HIPFIRE_RESIDUAL_LDSSTAGE=1
-        // (flags.residual_ldsstage) wherever K % 512 == 0: it beats ks4 by
-        // ~8% on hipx (53% vs 48% of roofline) but missed the 70% gate — 126
-        // VGPRs cap it at 1 WG/CU — so ks4 stays the default until register
-        // pressure is addressed.
+        // ldsstage design) is default-on for exact gfx1100
+        // (flags.residual_ldsstage) wherever K % 512 == 0; set
+        // HIPFIRE_RESIDUAL_LDSSTAGE=0 to restore the split-K table path.
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
@@ -29390,8 +29388,8 @@ impl Gpu {
     }
 
     /// Shared verify-tier pick for the exact-gfx1100 residual entries (see
-    /// `ResidualVerifyTier`): kill switch dominates both tiers, ldsstage
-    /// opt-in next, split-K table next, base fallback. Both the F32 entry
+    /// `ResidualVerifyTier`): kill switch dominates both tiers, default-on
+    /// ldsstage next, split-K table next, base fallback. Both the F32 entry
     /// above and the F16 entry route through here.
     #[inline]
     pub(crate) fn residual_verify_tier(
@@ -37397,7 +37395,7 @@ mod tests {
     #[test]
     fn residual_kill_switch_dominates_ldsstage_and_ksplit() {
         // K = 2048 admits both optimized tiers (K % 512 == 0, ks table -> kw=4).
-        // Kill switch restores base even with the ldsstage opt-in (the F16 bug).
+        // Kill switch restores base even with the ldsstage enabled (the F16 bug).
         assert_eq!(
             ResidualVerifyTier::Base,
             Gpu::residual_verify_tier(true, true, 2048)
@@ -37406,7 +37404,7 @@ mod tests {
             ResidualVerifyTier::Base,
             Gpu::residual_verify_tier(true, false, 2048)
         );
-        // Preserved opt-in/default routing with the kill switch off.
+        // Preserved enabled/disabled routing with the kill switch off.
         assert_eq!(
             ResidualVerifyTier::LdsStage,
             Gpu::residual_verify_tier(false, true, 2048)
