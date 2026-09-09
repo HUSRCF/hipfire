@@ -175,6 +175,8 @@ fn find_daemon_binary() -> Result<PathBuf, String> {
     // Prefer release; fall back to debug. Mirror the gate scripts'
     // discovery behaviour.
     let candidates = [
+        "target/release/daemon.exe",
+        "target/debug/daemon.exe",
         "target/release/daemon",
         "target/debug/daemon",
     ];
