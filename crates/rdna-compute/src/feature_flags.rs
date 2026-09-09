@@ -458,15 +458,11 @@ impl FeatureFlags {
                 == Ok("1"),
             rdna3_q8_group128: value("HIPFIRE_RDNA3_Q8_GROUP128").as_deref() == Ok("1"),
             rdna3_q8_group128_row2: value("HIPFIRE_RDNA3_Q8_GROUP128_ROW2").as_deref() == Ok("1"),
-            rdna3_q8_group128_dual_row_weight: value(
-                "HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT",
-            )
-            .as_deref()
+            rdna3_q8_group128_dual_row_weight: value("HIPFIRE_RDNA3_Q8_GROUP128_DUAL_ROW_WEIGHT")
+                .as_deref()
                 == Ok("1"),
-            rdna3_q8_group128_quad_row_weight: value(
-                "HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT",
-            )
-            .as_deref()
+            rdna3_q8_group128_quad_row_weight: value("HIPFIRE_RDNA3_Q8_GROUP128_QUAD_ROW_WEIGHT")
+                .as_deref()
                 == Ok("1"),
             rdna3_q8_group128_k128: value("HIPFIRE_RDNA3_Q8_GROUP128_K128").as_deref() == Ok("1"),
             rdna3_q8_group128_direct: value("HIPFIRE_RDNA3_Q8_GROUP128_DIRECT").as_deref()
@@ -591,7 +587,11 @@ impl FeatureFlags {
 
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
-            graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
+            graph_ar: match value("HIPFIRE_AR_GRAPH").ok().as_deref() {
+                Some("0") | Some("off") | Some("false") => false,
+                Some("1") | Some("on") | Some("true") => true,
+                _ => !cfg!(windows),
+            },
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),

@@ -6996,11 +6996,13 @@ pub fn forward_scratch(
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
-    //   - gfx11 (RDNA3 / 3.5): default-ON. +0.6-0.7% decode on 9B and
+    //   - gfx11 (RDNA3 / 3.5): default-ON on non-Windows hosts. +0.6-0.7%
+    //     decode on 9B and
     //     0.8B HFP4G32 on 7900 XTX (5-run mean per model, all positive,
     //     variance 1.001-1.010×, 2026-05-11). Smaller win than gfx12 —
     //     gfx11 has less per-launch overhead to amortize — but real
-    //     and consistent across model sizes.
+    //     and consistent across model sizes. Windows defaults AR graph OFF:
+    //     gfx1100/ROCm 7.2 replay corrupts output from the first token.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     `experimental.graph.forward = true`) since not yet A/B'd on those.
     //   - MoE configs follow `experimental.graph.moe`. The ~30-50-token
@@ -7525,11 +7527,7 @@ impl PrefillBatchScratch {
                 &[max_batch * hidden_dim],
                 DType::F16
             ),
-            up_f16_batch: alloc_opt!(
-                use_f16_ffn_scratch,
-                &[max_batch * hidden_dim],
-                DType::F16
-            ),
+            up_f16_batch: alloc_opt!(use_f16_ffn_scratch, &[max_batch * hidden_dim], DType::F16),
             ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
             ffn_group_energy: zeros_opt!(
                 gpu.flags.rdna3_ffn_group_calibration && hidden_dim % 256 == 0,
@@ -13011,8 +13009,7 @@ fn try_run_hfq4_group128_swiglu_down(
         || w_down.gpu_dtype != DType::MQ4G256
         || w_down.awq_scale.is_some()
         || w_down.m != 5_120
-        || (w_down.k != 17_408
-            && (!gpu.flags.rdna3_ffn_variable_width || w_down.k % 256 != 0))
+        || (w_down.k != 17_408 && (!gpu.flags.rdna3_ffn_variable_width || w_down.k % 256 != 0))
         || n % 256 != 0
         || gate.dtype != up.dtype
         || !matches!(gate.dtype, DType::F32 | DType::F16)

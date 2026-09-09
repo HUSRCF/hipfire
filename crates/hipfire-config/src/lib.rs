@@ -2346,10 +2346,10 @@ pub static FIELDS: &[ConfigField] = &[
         "experimental.graph.ar",
         "graph_ar",
         Experimental,
-        true,
+        !cfg!(windows),
         true,
         "HIPFIRE_AR_GRAPH",
-        "Allow autoregressive forward graph capture when otherwise eligible."
+        "Allow autoregressive forward graph capture when otherwise eligible (default off on Windows)."
     ),
     process_bool_field!(
         "experimental.graph.moe",
