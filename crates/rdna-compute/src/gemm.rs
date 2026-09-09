@@ -28451,7 +28451,9 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mqv2_prefill_batch_tile` outside replay/capture.
+    /// `mqv2_prefill_batch_tile` outside replay/capture. Small-N eager HIP on
+    /// exact gfx1100 defaults to the RAW-slab ldsstage (HIPFIRE_GATEUP_LDSSTAGE
+    /// default-on; `=0` restores historical base); capture/replay keep base.
     pub fn gemm_gate_up_mq4g256v2_wmma(
         &mut self,
         a_gate: &GpuTensor,
@@ -28519,8 +28521,30 @@ impl Gpu {
             }
         }
         self.bind_thread()?;
-        let kname = "gemm_gate_up_mq4g256v2_wmma";
-        let ksrc = kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC;
+        // Small-N eager HIP: exact-gfx1100 RAW-slab ldsstage default-on via
+        // flags.gate_up_ldsstage (HIPFIRE_GATEUP_LDSSTAGE; =0 → historical base),
+        // 1<=N<=16, K%512==0. Capture/replay and other shapes keep base block32.
+        let (kname, ksrc, block_x) = if !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && (1..=16).contains(&batch_size)
+            && k > 0
+            && k % 512 == 0
+            && self.flags.gate_up_ldsstage
+        {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC,
+                256u32,
+            )
+        } else {
+            (
+                "gemm_gate_up_mq4g256v2_wmma",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC,
+                32u32,
+            )
+        };
         self.ensure_kernel(kname, ksrc, kname)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut ag = a_gate.buf.as_ptr();
@@ -28555,7 +28579,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block_x, 1, 1],
             0,
             &mut params,
             || {

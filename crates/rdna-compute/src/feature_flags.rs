@@ -191,6 +191,12 @@ pub struct FeatureFlags {
     /// gfx1100; other arches default false; launchers remain exact-gfx1100-only. Set
     /// `HIPFIRE_RESIDUAL_LDSSTAGE=0` to restore the split-K table path.
     pub residual_ldsstage: bool,
+    /// `HIPFIRE_GATEUP_LDSSTAGE` selects the exact-gfx1100 N<=16 MQ4V2 gate_up
+    /// RAW-slab ldsstage on eligible eager HIP (1<=N<=16, K%512==0). Certified
+    /// default on exact gfx1100; other arches default false; launchers remain
+    /// exact-gfx1100-only. Capture/replay keep the historical base. Set
+    /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
+    pub gate_up_ldsstage: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -541,6 +547,7 @@ impl FeatureFlags {
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -802,6 +809,7 @@ impl FeatureFlags {
             force_blob_path: false,
             residual_ksplit_off: false,
             residual_ldsstage: false,
+            gate_up_ldsstage: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,

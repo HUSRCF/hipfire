@@ -448,12 +448,14 @@ impl Gpu {
         result
     }
 
-    /// MQ4V2 gate/up base GEMM consuming a caller-owned F16 activation.
+    /// MQ4V2 gate/up GEMM consuming a caller-owned F16 activation.
     ///
     /// Same contract as [`Gpu::gemm_qkvza_mq4g256v2_wmma_f16`]: launch-body
-    /// copy of the `gemm_gate_up_mq4g256v2_wmma` historical base path with
-    /// the validated F16 pointer. Taps mirror the `FusedGateUpMq4G256V2`
-    /// run-arm.
+    /// copy of the `gemm_gate_up_mq4g256v2_wmma` path with the validated F16
+    /// pointer. Exact-gfx1100 eager HIP defaults to RAW-slab ldsstage when
+    /// eligible (HIPFIRE_GATEUP_LDSSTAGE default-on, 1<=N<=16, K%512==0; `=0`
+    /// historical base); capture/replay keep base symbol/block32. Taps mirror
+    /// the `FusedGateUpMq4G256V2` run-arm.
     pub fn gemm_gate_up_mq4g256v2_wmma_f16(
         &mut self,
         a_gate: &GpuTensor,
@@ -481,8 +483,28 @@ impl Gpu {
         self.maybe_capture_activation(a_gate, x_f16, batch_size, k);
         self.maybe_capture_activation(a_up, x_f16, batch_size, k);
         self.bind_thread()?;
-        let kname = "gemm_gate_up_mq4g256v2_wmma";
-        let ksrc = crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC;
+        // Same guarded tuple as gemm_gate_up_mq4g256v2_wmma small-N eager HIP.
+        let (kname, ksrc, block_x) = if !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && (1..=16).contains(&batch_size)
+            && k > 0
+            && k % 512 == 0
+            && self.flags.gate_up_ldsstage
+        {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage",
+                crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC,
+                256u32,
+            )
+        } else {
+            (
+                "gemm_gate_up_mq4g256v2_wmma",
+                crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC,
+                32u32,
+            )
+        };
         self.ensure_kernel(kname, ksrc, kname)?;
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -520,7 +542,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block_x, 1, 1],
             0,
             &mut params,
             || {

@@ -3421,6 +3421,15 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
 /// LDS spanning gate+up rows, symbols mw{4,8}_lds. Production N>=384.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds.hip");
+/// Exact-gfx1100 N<=16 RAW-slab LDS-stage gate+up (MQ4V2).
+/// Sister of residual `GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC` and
+/// the gfx12 gate_up ldsstage: packed DEQUANT_A_FRAG_PK consume, half16 WMMA,
+/// dual barriers, overwrite split Y_gate/Y_up. Symbol
+/// `gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage`. Block 256, static LDS 12544.
+/// Requires K % 512 == 0; HIPFIRE_GATEUP_LDSSTAGE default-on exact gfx1100.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage.hip");
+
 
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
