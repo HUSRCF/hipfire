@@ -3075,7 +3075,14 @@ impl Gpu {
         // mapped). Costs up-front VRAM for the whole reservation; correctness
         // over on-demand commit on the platform whose driver breaks growth.
         #[cfg(windows)]
-        let initial_mapped_bytes = byte_size;
+        let initial_mapped_bytes = {
+            // map_next requires a multiple of the allocation granularity
+            let granularity = arena.granularity();
+            byte_size
+                .checked_add(granularity - 1)
+                .map(|v| v / granularity * granularity)
+                .unwrap_or(byte_size)
+        };
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
