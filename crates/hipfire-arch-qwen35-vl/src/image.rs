@@ -309,6 +309,366 @@ pub fn extract_patches(
     patches
 }
 
+/// VCN JPEG decode path (`image.decode = vcn|auto`, behind the `vcn-jpeg`
+/// cargo feature, default off). Mirrors `vision.mode` resolution via
+/// `hipfire-config`: `cpu` never touches VCN, `vcn`/`auto` attempt the pooled
+/// libva decode and fall back to the CPU path on anything unexpected (a VCN
+/// attempt NEVER fails the request — the CPU path is always correct).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageDecode {
+    Cpu,
+    Vcn,
+    Auto,
+}
+
+/// Resolve `image.decode` (`HIPFIRE_IMAGE_DECODE` compat) from the process
+/// snapshot. Default `cpu`; unrecognized values fail safe to `cpu`.
+pub fn resolve_image_decode() -> ImageDecode {
+    match hipfire_config::process_value("HIPFIRE_IMAGE_DECODE").as_deref() {
+        Some("vcn") => ImageDecode::Vcn,
+        Some("auto") => ImageDecode::Auto,
+        _ => ImageDecode::Cpu,
+    }
+}
+
+#[cfg(feature = "vcn-jpeg")]
+use rdna_compute::{DType, Gpu, GpuTensor};
+#[cfg(feature = "vcn-jpeg")]
+pub use va_bridge::VcnFrame;
+
+/// Device-resident patches from the VCN path, ready for
+/// [`crate::qwen35_vl::vision_forward_patches`] (no upload, no CPU pixels).
+#[cfg(feature = "vcn-jpeg")]
+pub struct VcnPatches {
+    pub patches: GpuTensor,
+    pub img_h: usize,
+    pub img_w: usize,
+    pub grid_h: usize,
+    pub grid_w: usize,
+}
+
+/// A pooled VCN decode plus its resized target dims — no GPU allocation
+/// (the mapping is session-pooled), so this can run before the daemon's
+/// capacity checks. [`vcn_to_patches`] does the kernel launches after them.
+///
+/// The `lease` holds the shared session mutex from decode until the
+/// consumer's device reads complete: while this value lives, no other thread
+/// can decode through the shared session, so the pooled surface cannot be
+/// overwritten mid-read. Non-`Copy`/non-`Clone` by construction (the lease
+/// is). Single-lease rule: never hold two `VcnDecoded`s at once — the mutex
+/// is not reentrant, so decode image N+1 only after [`vcn_to_patches`]
+/// consumes image N.
+#[cfg(feature = "vcn-jpeg")]
+pub struct VcnDecoded<'a> {
+    pub lease: va_bridge::SharedVcnLease<'a>,
+    pub img_h: usize,
+    pub img_w: usize,
+}
+
+#[cfg(feature = "vcn-jpeg")]
+impl VcnDecoded<'_> {
+    /// Frame metadata (geometry, layout, pooled device pointer). Valid only
+    /// while this decode is alive — never copy it out from under the lease.
+    pub fn frame(&self) -> &VcnFrame {
+        self.lease.frame()
+    }
+}
+
+#[cfg(feature = "vcn-jpeg")]
+const VL_YUV_PREPROCESS_SRC: &str = include_str!("../../../kernels/src/vl_yuv_preprocess.hip");
+#[cfg(feature = "vcn-jpeg")]
+const VL_RGB_KERNEL: &str = "vl_nv12_to_rgb_norm";
+#[cfg(feature = "vcn-jpeg")]
+const VL_PATCH_KERNEL: &str = "vl_extract_patches";
+#[cfg(feature = "vcn-jpeg")]
+const FOURCC_444P: u32 = 0x5034_3434;
+
+/// Log-once gate for the expected `auto`-on-CPU-host fallback.
+#[cfg(feature = "vcn-jpeg")]
+static VCN_UNAVAILABLE_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Pooled VCN decode + resized target dims, no GPU allocation. Returns
+/// `None` when the CPU path should be used (`image.decode = cpu`,
+/// non-JPEG input, VCN-unsupported streams, missing hardware, or a fourcc
+/// the preprocess kernels have no arm for). A `None` here is never an
+/// error — the CPU path is always correct.
+///
+/// The returned [`VcnDecoded`] carries the shared-session lease (`'static`:
+/// the pool is process-wide, independent of the input borrow), so the
+/// surface cannot be overwritten until [`vcn_to_patches`] consumes it.
+#[cfg(feature = "vcn-jpeg")]
+pub fn vcn_decode(
+    data: &[u8],
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> Option<VcnDecoded<'static>> {
+    let mode = resolve_image_decode();
+    if mode == ImageDecode::Cpu {
+        return None;
+    }
+    let lease = match va_bridge::VaSession::shared_decode_jpeg_lease(data) {
+        Ok(va_bridge::SharedDecodeOutcome::Decoded(l)) => l,
+        Ok(va_bridge::SharedDecodeOutcome::Unsupported(reason)) => {
+            if mode == ImageDecode::Vcn {
+                eprintln!("[vl-vcn] VCN unsupported ({reason}) — CPU fallback");
+            }
+            return None;
+        }
+        Err(e) => {
+            let unavailable = matches!(
+                e,
+                va_bridge::VaError::NoRenderNode
+                    | va_bridge::VaError::Dlopen { .. }
+                    | va_bridge::VaError::MissingSymbol { .. }
+            );
+            if mode == ImageDecode::Vcn || !unavailable {
+                eprintln!("[vl-vcn] VCN decode failed ({e}) — CPU fallback");
+            } else {
+                VCN_UNAVAILABLE_LOGGED.call_once(|| {
+                    eprintln!("[vl-vcn] VCN unavailable ({e}) — CPU fallback");
+                });
+            }
+            return None;
+        }
+    };
+    // Copy the scalars out before moving the lease: the frame borrow ends
+    // here, the lease moves into the returned decode below.
+    let (fourcc, src_w, src_h) = {
+        let f = lease.frame();
+        (f.fourcc, f.width as usize, f.height as usize)
+    };
+    if fourcc != va_bridge::VA_FOURCC_NV12 && fourcc != FOURCC_444P {
+        if mode == ImageDecode::Vcn {
+            eprintln!("[vl-vcn] fourcc 0x{fourcc:08x} has no kernel arm — CPU fallback");
+        }
+        return None;
+    }
+    // Same resize contract as the CPU path (`preprocess_dynamic_image`).
+    let factor = patch_size * spatial_merge_size;
+    let (t_h, t_w) = smart_resize(src_h, src_w, factor, VISION_MIN_PIXELS, vision_max_pixels());
+    Some(VcnDecoded {
+        lease,
+        img_h: t_h,
+        img_w: t_w,
+    })
+}
+
+/// Chroma addressing for [`vcn_to_patches`]: NV12 interleaved or planar 444.
+#[cfg(feature = "vcn-jpeg")]
+fn vcn_chroma(frame: &VcnFrame) -> Option<(u32, u32, u32, u32, u32)> {
+    if frame.fourcc == va_bridge::VA_FOURCC_NV12 {
+        Some((frame.uv_offset(), frame.uv_offset() + 1, 2, 1, 1))
+    } else if frame.fourcc == FOURCC_444P && frame.num_layers >= 3 {
+        Some((
+            frame.layers[1].offset[0],
+            frame.layers[2].offset[0],
+            1,
+            0,
+            0,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Kernel launches for a [`vcn_decode`] result: NV12/planar → CHW f32 →
+/// device patches. Joins the `Gpu` stream, ordered before the vision tower.
+///
+/// Takes the decode BY VALUE and consumes the session lease only after a
+/// checked terminal stream sync ([`Gpu::sync_with_deadline`]): launch is
+/// asynchronous, so the pooled surface is still being read until that sync
+/// returns `Ok`. Same-stream FIFO ordering is what makes the event/sync a
+/// read-completion proof rather than a launch receipt. The lease drops
+/// before the returned patches reach the vision tower — never held across
+/// language generation.
+///
+/// `Err` is GPU-side failure only (decode fallbacks already returned `None`
+/// above); the caller falls back to a CPU decode of the retained bytes. Any
+/// failure after the first kernel is enqueued still performs the terminal
+/// sync first (the enqueued surface read must complete before the surface
+/// can be reused) and chains a sync failure into the returned error — sync
+/// errors are never swallowed. A failed sync leaves the device suspect per
+/// the `sync_with_deadline` contract; the error propagates like any
+/// hung-GPU error.
+#[cfg(feature = "vcn-jpeg")]
+pub fn vcn_to_patches(
+    gpu: &mut Gpu,
+    dec: VcnDecoded<'_>,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<VcnPatches, String> {
+    let (t_h, t_w) = (dec.img_h, dec.img_w);
+    let frame = dec.frame();
+    let Some((u_off, v_off, step, sh_x, sh_y)) = vcn_chroma(frame) else {
+        // No kernel enqueued — the lease drops with `dec`, surface untouched.
+        return Err(format!(
+            "vcn fourcc 0x{:08x} has no kernel arm",
+            frame.fourcc
+        ));
+    };
+    let n_elem =
+        (t_h / patch_size) * (t_w / patch_size) * temporal_patch_size * 3 * patch_size * patch_size;
+    if n_elem == 0 {
+        return Err("vcn empty patch grid".to_string());
+    }
+    // Geometry scalars outlive the frame borrow; the log below runs after
+    // the lease drops.
+    let (src_w, src_h) = (frame.width, frame.height);
+    let map_err = |op: &'static str| move |e: hip_bridge::HipError| format!("vcn {op}: {e}");
+    gpu.ensure_kernel_public("vl_yuv_preprocess", VL_YUV_PREPROCESS_SRC, VL_RGB_KERNEL)
+        .map_err(map_err("ensure rgb kernel"))?;
+    gpu.ensure_kernel_public("vl_yuv_preprocess", VL_YUV_PREPROCESS_SRC, VL_PATCH_KERNEL)
+        .map_err(map_err("ensure patch kernel"))?;
+    let n_chw = 3 * t_h * t_w;
+    let d_chw = gpu
+        .alloc_tensor(&[n_chw], DType::F32)
+        .map_err(map_err("alloc chw"))?;
+    let mut b1 = hip_bridge::KernargBlob::new();
+    b1.push_ptr(frame.device_ptr() as *const std::ffi::c_void);
+    for v in [
+        frame.y_pitch(),
+        frame.uv_pitch(),
+        u_off,
+        v_off,
+        step,
+        frame.width,
+        frame.height,
+        sh_x,
+        sh_y,
+        t_w as u32,
+        t_h as u32,
+    ] {
+        b1.push_u32(v);
+    }
+    b1.push_ptr(d_chw.buf.as_ptr() as *const std::ffi::c_void);
+    b1.pad_to(16);
+    gpu.launch_kernel_blob(
+        VL_RGB_KERNEL,
+        [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
+        [16, 16, 1],
+        0,
+        b1.as_mut_slice(),
+    )
+    .map_err(map_err("launch rgb kernel"))?;
+    // Past this point a kernel is reading the surface: every error below
+    // syncs first (checked) so the read completes before the lease releases,
+    // and chains a sync failure instead of swallowing it.
+    let patches = match gpu.alloc_tensor(&[n_elem], DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(sync_after_enqueue(
+                gpu,
+                "rgb launch",
+                format!("vcn alloc patches: {e}"),
+                dec,
+            ));
+        }
+    };
+    let mut b2 = hip_bridge::KernargBlob::new();
+    b2.push_ptr(d_chw.buf.as_ptr() as *const std::ffi::c_void);
+    for v in [
+        t_h as u32,
+        t_w as u32,
+        patch_size as u32,
+        temporal_patch_size as u32,
+        spatial_merge_size as u32,
+    ] {
+        b2.push_u32(v);
+    }
+    b2.push_ptr(patches.buf.as_ptr() as *const std::ffi::c_void);
+    b2.pad_to(16);
+    if let Err(e) = gpu.launch_kernel_blob(
+        VL_PATCH_KERNEL,
+        [(n_elem as u32 + 255) / 256, 1, 1],
+        [256, 1, 1],
+        0,
+        b2.as_mut_slice(),
+    ) {
+        return Err(sync_after_enqueue(
+            gpu,
+            "rgb launch",
+            format!("vcn launch patch kernel: {e}"),
+            dec,
+        ));
+    }
+    if let Err(e) = gpu.free_tensor(d_chw) {
+        return Err(sync_after_enqueue(
+            gpu,
+            "patch launch",
+            format!("vcn free chw: {e}"),
+            dec,
+        ));
+    }
+    // Release boundary: the pooled-surface reads are complete only when this
+    // returns `Ok` (same-stream FIFO). On failure the reads may still be
+    // outstanding: quarantine the lease (never reuse the surface) instead of
+    // dropping it — see `sync_after_enqueue`.
+    if let Err(e) = gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE) {
+        va_bridge::VaSession::quarantine_shared(dec.lease);
+        return Err(format!(
+            "vcn terminal sync: {e} (shared session quarantined)"
+        ));
+    }
+    drop(dec);
+    eprintln!(
+        "[vl-vcn] VCN decode {src_w}x{src_h} -> {t_w}x{t_h} ({} patches)",
+        (t_h / patch_size) * (t_w / patch_size)
+    );
+    Ok(VcnPatches {
+        patches,
+        img_h: t_h,
+        img_w: t_w,
+        grid_h: t_h / patch_size,
+        grid_w: t_w / patch_size,
+    })
+}
+
+/// Checked terminal sync after kernels were enqueued, consuming the decode.
+/// `Ok` sync ⇒ surface reads complete ⇒ the lease drops normally and the
+/// surface is reusable. Sync failure ⇒ reads may still be outstanding ⇒ the
+/// lease is quarantined, never released for reuse; the chained error (never
+/// swallowed) drives the caller's CPU fallback.
+#[cfg(feature = "vcn-jpeg")]
+fn sync_after_enqueue(gpu: &Gpu, op: &'static str, prior: String, dec: VcnDecoded<'_>) -> String {
+    match gpu.sync_with_deadline(Gpu::GPU_SYNC_DEADLINE) {
+        Ok(()) => {
+            drop(dec);
+            prior
+        }
+        Err(e) => {
+            va_bridge::VaSession::quarantine_shared(dec.lease);
+            format!(
+                "{prior}; vcn terminal sync after {op} failed: {e} (shared session quarantined)"
+            )
+        }
+    }
+}
+
+/// One-call VCN JPEG → device patches: [`vcn_decode`] then
+/// [`vcn_to_patches`]. `Ok(None)` = take the CPU path; `Err` = GPU-side
+/// failure after a successful decode.
+#[cfg(feature = "vcn-jpeg")]
+pub fn try_vcn_preprocess(
+    gpu: &mut Gpu,
+    data: &[u8],
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<Option<VcnPatches>, String> {
+    let Some(dec) = vcn_decode(data, patch_size, spatial_merge_size) else {
+        return Ok(None);
+    };
+    vcn_to_patches(
+        gpu,
+        dec,
+        patch_size,
+        temporal_patch_size,
+        spatial_merge_size,
+    )
+    .map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1321,6 +1321,7 @@ dependencies = [
  "libjpeg-turbo-rs",
  "rdna-compute",
  "serde_json",
+ "va-bridge",
 ]
 
 [[package]]
@@ -3664,6 +3665,14 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "va-bridge"
+version = "0.1.0"
+dependencies = [
+ "hipfire-config",
+ "libloading",
 ]
 
 [[package]]

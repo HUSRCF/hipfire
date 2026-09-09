@@ -388,6 +388,24 @@ pub(crate) fn build_vl_mrope_ctx(
         built.rope_delta,
     ))
 }
+/// Strip an optional `data:...;base64,` prefix and base64-decode image bytes.
+/// Shared by the VCN pre-pass and the CPU fallback below so both see the
+/// same bytes (and the same errors).
+fn decode_image_bytes(b64: &str) -> Result<Vec<u8>, String> {
+    // A `data:` URL missing the comma separator is malformed — surface that
+    // explicitly rather than letting it fall through to a misleading
+    // "invalid byte 'd' at index 0" base64 error.
+    let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+        match rest.split_once(',') {
+            Some((_, after)) => after,
+            None => return Err("malformed data URL: missing ',' separator".to_string()),
+        }
+    } else {
+        b64
+    };
+    Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64)
+        .map_err(|e| format!("failed to decode base64 image data: {e}"))
+}
 
 pub fn generate_vl(
     m: &mut LoadedModel,
@@ -473,68 +491,89 @@ pub fn generate_vl(
         .special_token_id("<|vision_end|>")
         .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_end|> special token"));
 
-    // Image preprocessing (CPU decode + smart resize). Cheap relative to
-    // the GPU vision encoder, so we run it before the capacity check —
-    // we need img_h/img_w to estimate visual tokens, and rejecting an
-    // over-budget request before vision_forward saves expensive GPU work.
-    let (pixels, img_h, img_w) = match image_source {
-        ImageSource::Path(path) => {
-            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
-            match image::load_and_preprocess(
-                Path::new(path),
-                vision_config.patch_size,
-                vision_config.spatial_merge_size,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    write_error(stdout, id, &e);
-                    return;
-                }
-            }
+    // VCN pre-pass (feature `vcn-jpeg` only): pooled libva decode plus
+    // resized target dims. No GPU allocation (the mapping is session-pooled)
+    // and no CPU pixels, so the early returns below still own no request
+    // GPU buffers (see the invariant above). The retained bytes feed the
+    // last-resort CPU decode if the later kernel launches fail.
+    //
+    // Gated on `resolve_image_decode()` BEFORE touching the source: the
+    // default (`cpu`) path must not pay a file read / base64 decode here
+    // only to discard it in `vcn_decode` and redo it below. Bytes are
+    // retained only for an attempted VCN path.
+    //
+    // `VcnDecoded` holds the shared session lease (see its docs): at most
+    // one lives per request — a second `vcn_decode` while this is alive
+    // self-deadlocks — and `vcn_to_patches` consumes it right after its
+    // terminal sync, never across generation.
+    #[cfg(feature = "vcn-jpeg")]
+    let vcn_prepass: Option<(image::VcnDecoded<'static>, Vec<u8>)> = (|| {
+        if image::resolve_image_decode() == image::ImageDecode::Cpu {
+            return None;
         }
-        ImageSource::Base64(b64) => {
-            // Strip optional `data:...;base64,` prefix. A `data:` URL
-            // missing the comma separator is malformed — surface that
-            // explicitly rather than letting it fall through to a
-            // misleading "invalid byte 'd' at index 0" base64 error.
-            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
-                match rest.split_once(',') {
-                    Some((_, after)) => after,
-                    None => {
-                        write_error(stdout, id, "malformed data URL: missing ',' separator");
+        let bytes = match image_source {
+            ImageSource::Path(path) => std::fs::read(path).ok()?,
+            ImageSource::Base64(b64) => decode_image_bytes(b64).ok()?,
+        };
+        image::vcn_decode(
+            &bytes,
+            vision_config.patch_size,
+            vision_config.spatial_merge_size,
+        )
+        .map(|d| (d, bytes))
+    })();
+    #[cfg(feature = "vcn-jpeg")]
+    let vcn_dims = vcn_prepass.as_ref().map(|(d, _)| (d.img_h, d.img_w));
+    #[cfg(not(feature = "vcn-jpeg"))]
+    let vcn_dims: Option<(usize, usize)> = None;
+
+    // Image preprocessing (CPU decode + smart resize, unless the VCN
+    // pre-pass hit). Cheap relative to the GPU vision encoder, so we run it
+    // before the capacity check — we need img_h/img_w to estimate visual
+    // tokens, and rejecting an over-budget request before vision_forward
+    // saves expensive GPU work.
+    let (pixels, img_h, img_w) = match vcn_dims {
+        Some((h, w)) => (Vec::new(), h, w),
+        None => match image_source {
+            ImageSource::Path(path) => {
+                eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+                match image::load_and_preprocess(
+                    Path::new(path),
+                    vision_config.patch_size,
+                    vision_config.spatial_merge_size,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
                         return;
                     }
                 }
-            } else {
-                b64
-            };
-            eprintln!(
-                "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
-                raw_b64.len()
-            );
-            let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
-                Ok(b) => b,
-                Err(e) => {
-                    write_error(
-                        stdout,
-                        id,
-                        &format!("failed to decode base64 image data: {e}"),
-                    );
-                    return;
-                }
-            };
-            match image::load_and_preprocess_from_bytes(
-                &bytes,
-                vision_config.patch_size,
-                vision_config.spatial_merge_size,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    write_error(stdout, id, &e);
-                    return;
+            }
+            ImageSource::Base64(b64) => {
+                let bytes = match decode_image_bytes(b64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
+                    bytes.len()
+                );
+                match image::load_and_preprocess_from_bytes(
+                    &bytes,
+                    vision_config.patch_size,
+                    vision_config.spatial_merge_size,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
+                        return;
+                    }
                 }
             }
-        }
+        },
     };
     eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
 
@@ -724,40 +763,230 @@ pub fn generate_vl(
     };
     let mrope = mrope_ctx.as_ref();
 
-    // Now safe to run the expensive GPU vision encoder.
-    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels,
-        3,
-        img_h,
-        img_w,
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-    );
-    let visual_tokens = match qwen35_vl::vision_forward(
-        gpu,
-        vision_weights,
-        &vision_config,
-        &patches,
-        grid_h,
-        grid_w,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            vl_forward_fail(
-                stdout,
-                id,
-                "vision_forward",
-                e,
+    // Now safe to run the expensive GPU vision encoder. VCN images arrive
+    // as a pooled decode: kernels build device patches (no CPU pixels, no
+    // upload) and the tower runs on the resident tensor; everything else
+    // takes today's extract + upload path.
+    #[cfg(feature = "vcn-jpeg")]
+    let visual_tokens = match vcn_prepass {
+        Some((d, bytes)) => {
+            // By value: `vcn_to_patches` consumes the session lease after
+            // its terminal sync, so the surface is reusable (and the mutex
+            // free) before the tower runs. The retained source bytes live
+            // until all CPU fallbacks below are past, then release with the
+            // match scope.
+            let vcn_patches = match image::vcn_to_patches(
                 gpu,
-                dn,
-                kv,
-                &mut m.kv_adaptive,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
+                d,
+                vision_config.patch_size,
+                vision_config.temporal_patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(vp) => Some(vp),
+                Err(e) => {
+                    // Last-resort CPU decode of the retained bytes.
+                    eprintln!("[daemon/vl] VCN patch build failed ({e}) — CPU fallback");
+                    None
+                }
+            };
+            match vcn_patches {
+                Some(vp) => {
+                    let out = qwen35_vl::vision_forward_patches(
+                        gpu,
+                        vision_weights,
+                        &vision_config,
+                        &vp.patches,
+                        vp.grid_h,
+                        vp.grid_w,
+                    );
+                    if let Err(e) = gpu.free_tensor(vp.patches) {
+                        vl_forward_fail(
+                            stdout,
+                            id,
+                            "vision_forward_vcn_free",
+                            e,
+                            gpu,
+                            dn,
+                            kv,
+                            &mut m.kv_adaptive,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                        );
+                        return;
+                    }
+                    match out {
+                        Ok(v) => v,
+                        Err(e) => {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "vision_forward_vcn",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    let (pixels, fb_h, fb_w) = match image::load_and_preprocess_from_bytes(
+                        &bytes,
+                        vision_config.patch_size,
+                        vision_config.spatial_merge_size,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            write_error(stdout, id, &e);
+                            return;
+                        }
+                    };
+                    // The VCN dims above came from the same JPEG SOF geometry
+                    // through the same `smart_resize`, so these must agree.
+                    // Fail the request rather than feed `extract_patches`
+                    // mismatched geometry (silent corruption).
+                    if (fb_h, fb_w) != (img_h, img_w) {
+                        write_error(
+                            stdout,
+                            id,
+                            &format!(
+                                "VCN/CPU resize mismatch (vcn {img_h}x{img_w} vs cpu {fb_h}x{fb_w}) — refusing to encode mismatched geometry"
+                            ),
+                        );
+                        return;
+                    }
+                    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+                        &pixels,
+                        3,
+                        img_h,
+                        img_w,
+                        vision_config.patch_size,
+                        vision_config.temporal_patch_size,
+                        vision_config.spatial_merge_size,
+                    );
+                    match qwen35_vl::vision_forward(
+                        gpu,
+                        vision_weights,
+                        &vision_config,
+                        &patches,
+                        grid_h,
+                        grid_w,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "vision_forward",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+                &pixels,
+                3,
+                img_h,
+                img_w,
+                vision_config.patch_size,
+                vision_config.temporal_patch_size,
+                vision_config.spatial_merge_size,
             );
-            return;
+            match qwen35_vl::vision_forward(
+                gpu,
+                vision_weights,
+                &vision_config,
+                &patches,
+                grid_h,
+                grid_w,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    vl_forward_fail(
+                        stdout,
+                        id,
+                        "vision_forward",
+                        e,
+                        gpu,
+                        dn,
+                        kv,
+                        &mut m.kv_adaptive,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "vcn-jpeg"))]
+    let visual_tokens = {
+        // `image.decode = vcn|auto` requests the VCN path, but this binary
+        // was built without the `vcn-jpeg` cargo feature (the standard
+        // daemon build carries it; custom builds may not). CPU decode is
+        // correct — warn once so the operator intent never silently no-ops.
+        static VCN_FEATURE_WARNED: std::sync::Once = std::sync::Once::new();
+        if hipfire_arch_qwen35_vl::image::resolve_image_decode()
+            != hipfire_arch_qwen35_vl::image::ImageDecode::Cpu
+        {
+            VCN_FEATURE_WARNED.call_once(|| {
+                eprintln!(
+                    "[daemon/vl] image.decode requests VCN but this binary lacks the `vcn-jpeg` feature — CPU fallback"
+                );
+            });
+        }
+        let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+            &pixels,
+            3,
+            img_h,
+            img_w,
+            vision_config.patch_size,
+            vision_config.temporal_patch_size,
+            vision_config.spatial_merge_size,
+        );
+        match qwen35_vl::vision_forward(
+            gpu,
+            vision_weights,
+            &vision_config,
+            &patches,
+            grid_h,
+            grid_w,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "vision_forward",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
         }
     };
 
