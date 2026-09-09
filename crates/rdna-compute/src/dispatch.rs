@@ -3065,6 +3065,17 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
+        // (gfx1100) maps a second, later segment onto the SAME physical pages as
+        // the first (vmm_arena_smoke boundary-growth assert fails; every
+        // subsequent KV growth corrupts all prior KV -> token soup). Single
+        // segment maps are proven correct. So on Windows, map the FULL
+        // reservation in one map_next up front instead of growing in small
+        // segments; grow_vmm_tensor then becomes a no-op (already fully
+        // mapped). Costs up-front VRAM for the whole reservation; correctness
+        // over on-demand commit on the platform whose driver breaks growth.
+        #[cfg(windows)]
+        let initial_mapped_bytes = byte_size;
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
