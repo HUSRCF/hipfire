@@ -4050,10 +4050,22 @@ mod construction_tests {
         // the constructor ledgers. Real allocation and real free — only the
         // copy is injected — with no test-only production API. Soft-skip
         // without a GPU, like the dispatch rollback tests.
+        //
+        // The baseline is recorded after a successful warmup pass, not on an
+        // empty pool: `total_new` is cumulative, so the two first-touch
+        // mallocs belong outside the measured window, and the retry holds
+        // two live buffers at once — the pool must already hold both slots
+        // for the fail+retry cycle to stay flat. A leaked owner still fails
+        // this: the failure consumes a pooled slot without returning it, so
+        // the retry finds the list short and mallocs anew.
         let Some(mut gpu) = Gpu::init().ok() else {
             eprintln!("skip: no GPU");
             return;
         };
+        let warm_raw = upload_raw_weight(&mut gpu, &[9u8; 64], &[64]).expect("warm raw");
+        let warm_staged = upload_f32_weight(&mut gpu, &[1.5f32; 16], &[16]).expect("warm F32");
+        gpu.free_tensor(warm_raw).expect("free warm raw");
+        gpu.free_tensor(warm_staged).expect("free warm F32");
         let fresh_allocations = gpu.pool_stats().0;
 
         let err = match upload_raw_weight_with_copy(&mut gpu, &[9u8; 64], &[64], failing_copy) {
