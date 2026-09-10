@@ -394,6 +394,9 @@ impl GemmFamily {
             K::GemmQ8_0BatchedChunked => {
                 hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
             }
+            K::GemmQ8_0BatchedF32Chunked => {
+                hip!(gpu.gemm_q8_0_batched_f32_chunked(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmTQ2G128Prefill => {
                 hip!(gpu.gemm_tq2g128_prefill(w.buf, x, y, m, k, batch_size))

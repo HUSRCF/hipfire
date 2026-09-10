@@ -7,8 +7,8 @@
 //! Runs the SAME prompt through (A) per-token `forward_scratch` and
 //! (B) `forward_prefill_batch` with fresh KV each, compares prefill logits
 //! (max-abs diff, argmax) and an N-token greedy continuation (per-token decode
-//! from both prefill states). Bypasses the daemon arch gate so it can probe
-//! batched prefill on gfx12 where the daemon refuses.
+//! from both prefill states). Uses Q8 KV for both attention tiers, matching
+//! the daemon's explicit `--kv-mode q8` route.
 //!
 //! Usage:
 //!   prefill_parity_gemma4 --model <hfq> [--prompt <text>] [--decode N]
@@ -112,7 +112,7 @@ fn main() {
             cfg.sliding_window,
         )
         .expect("kv sliding");
-        let mut kv_full = KvCache::new_gpu_asym3(
+        let mut kv_full = KvCache::new_gpu_q8(
             &mut gpu,
             cfg.n_layers,
             cfg.full_n_kv_heads,
@@ -165,6 +165,7 @@ fn main() {
             t0.elapsed().as_secs_f64()
         );
         let logits = gpu.download_f32(&scratch.logits).expect("logits dl");
+        assert!(logits.iter().all(|v| v.is_finite()), "non-finite {label} logits");
         let (am, av) = argmax(&logits);
         let lh = fnv(unsafe {
             std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
@@ -196,8 +197,8 @@ fn main() {
         }
         eprintln!("[{label}] cont ids:  {:?}", cont);
         eprintln!("[{label}] cont text: {:?}", tok.decode(&cont));
-        kv_sliding.free_gpu(&mut gpu);
-        kv_full.free_gpu(&mut gpu);
+        kv_sliding.free_gpu(&mut gpu).expect("free sliding KV");
+        kv_full.free_gpu(&mut gpu).expect("free full KV");
         (logits, cont)
     };
 

@@ -4,6 +4,7 @@
 
 - Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
 - DFlash weight and scratch constructors now roll back late failures for immediate retry, including pool-aware F32 leaf uploads and AWQ sidecar attachment.
+- Gemma 4 26B-A4B lowered route: admission serves MoE/batched lowered loads end to end (`generate_gemma4_lowered`) instead of refusing them; scratch and both KV caches derive from the single `max_seq` authority. Batched prefill shares the single-token indexed MoE semantics (`moe_token_indexed`) and routes Q8 projections through an explicit F32 batched path. Fixture: `gemma-4-26b-a4b-it.hfq4g128-maintainer.hf4` (15,343,188,028 bytes, sha256 `11cf46cba97f5e279d351f9d31cf4bdd78cb1fbc7c16da2433e6141ae7e07d53`); serve battery/chain and decode HIP/PM4 parity measured on gfx1100/gfx1201. Kernel prerequisite (historical, PR #734, landed as dea1dc3bf): compile-time K=2816 eleven-group specialization for the indexed HFQ4/MQ4 MoE gate-up kernels, preserving the K=2048 A3B route.
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 

@@ -22284,6 +22284,11 @@ impl Gpu {
     /// the WMMA Q8 GEMM (`gemm_q8_0_wmma`, or its gfx12 sibling) which is
     /// much faster than the scalar `gemm_q8_0_batched` per output. Opt out
     /// via HIPFIRE_Q8_BATCHED_LEGACY=1.
+    ///
+    /// Callers that need explicit F32 input/dequant precision (no F16 rounding
+    /// of activations or dequant weights) should use
+    /// [`Self::gemm_q8_0_batched_f32_chunked`] instead of relying on the
+    /// automatic WMMA selector here.
     pub fn gemm_q8_0_batched_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -22309,6 +22314,26 @@ impl Gpu {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
 
+        self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)
+    }
+
+    /// Explicit F32-precision Q8_0 batched GEMM: sub-batches at MAX_BATCH=64 and
+    /// always runs the scalar `gemm_q8_0_batched` path (F32 activations and F32
+    /// dequant of Q8 weights). Separate from [`Self::gemm_q8_0_batched_chunked`],
+    /// whose automatic WMMA selector rounds both F32 inputs and dequant weights
+    /// to F16 on gfx12 — that loss breaks Gemma prefill/decode continuation.
+    /// Keeps the same portable Always contract as the generic F32 kernels; no
+    /// arch gate. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
+    pub fn gemm_q8_0_batched_f32_chunked(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
         const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
