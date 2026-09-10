@@ -7750,6 +7750,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
@@ -7792,6 +7793,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["draft"], draft_path.display().to_string());
@@ -7817,6 +7819,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .expect_err("on without a pulled draft must fail closed");
         let message = format!("{error:#}");
@@ -7844,6 +7847,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
@@ -7876,6 +7880,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["draft"], explicit);
@@ -7904,6 +7909,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "off");
@@ -7924,6 +7930,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["draft"], draft_path.display().to_string());
@@ -7957,6 +7964,7 @@ mod tests {
             None,
             Some("qwen3.5:9b"),
             true,
+            None,
         )
         .unwrap();
         assert!(params.get("draft").is_none());
@@ -7985,6 +7993,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["vision"], vision_path.display().to_string());
@@ -8011,6 +8020,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .unwrap();
         assert!(params.get("vision").is_none());
@@ -8039,6 +8049,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["vision"], vision_path.display().to_string());
@@ -8118,6 +8129,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["vision_mode"], "off");
@@ -8166,6 +8178,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["vision_mode"], "on");
@@ -8193,6 +8206,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .expect_err("on without a pulled tower must fail closed");
         let message = format!("{error:#}");
@@ -8220,6 +8234,7 @@ mod tests {
             None,
             Some("qwen3.8:27b"),
             false,
+            None,
         )
         .unwrap();
         assert!(params.get("vision").is_none());
@@ -8618,6 +8633,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect_err("on without registry identity must fail closed");
         let message = format!("{error:#}");
@@ -8637,6 +8653,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
@@ -11786,7 +11803,7 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
         let direct_path = PathBuf::from("/tmp/direct-model.mq4");
-        let params = load_params(&defaults, None, &direct_path, 64, None, None, None).unwrap();
+        let params = load_params(&defaults, None, &direct_path.parent().unwrap(), &direct_path, 64, None, None, None, false, None).unwrap();
         assert_eq!(
             params["kv_mode"], "auto",
             "direct-path auto must survive to architecture"
@@ -11804,7 +11821,7 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("maple-preview").unwrap();
         let params2 =
-            load_params(&defaults, Some(entry), &direct_path, 64, None, None, None).unwrap();
+            load_params(&defaults, Some(entry), &direct_path.parent().unwrap(), &direct_path, 64, None, None, None, false, None).unwrap();
         assert_eq!(
             params2["kv_mode"], "auto",
             "registry auto must survive even when entry has bf16 default"
@@ -11813,10 +11830,13 @@ mod tests {
         let params3 = load_params(
             &defaults,
             Some(entry),
+            &direct_path.parent().unwrap(),
             &direct_path,
             64,
             Some("q8"),
             None,
+            None,
+            false,
             None,
         )
         .unwrap();
