@@ -2713,7 +2713,10 @@ mod overlay_tests {
             .unwrap()
             .set_len(len - 10)
             .unwrap();
-        let err = HfqFile::open_at_offset(&head, 0).unwrap_err();
+        let err = match HfqFile::open_at_offset(&head, 0) {
+            Ok(_) => panic!("truncated open must refuse"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("truncated"), "got: {err}");
     }
 
