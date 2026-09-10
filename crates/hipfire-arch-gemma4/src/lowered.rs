@@ -5361,7 +5361,8 @@ fn forward_prefill_batch_v2(
 //
 // Migrates Gemma 4's decode forward from per-token execute_steps resolution
 // to pre-resolved LayerPrograms executed via run_layer_program + ForwardBindings.
-// Behind HIPFIRE_FORWARD_LOWERED gate (default OFF) until byte-parity validated.
+// Behind HIPFIRE_FORWARD_LOWERED gate (default ON since byte-parity validated
+// 2026-06-08; set HIPFIRE_FORWARD_LOWERED=0 to force the legacy hand path).
 // See docs/plans/gemma4_forward_as_pipeline.md for the full plan.
 
 use hipfire_dispatch::pipeline::superop::{
