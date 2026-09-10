@@ -19,8 +19,8 @@ use hipfire_engine::terminal::{
     batch_clear_all_terminals, batch_clear_terminal, batch_commit_teardown_class,
     batch_hit_length_cap, batch_lane_at_capacity, batch_mark_ready, batch_mark_ready_with_pending,
     batch_poll_decision, batch_should_finish_decode, batch_terminal_control,
-    batch_transfer_abort_to_singleton_and_clear, AttemptKey, BatchCommitTeardownClass,
-    ClientTerminalDecision, LaneTicket,
+    batch_transfer_abort_to_singleton_and_clear, emit_staged_terminal_done, AttemptKey,
+    BatchAttemptScope, BatchCommitTeardownClass, ClientTerminalDecision, LaneTicket,
 };
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -268,6 +268,51 @@ fn early_commit_before_ready_rejected_and_poll_is_nonmutating() {
     );
     assert!(sched.commit_lane(ticket.lane, &k));
     assert!(sched.lanes[ticket.lane].is_empty());
+    assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+}
+
+#[test]
+fn retained_commit_keeps_registry_until_single_done_claim() {
+    let _l = begin();
+    let k = AttemptKey::new("retained-done", 101);
+    batch_announce_terminal(&k.id, k.attempt_id);
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
+    let (_key, ticket) = sched.try_assign_one().unwrap();
+    let pending = serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":3});
+    assert!(sched.mark_awaiting_commit(ticket.lane, pending.clone()));
+    batch_apply_terminal_control("commit", &k.id, k.attempt_id);
+
+    assert!(sched.commit_lane_retain_terminal(ticket.lane, &k));
+    assert!(sched.lanes[ticket.lane].is_empty());
+    assert_eq!(
+        batch_poll_decision(&k.id, k.attempt_id),
+        Some(ClientTerminalDecision::Commit)
+    );
+
+    let mut sink = Vec::new();
+    {
+        let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
+        emit_staged_terminal_done(&mut sink, &pending);
+        emit_staged_terminal_done(&mut sink, &pending);
+    }
+    let events = String::from_utf8(sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "done");
+    assert!(batch_terminal_control()
+        .mu
+        .lock()
+        .unwrap()
+        .entries
+        .get(&k)
+        .is_some_and(|entry| entry.terminal_claimed));
+
+    batch_clear_terminal(&k.id, k.attempt_id);
+    assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
 }
 
 #[test]

@@ -316,6 +316,24 @@ impl ContinuousBatchScheduler {
     }
 
     pub fn commit_lane(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+        self.commit_lane_inner(lane, expected, true)
+    }
+
+    /// Commit a ready lane while retaining its keyed terminal registry entry.
+    ///
+    /// Continuous-batch callers use this when a staged `done` still needs to
+    /// claim the request-owned terminal slot. They must clear the entry after
+    /// the terminal writer has claimed and emitted the envelope.
+    pub fn commit_lane_retain_terminal(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+        self.commit_lane_inner(lane, expected, false)
+    }
+
+    fn commit_lane_inner(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        clear_terminal: bool,
+    ) -> bool {
         if lane >= self.lanes.len() {
             return false;
         }
@@ -349,7 +367,9 @@ impl ContinuousBatchScheduler {
         };
         self.pending.remove(expected);
         self.pending_sampling.remove(expected);
-        batch_clear_terminal(&expected.id, expected.attempt_id);
+        if clear_terminal {
+            batch_clear_terminal(&expected.id, expected.attempt_id);
+        }
         self.maybe_clear_cohort();
         true
     }

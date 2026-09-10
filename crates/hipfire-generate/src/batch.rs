@@ -42,6 +42,26 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
+struct BatchTerminalCleanup {
+    id: String,
+    attempt_id: u64,
+}
+
+impl BatchTerminalCleanup {
+    fn new(key: &AttemptKey) -> Self {
+        Self {
+            id: key.id.clone(),
+            attempt_id: key.attempt_id,
+        }
+    }
+}
+
+impl Drop for BatchTerminalCleanup {
+    fn drop(&mut self) {
+        batch_clear_terminal(&self.id, self.attempt_id);
+    }
+}
+
 /// Cancellable LFM prefill helper. Attempts to use the arch's
 /// `prefill_lane_cancellable` when present; otherwise falls back to the
 /// standard `prefill_lane` with post-prefill abort handling. The closure is
@@ -386,7 +406,10 @@ pub fn drive_qwen_continuous_batch(
                     );
                 }
             };
-            let commit_ok = sched.commit_lane(idx, &key);
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
+            // Keep the keyed registry alive through the terminal writer. This
+            // also clears it on error/early return after the host transition.
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -1320,7 +1343,8 @@ pub fn drive_lfm_continuous_batch(
                     );
                 }
             };
-            let commit_ok = sched.commit_lane(idx, &key);
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -2712,7 +2736,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
-            let commit_ok = sched.commit_lane(idx, &key);
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!(),
                 BatchCommitTeardownClass::CommitFailed => {
