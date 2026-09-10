@@ -65,6 +65,28 @@ impl Drop for BatchTerminalCleanup {
         }
     }
 }
+/// Emit one correlated terminal error for a request that was already
+/// announced on the batch plane, then retire only that admission generation.
+fn emit_batch_admission_error(
+    stdout: &mut impl Write,
+    id: &str,
+    attempt_id: u64,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    let generation = {
+        let scope = BatchAttemptScope::enter_for(id, attempt_id);
+        let generation = scope.admission_generation();
+        emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
+        let _ = stdout.flush();
+        generation
+    };
+    if let Some(generation) = generation {
+        batch_clear_terminal_at_generation(id, attempt_id, generation);
+    }
+}
 
 /// Cancellable LFM prefill helper. Attempts to use the arch's
 /// `prefill_lane_cancellable` when present; otherwise falls back to the
@@ -591,16 +613,15 @@ pub fn drive_qwen_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                    emit_uncorrelated_error(
+                                    emit_batch_admission_error(
                                         stdout,
-                                        Some(&id),
+                                        &id,
+                                        attempt_id,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
                                         false,
                                     );
-                                    batch_clear_terminal(&id, attempt_id);
                                     continue;
                                 }
                             },
@@ -627,16 +648,15 @@ pub fn drive_qwen_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -649,16 +669,15 @@ pub fn drive_qwen_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                            emit_uncorrelated_error(
+                            emit_batch_admission_error(
                                 stdout,
-                                Some(&id),
+                                &id,
+                                attempt_id,
                                 "prompt exceeds lane capacity or empty",
                                 "validation",
                                 false,
                                 false,
                             );
-                            batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
                         // Explicit wire `seed` must reach the lane RNG on the
@@ -667,15 +686,15 @@ pub fn drive_qwen_continuous_batch(
                         let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
                             Ok(s) => s,
                             Err(reason) => {
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &reason,
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -1560,16 +1579,15 @@ pub fn drive_lfm_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                    emit_uncorrelated_error(
+                                    emit_batch_admission_error(
                                         stdout,
-                                        Some(&id),
+                                        &id,
+                                        attempt_id,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
                                         false,
                                     );
-                                    batch_clear_terminal(&id, attempt_id);
                                     continue;
                                 }
                             },
@@ -1588,16 +1606,15 @@ pub fn drive_lfm_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -1607,16 +1624,15 @@ pub fn drive_lfm_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                            emit_uncorrelated_error(
+                            emit_batch_admission_error(
                                 stdout,
-                                Some(&id),
+                                &id,
+                                attempt_id,
                                 "empty prompt after tokenize",
                                 "validation",
                                 false,
                                 false,
                             );
-                            batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
                         if batch_lfm_exceeds_capacity(
@@ -1624,10 +1640,10 @@ pub fn drive_lfm_continuous_batch(
                             max_tokens_req,
                             sched.lane_capacity,
                         ) {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                            emit_uncorrelated_error(
+                            emit_batch_admission_error(
                                 stdout,
-                                Some(&id),
+                                &id,
+                                attempt_id,
                                 &format!(
                                     "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
                                     prompt_tokens.len(),
@@ -1638,7 +1654,6 @@ pub fn drive_lfm_continuous_batch(
                                 false,
                                 false,
                             );
-                            batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
                         // Explicit wire `seed` must reach the lane RNG on the
@@ -1647,15 +1662,15 @@ pub fn drive_lfm_continuous_batch(
                         let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
                             Ok(s) => s,
                             Err(reason) => {
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &reason,
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -2940,16 +2955,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                    emit_uncorrelated_error(
+                                    emit_batch_admission_error(
                                         stdout,
-                                        Some(&id),
+                                        &id,
+                                        attempt_id,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
                                         false,
                                     );
-                                    batch_clear_terminal(&id, attempt_id);
                                     continue;
                                 }
                             },
@@ -2976,16 +2990,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -2995,16 +3008,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
-                            emit_uncorrelated_error(
+                            emit_batch_admission_error(
                                 stdout,
-                                Some(&id),
+                                &id,
+                                attempt_id,
                                 "prompt exceeds lane capacity or empty",
                                 "validation",
                                 false,
                                 false,
                             );
-                            batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
                         // Explicit wire `seed` must reach the lane RNG on the
@@ -3013,15 +3025,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                         let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
                             Ok(s) => s,
                             Err(reason) => {
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     stdout,
-                                    Some(&id),
+                                    &id,
+                                    attempt_id,
                                     &reason,
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(&id, attempt_id);
                                 continue;
                             }
                         };
@@ -3547,4 +3559,75 @@ pub fn emit_uncorrelated_error(
     rolled_back: bool,
 ) {
     crate::dense::write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    fn lock() -> MutexGuard<'static, ()> {
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn direct_driver_admission_errors_are_correlated_once_and_cleared() {
+        let _guard = lock();
+        for (driver, id, attempt_id, message, class) in [
+            (
+                "qwen",
+                "qwen-direct",
+                101_u64,
+                "invalid messages field",
+                "validation",
+            ),
+            (
+                "lfm",
+                "lfm-direct",
+                202_u64,
+                "prompt exceeds context capacity",
+                "context_length",
+            ),
+            (
+                "qwen35-ep",
+                "qwen35-ep-direct",
+                303_u64,
+                "seed must fit in a u32",
+                "validation",
+            ),
+        ] {
+            assert!(batch_announce_terminal(id, attempt_id), "{driver} announce");
+
+            let mut output = Vec::new();
+            emit_batch_admission_error(&mut output, id, attempt_id, message, class, false, false);
+
+            let lines: Vec<&str> = std::str::from_utf8(&output)
+                .expect("UTF-8 error envelope")
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect();
+            assert_eq!(lines.len(), 1, "{driver} terminal count");
+            let event: serde_json::Value =
+                serde_json::from_str(lines[0]).expect("JSON error envelope");
+            assert_eq!(event["type"], "error", "{driver} event type");
+            assert_eq!(
+                event["attempt_id"].as_u64(),
+                Some(attempt_id),
+                "{driver} attempt id"
+            );
+            assert_ne!(
+                event["attempt_id"].as_u64(),
+                Some(0),
+                "{driver} attempt zero"
+            );
+            assert_eq!(event["id"].as_str(), Some(id), "{driver} request id");
+            assert_eq!(event["class"].as_str(), Some(class), "{driver} error class");
+            assert_eq!(
+                batch_terminal_generation(id, attempt_id),
+                None,
+                "{driver} admission cleanup"
+            );
+        }
+    }
 }
