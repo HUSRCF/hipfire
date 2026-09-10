@@ -39,29 +39,6 @@ fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result
     Ok(())
 }
 
-/// Generate-time refusal for the lowered/MoE path, shared with the load-time
-/// admission below so both name the same combination and remedy. The generate
-/// body is eager-dense-only; a lowered load must never reach it.
-pub const LOWERED_GENERATE_REFUSAL: &str = "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant";
-
-/// Admission decision for the lowered path, before any device allocation.
-/// Pure so the contract is unit-testable. Returns the refusal reason when the
-/// (model, option) combination would select `lowered` via [`gemma4_use_lowered`],
-/// which generate cannot serve — fail here instead of after a full weight/KV
-/// upload. `None` means the eager dense path serves the combination.
-pub fn gemma4_lowered_refusal(
-    enable_moe_block: bool,
-    want_batched: bool,
-    has_drafter: bool,
-    is_e_series: bool,
-) -> Option<&'static str> {
-    if gemma4_use_lowered(enable_moe_block, want_batched, has_drafter, is_e_series) {
-        Some(LOWERED_GENERATE_REFUSAL)
-    } else {
-        None
-    }
-}
-
 // ─── Bundle types ─────────────────────────────────────────────────────────
 
 pub struct Gemma4EagerBundle {
@@ -142,29 +119,16 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     } else {
         false
     };
-    // Admission: the lowered/MoE path has no generate arm (the generate body is
-    // eager-dense-only and refuses post-load). Fail here — after the host-side
-    // config/env parse but before `lowered::load_weights` (first device
-    // allocation) — instead of after a full weight/scratch/KV upload.
-    // The `if use_lowered` block below is retained for the future lowered serve
-    // path; it is unreachable while this refusal stands.
-    if let Some(lcfg) = &lowered_cfg {
-        if let Some(reason) = gemma4_lowered_refusal(
-            lcfg.enable_moe_block,
-            want_batched,
-            ctx.gemma4_drafter_path.is_some(),
-            is_e_series,
-        ) {
-            return Err(reason.to_string());
-        }
-    }
+    // The lowered/MoE path is served: `generate_gemma4_lowered` in
+    // hipfire-generate handles `Gemma4Lowered` models end to end, so a
+    // `use_lowered` selection proceeds directly to weight/scratch/KV upload.
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
         let (n_sliding_layers, n_full_layers) = lowered_kv_layer_counts(&lcfg.layer_types);
         let mut hfq2 = hfq;
         let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
+        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, ctx.max_seq)
             .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
         lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim)
             .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
@@ -241,21 +205,45 @@ mod tests {
     }
 
     #[test]
-    fn lowered_admission_refuses_what_generate_cannot_serve() {
-        // MoE variant: refused with the combination and remedy named.
-        let err = gemma4_lowered_refusal(true, false, false, false)
-            .expect("MoE lowered must be refused at admission");
-        assert!(err.contains("lowered/MoE"), "reason names the state: {err}");
-        assert!(err.contains("eager dense only"), "reason: {err}");
-        // Dense with batched/WMMA prefill opt-in and no drafter: refused.
-        assert!(gemma4_lowered_refusal(false, true, false, false).is_some());
-        // Adjacent supported: eager dense (no opt-in), drafter-kept-eager,
-        // and E-series all admit.
-        assert_eq!(gemma4_lowered_refusal(false, false, false, false), None);
-        assert_eq!(gemma4_lowered_refusal(false, true, true, false), None);
-        assert_eq!(gemma4_lowered_refusal(false, true, false, true), None);
-        // MoE always selects lowered even with a drafter requested, so it is
-        // refused too (the drafter route only keeps *dense* eager).
-        assert!(gemma4_lowered_refusal(true, false, true, false).is_some());
+    fn scratch_geometry_uses_single_max_seq_authority() {
+        // No HIPFIRE_KV_SEQ env var should affect geometry; both partials
+        // and KV are sized from the same ctx.max_seq. Verify the pure helpers
+        // that the loader now uses.
+        let max_seq_small = 32768usize;
+        let max_seq_large = 131072usize;
+        let n_heads = 32usize;
+        let full_hd = 512usize;
+        let s_small = lowered::gemma4_flash_partials_len(max_seq_small, n_heads, full_hd);
+        let s_large = lowered::gemma4_flash_partials_len(max_seq_large, n_heads, full_hd);
+        assert_eq!(s_small, 4_210_688);
+        assert_eq!(s_large, 16_842_752);
+        assert_eq!(s_large, 4 * s_small);
+        let pb_small = lowered::gemma4_pb_flash_partials_len(max_seq_small, n_heads, full_hd);
+        let pb_large = lowered::gemma4_pb_flash_partials_len(max_seq_large, n_heads, full_hd);
+        assert_eq!(pb_small, 128 * s_small);
+        assert_eq!(pb_large, 128 * s_large);
+        assert_eq!(pb_large, 2_155_872_256);
+    }
+
+    #[test]
+    fn scratch_geometry_has_no_env_mismatch() {
+        // Simulate that an old env var could earlier cause mismatch between
+        // KV (ctx.max_seq) and scratch (HIPFIRE_KV_SEQ). After the fix both
+        // derive from the same max_seq, so the arithmetic must be identical
+        // for any max_seq value, including 131072 without GPU alloc.
+        for &max_seq in &[8192usize, 32768, 65536, 131072] {
+            let n_heads = 32;
+            let hd = 512;
+            let tiles = max_seq.div_ceil(lowered::GEMMA4_FLASH_TILE);
+            let expected = n_heads * tiles * (2 + hd);
+            assert_eq!(
+                lowered::gemma4_flash_partials_len(max_seq, n_heads, hd),
+                expected
+            );
+            assert_eq!(
+                lowered::gemma4_pb_flash_partials_len(max_seq, n_heads, hd),
+                lowered::GEMMA4_MAX_PREFILL_BATCH * expected
+            );
+        }
     }
 }

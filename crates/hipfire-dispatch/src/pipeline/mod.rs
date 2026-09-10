@@ -459,7 +459,7 @@ pub fn run_uniform_moe_gate_up(
         result.map_err(|error| DispatchError::Hip(error.to_string()))
     };
     match dtype {
-        DType::MQ4G256 => hip(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+        DType::MQ4G256 | DType::HFQ4G256 => hip(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
             expert_ptrs,
             topk_indices,
             x_rot,
@@ -469,7 +469,7 @@ pub fn run_uniform_moe_gate_up(
             k,
             k_top,
         )),
-        DType::MQ6G256 => hip(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+        DType::MQ6G256 | DType::HFQ6G256 => hip(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             expert_ptrs,
             topk_indices,
             x_rot,
@@ -1796,7 +1796,6 @@ fn run_moe_decode_cpu_fallback(
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
-
     // EP (Ship 6 substrate-EP) is not wired through the generic CPU-top-K
     // fallback yet — it still accumulates into x_residual directly. The
     // fast-path (use_gpu_topk) covers all current EP-target MoE models

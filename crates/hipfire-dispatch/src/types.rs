@@ -332,6 +332,7 @@ pub enum KernelKey {
     GemmMq3G256V2BatchedLmhead,
     GemmMq2G256V2BatchedLmhead,
     GemmQ8_0BatchedChunked,
+    GemmQ8_0BatchedF32Chunked,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
     GemmHfq4G256Wmma,
