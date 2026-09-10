@@ -60,8 +60,11 @@ pub struct ThinkOutputRouter {
     in_think: bool,
     pending: String,
     strip_answer_newlines: bool,
+    /// Initial prompt state retained so `reset` can reuse this router for a
+    /// fresh turn without losing assistant-prefix think semantics.
+    started_in_think: bool,
     /// Once terminal output is finalized, no later bytes may cross the
-    /// client-visible boundary until a fresh router is constructed.
+    /// client-visible boundary until `reset` or a fresh router starts a turn.
     finished: bool,
 }
 
@@ -74,8 +77,18 @@ impl ThinkOutputRouter {
             in_think: started_in_think,
             pending: String::new(),
             strip_answer_newlines: false,
+            started_in_think,
             finished: false,
         }
+    }
+
+    /// Reuse this router for a fresh turn, restoring the prompt-derived
+    /// initial channel and clearing all buffered/terminal state.
+    pub fn reset(&mut self) {
+        self.in_think = self.started_in_think;
+        self.pending.clear();
+        self.strip_answer_newlines = false;
+        self.finished = false;
     }
 
     /// Whether the generated stream currently has an unclosed think span.
@@ -1195,6 +1208,36 @@ mod tests {
         router.push_into("nk>late", &mut events);
         assert_eq!(events.len(), first_len);
         assert!(router.in_think());
+    }
+
+    #[test]
+    fn think_router_reset_reuses_finished_router_with_initial_think_state() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+
+        router.push_into("first", &mut events);
+        router.finish_into(&mut events);
+        router.push_into("late", &mut events);
+        assert_eq!(
+            events,
+            vec![ThinkRouteEvent::Reasoning("first".into())],
+            "finished routers must reject late bytes before reset"
+        );
+
+        router.reset();
+        assert!(
+            router.in_think(),
+            "reset must restore started-in-think state"
+        );
+        router.push_into("second", &mut events);
+        router.finish_into(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                ThinkRouteEvent::Reasoning("first".into()),
+                ThinkRouteEvent::Reasoning("second".into()),
+            ]
+        );
     }
 
     #[test]
