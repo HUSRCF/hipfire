@@ -41,14 +41,18 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// to the scalar GEMV path. Set HIPFIRE_WMMA_PREFILL=1 to opt in.
 pub fn wmma_prefill_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_WMMA_PREFILL").map_or(false, |v| v == "1"))
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_WMMA_PREFILL").map_or(false, |v| v == "1")
+    })
 }
 
 /// Env gate for batched prefill (v2). Independent from WMMA.
 /// Set HIPFIRE_BATCHED_PREFILL=1 to use batched projections + per-token attention.
 pub fn batched_prefill_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_BATCHED_PREFILL").map_or(false, |v| v == "1"))
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_BATCHED_PREFILL").map_or(false, |v| v == "1")
+    })
 }
 
 /// Batched GEMM for prefill projections.
@@ -283,7 +287,11 @@ fn run_prefill_gemm_inner(
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     // Debug parity hook: re-run token 0 through the per-token GEMV path
     // (raw input; weight_gemv rotates internally) and diff against the GEMM.
-    if hipfire_config::developer_var("HIPFIRE_GEMMA4_GEMM_VERIFY").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_GEMM_VERIFY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
         let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
         gpu.hip
@@ -312,7 +320,11 @@ fn run_prefill_gemm_inner(
 /// Set HIPFIRE_GEMMA4_DUMP=1 to enable. Prints first 4 floats + sum + nan/inf count.
 #[allow(dead_code)]
 fn dbg_dump(gpu: &mut Gpu, label: &str, t: &GpuTensor, take: usize) {
-    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() != Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return;
     }
     let data = match gpu.download_f32(t) {
@@ -811,7 +823,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> HipResult<Vec<f
             &format!("shape mismatch for {name}: expected {expected_n}, got {n}"),
         ));
     }
-    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1")
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
         && data.len() <= 4
         && name.contains("layer_scalar")
     {
@@ -2622,12 +2637,16 @@ pub fn forward_scratch(
     //   - Compact offset != 0 (TriAttention eviction) still breaks capture
     //     for the same reason as Qwen35 — bail to direct in that case.
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let graph_override =
-        *GRAPH_OVERRIDE_ENV.get_or_init(|| match hipfire_config::developer_var("HIPFIRE_GRAPH").ok().as_deref() {
+    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_GRAPH")
+            .ok()
+            .as_deref()
+        {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
-        });
+        }
+    });
     let use_graph = graph_override.unwrap_or(false)
         && kv_sliding.compact_offset == 0
         && kv_full.compact_offset == 0;
@@ -2721,7 +2740,12 @@ fn forward_scratch_inner(
     let mut full_kv_idx = 0usize;
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
         // Diagnostic: dump residual before layer
-        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && layer_idx < 2 {
+        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && layer_idx < 2
+        {
             let data = gpu.download_f32(&scratch.x).unwrap_or_default();
             let sum: f64 = data.iter().map(|&v| v as f64).sum();
             let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
@@ -2746,7 +2770,11 @@ fn forward_scratch_inner(
             }
         }
         // Diagnostic: dump residual after layer
-        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             let data = gpu.download_f32(&scratch.x).unwrap_or_default();
             let sum: f64 = data.iter().map(|&v| v as f64).sum();
             let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
@@ -2765,7 +2793,11 @@ fn forward_scratch_inner(
     )?;
 
     // Diagnostic: dump hidden state before lm_head
-    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let data = gpu.download_f32(&scratch.tmp).unwrap_or_default();
         let sum: f64 = data.iter().map(|&v| v as f64).sum();
         let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
@@ -2798,7 +2830,11 @@ fn forward_scratch_inner(
     }
 
     // Diagnostic: dump logits
-    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let data = gpu.download_f32(&scratch.logits).unwrap_or_default();
         let top5: Vec<(usize, f32)> = {
             let mut indexed: Vec<(usize, f32)> =
@@ -2900,7 +2936,10 @@ fn sliding_layer_decode_impl(
         gpu.hip
             .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
     }
-    let _dump_on = hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1")
+    let _dump_on = hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
         && (pos == 0 || pos == 1)
         && kv_layer_idx == 0;
     if _dump_on {
@@ -3236,7 +3275,10 @@ fn sliding_layer_decode_impl(
     // apply_moe_branch (which adds the parallel MoE branch + sandwich norms
     // 1 and 2 before this outer norm); on dense layers we just call the
     // standalone post_feedforward_layernorm.
-    let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
+    let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS")
+        .ok()
+        .as_deref()
+        == Some("1");
     match (lw.moe.as_ref(), moe_bypass) {
         (Some(moe), false) => apply_moe_branch(
             gpu,
@@ -3350,7 +3392,10 @@ fn full_layer_decode_impl(
         config.norm_eps,
     )?;
 
-    let _fdump = hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1")
+    let _fdump = hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+        .ok()
+        .as_deref()
+        == Some("1")
         && pos == 1
         && kv_layer_idx == 0;
     if _fdump {
@@ -3556,7 +3601,10 @@ fn full_layer_decode_impl(
     }
 
     // Sandwich post-FFN norm. Same MoE dispatch as sliding_layer_decode.
-    let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
+    let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS")
+        .ok()
+        .as_deref()
+        == Some("1");
     match (lw.moe.as_ref(), moe_bypass) {
         (Some(moe), false) => apply_moe_branch(
             gpu,
@@ -4622,7 +4670,11 @@ fn forward_prefill_batch_v2(
                 let ctx = DispatchCtx::new(gpu);
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-                if hipfire_config::developer_var("HIPFIRE_GEMMA4_ATTN_VERIFY").ok().as_deref() == Some("1") {
+                if hipfire_config::developer_var("HIPFIRE_GEMMA4_ATTN_VERIFY")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
                     let batched_out = gpu.download_f32(&scratch.pb_attn_q)?;
                     for i in 0..n_batch {
                         let pos = start_pos + i;
@@ -4957,7 +5009,10 @@ fn forward_prefill_batch_v2(
         // MoE branch (or dense fallback). HIPFIRE_MOE_BYPASS=1 forces dense
         // path even on MoE layers (parity with v1 — used to isolate whether
         // a regression lives in apply_moe_branch_batched vs the dense path).
-        let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
+        let moe_bypass = hipfire_config::developer_var("HIPFIRE_MOE_BYPASS")
+            .ok()
+            .as_deref()
+            == Some("1");
         match (moe_opt, moe_bypass) {
             (Some(moe), false) => {
                 apply_moe_branch_batched(gpu, config, scratch, moe, post_ffn_norm_ref, n_batch)?;
@@ -4977,7 +5032,11 @@ fn forward_prefill_batch_v2(
                 gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
             }
         }
-        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             let data = gpu.download_f32(&scratch.pb_residual).unwrap_or_default();
             let last = &data[(n_batch - 1) * dim..n_batch * dim];
             let sum: f64 = last.iter().map(|&v| v as f64).sum();
@@ -5807,7 +5866,10 @@ fn forward_lowered_enabled() -> bool {
     *F.get_or_init(|| {
         // Default ON (byte-parity validated 2026-06-08).
         // Set HIPFIRE_FORWARD_LOWERED=0 to force legacy hand path.
-        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0")
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
     })
 }
 

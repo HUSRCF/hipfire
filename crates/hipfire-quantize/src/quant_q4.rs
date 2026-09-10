@@ -486,10 +486,8 @@ mod tests {
             for l in 0..32 {
                 let idx_e = group * 64 + l;
                 let idx_o = idx_e + 32;
-                let expect_e =
-                    ((vals[idx_e] + min_e) * inv_e + 0.5).max(0.0).min(15.0) as u8;
-                let expect_o =
-                    ((vals[idx_o] + min_o) * inv_o + 0.5).max(0.0).min(15.0) as u8;
+                let expect_e = ((vals[idx_e] + min_e) * inv_e + 0.5).max(0.0).min(15.0) as u8;
+                let expect_o = ((vals[idx_o] + min_o) * inv_o + 0.5).max(0.0).min(15.0) as u8;
                 let byte = qs[group * 32 + l];
                 assert_eq!(
                     byte & 0x0F,

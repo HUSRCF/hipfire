@@ -670,14 +670,12 @@ impl HfqFile {
             // refuse here, not attach and serve corrupted logits later.
             // Extents pack contiguously from data_offset, so each tensor's
             // end is checked as it is indexed.
-            let end = cumulative_offset
-                .checked_add(data_size)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("HfqFile: tensor '{name}' payload size overflows usize"),
-                    )
-                })?;
+            let end = cumulative_offset.checked_add(data_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HfqFile: tensor '{name}' payload size overflows usize"),
+                )
+            })?;
             if end > file_len {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -2711,7 +2709,10 @@ mod overlay_tests {
         assert!(err.contains("'Z' not present in base"), "got: {err}");
     }
 
-    fn write_head_pair(dir: &std::path::Path, byte: u8) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn write_head_pair(
+        dir: &std::path::Path,
+        byte: u8,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let base = dir.join("base.hfq");
         let head = dir.join("head.hfq");
         write_min_hfq(
@@ -2722,7 +2723,11 @@ mod overlay_tests {
                 ("lm_head.weight", 3, &[2, 4], &vec![1u8; 32]),
             ],
         );
-        write_min_hfq(&head, 15, &[("lm_head.weight", 13, &[2, 4], &vec![byte; 32])]);
+        write_min_hfq(
+            &head,
+            15,
+            &[("lm_head.weight", 13, &[2, 4], &vec![byte; 32])],
+        );
         (base, head)
     }
 
@@ -2790,7 +2795,8 @@ mod overlay_tests {
         let (base, head) = write_head_pair(dir.path(), 7);
         let mut f = HfqFile::open(&base).unwrap();
         let ov = HfqFile::open(&head).unwrap();
-        f.attach_opened_head(ov, &head).expect("valid head attaches");
+        f.attach_opened_head(ov, &head)
+            .expect("valid head attaches");
         let (_, data) = f.tensor_data("lm_head.weight").expect("head served");
         assert_eq!(data, &vec![7u8; 32], "overlay shadows the base head");
     }

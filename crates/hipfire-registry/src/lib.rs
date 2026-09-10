@@ -1467,7 +1467,7 @@ mod tests {
         // is not a tag and resolves to itself.
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-10T00:00:00Z",
             "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1487,7 +1487,7 @@ mod tests {
     fn entry_for_file_matches_exact_bare_names_only() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-10T00:00:00Z",
             "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{"qwen36":"qwen3.6:27b"}
         }"#;

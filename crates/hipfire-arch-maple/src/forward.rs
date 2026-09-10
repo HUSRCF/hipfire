@@ -612,13 +612,16 @@ enum DownMode {
 
 fn down_mode() -> DownMode {
     static M: std::sync::OnceLock<DownMode> = std::sync::OnceLock::new();
-    *M.get_or_init(
-        || match hipfire_config::developer_var("HIPFIRE_MAPLE_DOWN").ok().as_deref() {
+    *M.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_MAPLE_DOWN")
+            .ok()
+            .as_deref()
+        {
             Some("atomic") => DownMode::Atomic,
             Some("expanded-nocombine") => DownMode::ExpandedNoCombine,
             _ => DownMode::Expanded,
-        },
-    )
+        }
+    })
 }
 
 // ───────────────────────── Batched prefill ─────────────────────────

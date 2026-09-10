@@ -1366,8 +1366,7 @@ impl KvCache {
         // `alloc_k_v_filtered` so a mid-loop `zeros` failure frees every
         // already-pushed owner — GpuTensor has no freeing Drop.
         let is_kv_layer = vec![true; n_layers];
-        let (k_gpu, v_gpu) =
-            Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, &is_kv_layer)?;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, &is_kv_layer)?;
         Ok(Self {
             k_gpu,
             v_gpu,

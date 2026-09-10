@@ -11736,6 +11736,7 @@ mod tests {
             kv_backend: None,
             speculation: None,
             model_draft: None,
+            vision: None,
             draft_max: None,
             dspark_conf_threshold: None,
             system: None,
@@ -11756,8 +11757,6 @@ mod tests {
             !run_should_force_local(&without_head),
             "without head and no other flags should not force local"
         );
-        // Verify the helper is used by run_command: an HTTP service would be bypassed.
-        // No network needed; the flag alone is the contract.
     }
 
     #[test]
@@ -11803,7 +11802,19 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
         let direct_path = PathBuf::from("/tmp/direct-model.mq4");
-        let params = load_params(&defaults, None, &direct_path.parent().unwrap(), &direct_path, 64, None, None, None, false, None).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             params["kv_mode"], "auto",
             "direct-path auto must survive to architecture"
@@ -11820,8 +11831,19 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("maple-preview").unwrap();
-        let params2 =
-            load_params(&defaults, Some(entry), &direct_path.parent().unwrap(), &direct_path, 64, None, None, None, false, None).unwrap();
+        let params2 = load_params(
+            &defaults,
+            Some(entry),
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             params2["kv_mode"], "auto",
             "registry auto must survive even when entry has bf16 default"

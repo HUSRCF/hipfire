@@ -863,10 +863,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     // + 3 i32 (M,K,B) = 36 explicit bytes. A@0 and X@8 are reads; Y@16 is a pure
     // overwrite (`Y[...] = acc`), so write — never an RMW. gfx11 and gfx12 are
     // distinct symbols with one shared contract, like the residual `_wmma`/`_gfx12` pairs.
-    if matches!(
-        kernel,
-        "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12"
-    ) {
+    if matches!(kernel, "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12") {
         return Some(vec![read(0), read(8), write(16)]);
     }
 
@@ -1515,10 +1512,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     // F16 dense batched GEMM: 3 ptr + M,K,B = 36 → 48 padded. gfx11 and gfx12
     // share one ABI — see `Gpu::gemm_f16_x_f16_wmma`, whose blob builder pushes
     // the same 3 ptr + 3 i32 on both paths before the record path's pad_to(16).
-    if matches!(
-        kernel,
-        "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12"
-    ) {
+    if matches!(kernel, "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12") {
         return Some(48);
     }
 

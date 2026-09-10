@@ -733,8 +733,7 @@ mod tests {
         #[test]
         fn head_on_ep_topology_refuses() {
             let trunk = maple_trunk("g-trunk");
-            let mut base =
-                ModelSource::from_path(trunk.to_str().unwrap()).expect("open trunk");
+            let mut base = ModelSource::from_path(trunk.to_str().unwrap()).expect("open trunk");
             let err = super::super::admit_head_overlay(
                 Some("g-head"),
                 &mut base,
@@ -750,19 +749,20 @@ mod tests {
         #[test]
         fn head_with_reap_overlay_refuses() {
             let trunk = maple_trunk("h-trunk");
-            let plan = std::env::temp_dir().join(format!(
-                "hipfire-head-admit-{}-h-plan",
-                std::process::id()
-            ));
+            let plan = std::env::temp_dir()
+                .join(format!("hipfire-head-admit-{}-h-plan", std::process::id()));
             std::fs::create_dir_all(&plan).unwrap();
             // Install a REAP overlay through the injected plan (deterministic:
             // no process-config snapshot involved).
             let plan_file = plan.join("overlay.hfq");
-            let staged = write_tensors("h-ov", 15, &[("lm_head.weight", 8, vec![2, 4], vec![9u8; 32])]);
+            let staged = write_tensors(
+                "h-ov",
+                15,
+                &[("lm_head.weight", 8, vec![2, 4], vec![9u8; 32])],
+            );
             std::fs::rename(&staged, &plan_file).unwrap();
             let head = maple_head("h-head", 7);
-            let base =
-                HfqFile::open_with_reap_plan(&trunk, Some(&plan)).expect("open trunk");
+            let base = HfqFile::open_with_reap_plan(&trunk, Some(&plan)).expect("open trunk");
             assert!(base.has_overlay(), "REAP overlay must install");
             let mut source = ModelSource::Hfq(base);
             let err = super::super::admit_head_overlay(
