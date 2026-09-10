@@ -1817,7 +1817,10 @@ impl WeightSource for LlamaHfqSource<'_> {
                 )
             },
             |gpu| {
-                let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
+                let data = hfq
+                    .tensor_data("model.embed_tokens.weight")
+                    .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?
+                    .1;
                 reupload_f16_as_f32(gpu, &data, cfg.vocab_size, cfg.dim)
             },
         )
@@ -1838,6 +1841,9 @@ impl WeightSource for LlamaHfqSource<'_> {
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
+    }
 }
 
 /// Load llama-family `model.embed_tokens.weight` and classify its embedding
@@ -1850,7 +1856,7 @@ fn load_embedding_llama(
     eprintln!("  loading token_embd...");
     let (info, data) = hfq
         .tensor_data("model.embed_tokens.weight")
-        .expect("embed_tokens not found");
+        .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
     // Q4K embeddings are llama-family-only (GGUF-derived). qwen2/qwen35 have no
     // Q4K embedding-lookup kernel — that is why the shared `load_embedding` /
 

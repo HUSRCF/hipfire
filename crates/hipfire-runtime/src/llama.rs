@@ -539,6 +539,26 @@ impl WeightTensor {
         let _ = gpu.free_tensor(self.buf);
     }
 }
+impl WeightTensor {
+    /// Free owning metadata while retaining the weight buffer.
+    ///
+    /// Tied output heads are non-owning views of the embedding buffer. Their
+    /// metadata still belongs to the output descriptor, but freeing the buffer
+    /// here would double-release the embedding allocation.
+    pub fn free_metadata_only(self, gpu: &mut Gpu) {
+        if let Some(paro) = self.paro {
+            if !paro.is_alias {
+                let _ = gpu.free_tensor(paro.pairs);
+                let _ = gpu.free_tensor(paro.theta);
+                let _ = gpu.free_tensor(paro.channel_scales);
+            }
+        }
+        if let Some(awq) = self.awq_scale {
+            let _ = gpu.free_tensor(awq);
+        }
+    }
+}
+
 
 impl WeightTensor {
     /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
@@ -677,6 +697,31 @@ pub struct LayerWeights {
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
 }
+impl LayerWeights {
+    /// Return every GPU buffer owned by one layer to the pool.
+    ///
+    /// Whole-model loaders use this during rollback as well as normal unload,
+    /// so a partially completed sweep has the same ownership semantics as a
+    /// successfully published model.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        if let Some(t) = self.q_norm {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.k_norm {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.w_gate.free_all(gpu);
+        self.w_up.free_all(gpu);
+        self.w_down.free_all(gpu);
+    }
+}
+
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
@@ -692,22 +737,8 @@ impl LlamaWeights {
             // the whole output weight when aliased still frees exactly once.
             self.output.free_all(gpu);
         }
-        for l in self.layers {
-            let _ = gpu.free_tensor(l.attn_norm);
-            l.wq.free_all(gpu);
-            l.wk.free_all(gpu);
-            l.wv.free_all(gpu);
-            l.wo.free_all(gpu);
-            if let Some(t) = l.q_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(t) = l.k_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            let _ = gpu.free_tensor(l.ffn_norm);
-            l.w_gate.free_all(gpu);
-            l.w_up.free_all(gpu);
-            l.w_down.free_all(gpu);
+        for layer in self.layers {
+            layer.free_gpu(gpu);
         }
     }
 }

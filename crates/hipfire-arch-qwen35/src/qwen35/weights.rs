@@ -357,6 +357,71 @@ pub enum LayerWeights {
     DeltaNetMoe(DeltaNetMoeLayerWeights),
     FullAttnMoe(FullAttnMoeLayerWeights),
 }
+impl LayerWeights {
+    /// Return every GPU allocation owned by one layer to `gpu`.
+    ///
+    /// This is the single layer-level teardown used by both normal unload and
+    /// whole-model load rollback. In particular, it preserves the packed,
+    /// paged, EP, and Paro ownership branches in `free_moe_ffn`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            LayerWeights::DeltaNet(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::FullAttn(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::DeltaNetMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+        }
+    }
+}
 /// Immutable source identity captured before any EP GPU allocation.
 /// Exact equality over canonical path, platform file identity (dev, ino),
 /// length, mtime, arch_id, exact metadata_json, ordered tensor manifest
