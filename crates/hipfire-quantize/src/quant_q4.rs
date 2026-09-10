@@ -241,9 +241,16 @@ pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
             min_ints[sb] = ((-sub_mins[sb]) * inv_dmin + 0.5).min(63.0) as u8;
         }
 
-        // Write super-block header
-        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        // Write super-block header. Final nibbles must use the F16 values that
+        // are actually stored — dequant only sees those — matching llama.cpp
+        // quantize_row_q4_K_ref (ggml-quants.c): FP32_TO_FP16 then FP16_TO_FP32
+        // before (x + dm) / d. Scale/min *ints* stay on the pre-store F32 path.
+        let d_bits = f32_to_f16(d);
+        let dmin_bits = f32_to_f16(dmin);
+        output[out_off..out_off + 2].copy_from_slice(&d_bits.to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&dmin_bits.to_le_bytes());
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dmin_bits);
 
         // Pack 6-bit scales/mins into 12 bytes (GGML encoding)
         let sc = &mut output[out_off + 4..out_off + 16];
@@ -403,4 +410,105 @@ pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, 
     }
 
     (output, row_stride)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Q4_K final nibbles must be chosen from the *stored* F16 `d`/`dmin`, not
+    /// the pre-store F32 values. Fixture: sub-block 0 is constant 0.09 (tiny
+    /// scale_int=1) while sub-block 1 is ±4.05 (sets max_scale so `d = max/63`
+    /// is not F16-exact). With the pre-store F32 `d`, element 0 sits just under
+    /// the half-integer (`10.999… → nibble 10`); after F16 truncate+re-widen it
+    /// crosses (`11.004… → nibble 11`). GGML's quantize_row_q4_K_ref does the
+    /// same re-widen before packing qs.
+    #[test]
+    fn q4k_nibbles_follow_stored_f16_d_at_half_integer_boundary() {
+        let mut vals = vec![0.0f32; 256];
+        for i in 0..32 {
+            vals[i] = 0.09;
+        }
+        for i in 32..64 {
+            vals[i] = if i % 2 == 0 { 4.05 } else { -4.05 };
+        }
+
+        let packed = quantize_q4k(&vals);
+        assert_eq!(packed.len(), 144, "one Q4_K super-block");
+
+        let d_bits = u16::from_le_bytes([packed[0], packed[1]]);
+        let dmin_bits = u16::from_le_bytes([packed[2], packed[3]]);
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dmin_bits);
+
+        // Unpack 6-bit scales/mins (same layout as dequant_q4_k / GGML).
+        let sc = &packed[4..16];
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for i in 0..4 {
+            scales[i] = sc[i] & 63;
+            mins[i] = sc[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc[8 + i] & 0xF) | ((sc[i] >> 6) << 4);
+            mins[4 + i] = (sc[8 + i] >> 4) | ((sc[4 + i] >> 6) << 4);
+        }
+
+        // Precondition: this fixture's super-scale is not F16-exact, so the
+        // re-widen path is load-bearing (next F16 step flips the boundary nibble).
+        assert_eq!(scales[0], 1, "fixture expects scale_int[0]=1");
+        assert_eq!(mins[0], 0, "fixture expects min_int[0]=0");
+        let d_next = f16_to_f32(d_bits.wrapping_add(1));
+        let q_stored = {
+            let inv = 1.0 / (d * scales[0] as f32);
+            ((vals[0] * inv) + 0.5).max(0.0).min(15.0) as u8
+        };
+        let q_next = {
+            let inv = 1.0 / (d_next * scales[0] as f32);
+            ((vals[0] * inv) + 0.5).max(0.0).min(15.0) as u8
+        };
+        assert_ne!(
+            q_stored, q_next,
+            "fixture must sit on an F16 rounding boundary (stored d nibble {q_stored} vs next {q_next})"
+        );
+
+        // Every packed nibble must match reconstruction from the stored F16 scales.
+        let qs = &packed[16..144];
+        for group in 0..4 {
+            let sb_e = group * 2;
+            let sb_o = group * 2 + 1;
+            let eff_e = d * scales[sb_e] as f32;
+            let eff_o = d * scales[sb_o] as f32;
+            let min_e = dmin * mins[sb_e] as f32;
+            let min_o = dmin * mins[sb_o] as f32;
+            let inv_e = if eff_e > 0.0 { 1.0 / eff_e } else { 0.0 };
+            let inv_o = if eff_o > 0.0 { 1.0 / eff_o } else { 0.0 };
+            for l in 0..32 {
+                let idx_e = group * 64 + l;
+                let idx_o = idx_e + 32;
+                let expect_e =
+                    ((vals[idx_e] + min_e) * inv_e + 0.5).max(0.0).min(15.0) as u8;
+                let expect_o =
+                    ((vals[idx_o] + min_o) * inv_o + 0.5).max(0.0).min(15.0) as u8;
+                let byte = qs[group * 32 + l];
+                assert_eq!(
+                    byte & 0x0F,
+                    expect_e,
+                    "low nibble mismatch at elem {idx_e} (stored-F16 reconstruction)"
+                );
+                assert_eq!(
+                    byte >> 4,
+                    expect_o,
+                    "high nibble mismatch at elem {idx_o} (stored-F16 reconstruction)"
+                );
+            }
+        }
+
+        // Pin the boundary element itself: must be the stored-scale choice.
+        assert_eq!(
+            qs[0] & 0x0F,
+            q_stored,
+            "elem 0 must use re-widened stored d (nibble {q_stored})"
+        );
+    }
 }

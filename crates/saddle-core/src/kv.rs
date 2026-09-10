@@ -1313,9 +1313,10 @@ impl KvCache {
     }
 
     /// Create a flat BF16 KV cache. 2 bytes per element — 1.88x the Q8_0
-    /// layout (34 B per 32 elements) but with no per-block scale and no
-    /// quantization error: bf16 carries the same 8 exponent bits as f32 and
-    /// truncates only the mantissa.
+    /// layout (34 B per 32 elements). Values are **rounded F32→BF16** (same 8
+    /// exponent bits, truncated mantissa); that is not lossless, but it is the
+    /// near-reference tier Maple compares Q8 against and **the default Maple
+    /// KV mode** today.
     ///
     /// Layout is deliberately the simplest thing that can work: element
     /// `(t, kv_h, d)` lives at `t * kv_dim + kv_h * head_dim + d`, one bf16
@@ -1324,9 +1325,6 @@ impl KvCache {
     ///
     /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
     /// callers get the buffer they asked for.
-    ///
-    /// This exists so Maple's Q8 KV can be compared against a near-reference
-    /// KV at long context. It is NOT the default for any model.
     pub fn new_gpu_bf16(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -1364,12 +1362,12 @@ impl KvCache {
         // a hypothetical odd kv_dim from under-allocating.
         let cache_bytes = physical_cap * kv_dim * 2;
         let cache_elems = cache_bytes.div_ceil(4);
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-        }
+        // All layers carry KV (no hybrid mask). Route through
+        // `alloc_k_v_filtered` so a mid-loop `zeros` failure frees every
+        // already-pushed owner — GpuTensor has no freeing Drop.
+        let is_kv_layer = vec![true; n_layers];
+        let (k_gpu, v_gpu) =
+            Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, &is_kv_layer)?;
         Ok(Self {
             k_gpu,
             v_gpu,
