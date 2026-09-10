@@ -3872,8 +3872,7 @@ mod tests {
         assert_eq!(assigned_key, key);
 
         let mut output = Vec::new();
-        let _scope =
-            BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
         emit_lfm_assignment_capacity_error(&mut output, &key, 7, 4, 8);
         let lines: Vec<&str> = std::str::from_utf8(&output)
             .expect("UTF-8 error envelope")
@@ -3881,8 +3880,7 @@ mod tests {
             .filter(|line| !line.is_empty())
             .collect();
         assert_eq!(lines.len(), 1, "assignment emits exactly one error");
-        let event: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("JSON error envelope");
+        let event: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON error envelope");
         assert_eq!(event["id"].as_str(), Some(id));
         assert_eq!(event["attempt_id"].as_u64(), Some(attempt_id));
         assert_eq!(event["class"].as_str(), Some("context_length"));
