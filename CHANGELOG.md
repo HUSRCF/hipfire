@@ -1,13 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
-- Manifest-route weight uploads go through the GPU buffer pool (`weight_store` pooled fulfillment + pool-return rollback) instead of raw `hip.malloc` paired with pooled frees, so repeated load/unload cycles on one context hold post-warmup free VRAM flat instead of retaining ~one model's weights per cycle. Single plain-manifest transactional load only — the legacy loader path is unchanged. Provenance: per-cycle upload journal count, decode parity, and pool-hit counters in the pinned-fixture cycle test; pooled manifest vs legacy forwards bit-identical. AWQ numerics now rest on a post-`output_norm` quantized-lm_head oracle (uniform 2.0-vs-4.0 sidecars forward at an exact 2:1 logit ratio, alternating sidecar proves per-channel application); the pre-norm o_proj pair only records sidecar attachment since RMSNorm erases global scales.
-- DFlash weight and scratch constructors now roll back late failures for immediate retry, including pool-aware F32 leaf uploads and AWQ sidecar attachment.
-- Preserve all eleven weight groups in K=2816 HFQ4/MQ4 MoE gate/up kernels while retaining the K=2048 path; this kernel prerequisite does not enable Gemma serving.
-- Maple head overlays and BF16 KV tier (#670, nwoolmer): `hipfire run maple-preview --head q4k|bf16` loads single-tensor head overlays that validate and attach during source admission before teardown (non-Maple, EP, and REAP combinations are refused there); truncated payloads refuse at open and short reads refuse instead of zero-filling. Flat BF16 KV tier with windowed attention kernels, selectable via `--kv-mode`; the batch-router GEMM selects a gfx12 WMMA sister kernel on RDNA4. No quality or performance claims are made here.
-
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Source-aware admission and refusal-before-teardown (#682, #687).
@@ -30,6 +22,11 @@
 - Gate overhaul: `change_gate` / agentic-review retired (#700); hw-gate pins Qwen3.8 MQ4-XT and drops qwen3.6 as current fixture.
 - S1+S2 dependency hygiene and panic-free config CLI (#701).
 - All production `HIPFIRE_*` reads are config-owned.
+- Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
+- Manifest-route weight uploads go through the GPU buffer pool (`weight_store` pooled fulfillment + pool-return rollback) instead of raw `hip.malloc` paired with pooled frees, so repeated load/unload cycles on one context hold post-warmup free VRAM flat instead of retaining ~one model's weights per cycle. Single plain-manifest transactional load only — the legacy loader path is unchanged. Provenance: per-cycle upload journal count, decode parity, and pool-hit counters in the pinned-fixture cycle test; pooled manifest vs legacy forwards bit-identical. AWQ numerics now rest on a post-`output_norm` quantized-lm_head oracle (uniform 2.0-vs-4.0 sidecars forward at an exact 2:1 logit ratio, alternating sidecar proves per-channel application); the pre-norm o_proj pair only records sidecar attachment since RMSNorm erases global scales.
+- DFlash weight and scratch constructors now roll back late failures for immediate retry, including pool-aware F32 leaf uploads and AWQ sidecar attachment.
+- Preserve all eleven weight groups in K=2816 HFQ4/MQ4 MoE gate/up kernels while retaining the K=2048 path; this kernel prerequisite does not enable Gemma serving.
+- Maple head overlays and BF16 KV tier (#670, nwoolmer): `hipfire run maple-preview --head q4k|bf16` loads single-tensor head overlays that validate and attach during source admission before teardown (non-Maple, EP, and REAP combinations are refused there); truncated payloads refuse at open and short reads refuse instead of zero-filling. Flat BF16 KV tier with windowed attention kernels, selectable via `--kv-mode`; the batch-router GEMM selects a gfx12 WMMA sister kernel on RDNA4. No quality or performance claims are made here.
 
 ### Validation
 

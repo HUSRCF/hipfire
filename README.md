@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.3.1" src="https://img.shields.io/badge/stable-v0.3.1-24292f?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Next release v0.3.1 candidate" src="https://img.shields.io/badge/next-v0.3.1%20candidate-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="80 curated model entries" src="https://img.shields.io/badge/registry-80%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -44,7 +45,8 @@ hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
-Current stable release: **v0.3.1**. DFlash prompt-cache repair, registry
+Current stable release: **v0.2.1**. The next release is **v0.3.1**
+(promotion candidate), headlined by DFlash prompt-cache repair, registry
 draft sidecars, Ornith 1.5, and first-release image generation (FLUX).
 See [CHANGELOG.md](CHANGELOG.md).
 
