@@ -626,9 +626,10 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
     }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
-        b.scratch.free_gpu(gpu);
-        let _ = b.kv_sliding.free_gpu(gpu);
+        // Reverse of lowered load construction: full → sliding → scratch → weights.
         let _ = b.kv_full.free_gpu(gpu);
+        let _ = b.kv_sliding.free_gpu(gpu);
+        b.scratch.free_gpu(gpu);
         b.weights.free_gpu(gpu);
     }
 }
@@ -1448,7 +1449,7 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
             return Some(qwen35_template_from_embedded(
                 hfq.chat_template(),
                 model_path,
-            ))
+            ));
         }
         11 => {
             if let Some(t) = hfq.chat_template() {
@@ -1961,12 +1962,12 @@ fn finish_qwen35_load(
                                     .or(ctx.spec.dspark_conf_threshold)
                                     .unwrap_or(0.1f32);
                                     eprintln!(
-                                    "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
-                                    block,
-                                    dspark_weights.cfg.target_layer_ids,
-                                    vocab,
-                                    conf_threshold
-                                );
+                                        "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
+                                        block,
+                                        dspark_weights.cfg.target_layer_ids,
+                                        vocab,
+                                        conf_threshold
+                                    );
                                     match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
                                         assets,
                                         &dspark_weights.cfg,
@@ -1987,14 +1988,16 @@ fn finish_qwen35_load(
                                         }
                                         Err(e) => {
                                             eprintln!(
-                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                                "  qwen35: DSpark body build failed: {e} — AR/other"
                                             );
                                             None
                                         }
                                     }
                                 }
                                 Ok(None) => {
-                                    eprintln!("  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping");
+                                    eprintln!(
+                                        "  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
+                                    );
                                     None
                                 }
                                 Err(e) => {
@@ -2489,6 +2492,7 @@ pub fn load_model_with_gemma4_drafter(
         gpu.arch.as_str(),
         None,
         head_path,
+        max_seq,
     )?;
     load_admitted_with_gemma4_drafter(
         admission,
@@ -3058,7 +3062,8 @@ pub fn load_model_ep_with_kv_mode(
     // Classify once and admit before any side effect. EP is HFQ-only and
     // dispatches on arch_id, so the admission retains the arch_id decision and
     // the per-rank file re-open happens inside the EP load (unchanged).
-    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None, None)?;
+    let admission =
+        crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None, None, max_seq)?;
     load_model_ep_admitted(
         admission,
         path,
@@ -4363,7 +4368,12 @@ mod registry_tests {
         assert_eq!(super::vision_route(9), super::VisionRoute::None);
         // Text-only carriers must stay false.
         assert!(
-            REGISTRY.iter().find(|c| c.name() == "lfm2moe").unwrap().caps().supports_images,
+            REGISTRY
+                .iter()
+                .find(|c| c.name() == "lfm2moe")
+                .unwrap()
+                .caps()
+                .supports_images,
             "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
         );
         for name in [

@@ -3271,14 +3271,36 @@ impl Gpu {
         }
     }
 
+    /// Allocate a pool tensor then run `init`. On init failure the owner is
+    /// returned to the pool and the original error is preserved — constructors
+    /// that allocate then memset/htod must not strand the buffer when init fails
+    /// (`GpuTensor` has no freeing `Drop`).
+    fn alloc_then_init(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        init: impl FnOnce(&HipRuntime, Option<&hip_bridge::Stream>, &GpuTensor) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        let tensor = self.alloc_tensor(shape, dtype)?;
+        let init_result = {
+            let stream = self.active_stream.as_ref();
+            init(&self.hip, stream, &tensor)
+        };
+        if let Err(err) = init_result {
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F32)?;
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        self.hip.memcpy_htod(&tensor.buf, bytes)?;
-        Ok(tensor)
+        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            hip.memcpy_htod(&tensor.buf, bytes)
+        })
     }
 
     /// Upload host-side **f16 bit patterns** straight into an `F16` tensor.
@@ -3319,12 +3341,12 @@ impl Gpu {
     /// softmax weight).
     pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F32)?;
-        let data = vec![value; tensor.numel()];
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        self.hip.memcpy_htod(&tensor.buf, bytes)?;
-        Ok(tensor)
+        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+            let data = vec![value; tensor.numel()];
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            hip.memcpy_htod(&tensor.buf, bytes)
+        })
     }
 
     /// In-place constant fill of an existing F32 tensor (sync htod).
@@ -3369,21 +3391,40 @@ impl Gpu {
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, dtype)?;
-        match self.active_stream.as_ref() {
-            Some(stream) => self
-                .hip
-                .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
-            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
-        }
-        Ok(tensor)
+        self.alloc_then_init(shape, dtype, |hip, stream, tensor| match stream {
+            Some(stream) => hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream),
+            None => hip.memset(&tensor.buf, 0, tensor.byte_size()),
+        })
     }
 
     /// Upload raw bytes to GPU (for quantized weights).
+    ///
+    /// Allocation is a direct `hip.malloc` (not the GpuPool). On host→device
+    /// copy failure the buffer is released with `hip.free` — never
+    /// [`Self::free_tensor`], which would park a never-pooled allocation on
+    /// the free list. Successful owners are still typically torn down via
+    /// `free_tensor`, which *does* return them into the pool; later
+    /// `upload_raw` calls still malloc fresh and never reclaim those slots
+    /// (the pool-backed twin lives in hipfire-runtime weight fulfillment).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.upload_raw_with_copy(data, shape, HipRuntime::memcpy_htod)
+    }
+
+    /// [`Self::upload_raw`] with an injectable copy step so regressions can
+    /// force malloc-success / copy-failure without a production knob.
+    fn upload_raw_with_copy(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
-        self.hip.memcpy_htod(&buf, data)?;
+        if let Err(err) = copy(&self.hip, &buf, data) {
+            // hip.malloc owner — hip.free only. free_tensor would pool it.
+            let _ = self.hip.free(buf);
+            return Err(err);
+        }
         Ok(GpuTensor {
             buf,
             shape: shape.to_vec(),
@@ -5404,6 +5445,104 @@ mod tests {
         assert_eq!(actual, expect);
         gpu.free_tensor(tensor).expect("free");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    /// Alloc→init failure must return the owner to the pool. Baseline is taken
+    /// after a successful public warm so first-touch `total_new` sits outside the
+    /// measured window; a leaked owner still forces a fresh malloc on retry.
+    #[test]
+    fn alloc_then_init_failure_returns_pool_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let warm = gpu.zeros(&[64], DType::F32).expect("warm public zeros");
+        let warm_host = gpu.download_f32(&warm).expect("download warm");
+        assert_eq!(warm_host.len(), 64);
+        assert!(
+            warm_host.iter().all(|&x| x == 0.0),
+            "public zeros must clear the buffer"
+        );
+        gpu.free_tensor(warm).expect("free warm");
+        let fresh_allocations = gpu.pool_stats().0;
+
+        // Real allocation, injected init only — not a pre-alloc inject.
+        let err = match gpu.alloc_then_init(&[64], DType::F32, |_hip, _stream, _tensor| {
+            Err(hip_bridge::HipError::new(2, "injected init failure"))
+        }) {
+            Err(error) => error,
+            Ok(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+                panic!("injected init failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        // Immediate public retry reuses the returned slot; content still correct.
+        let ok = gpu.zeros(&[64], DType::F32).expect("zeros retry");
+        let host = gpu.download_f32(&ok).expect("download retry");
+        assert_eq!(host, vec![0.0f32; 64]);
+        gpu.free_tensor(ok).expect("free retry");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed init leaked its pool allocation instead of rolling it back",
+        );
+    }
+
+    /// malloc-success / copy-failure must `hip.free` the raw owner (not
+    /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
+    #[test]
+    fn upload_raw_copy_failure_hip_frees_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        // Public success path still works and is free_tensor-teardown'd
+        // (pooled free domain — see upload_raw docs). Not an allocator change.
+        let warm = gpu
+            .upload_raw(&[7u8; 64], &[64])
+            .expect("warm public upload_raw");
+        assert_eq!(warm.buf.size(), 64);
+        assert!(warm.buf.is_hip_allocation());
+        gpu.free_tensor(warm).expect("free warm into pool");
+
+        let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
+        let pool_before = gpu.pool_stats();
+
+        let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
+            Err(hip_bridge::HipError::new(2, "injected raw H2D failure"))
+        }) {
+            Err(error) => error,
+            Ok(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+                panic!("injected raw copy failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
+        assert_eq!(
+            free_after, free_before,
+            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
+        );
+        // hip.free path must not touch pool counters (would if free_tensor'd).
+        assert_eq!(
+            gpu.pool_stats(),
+            pool_before,
+            "copy-fail must not route the raw malloc through the pool"
+        );
+
+        // Public success still works after the failure seam.
+        let ok = gpu.upload_raw(&[9u8; 64], &[64]).expect("upload_raw retry");
+        assert!(ok.buf.is_hip_allocation());
+        gpu.free_tensor(ok).expect("free retry");
     }
 
     #[test]

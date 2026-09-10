@@ -308,6 +308,7 @@ pub fn admit_source(
     gpu_arch: &str,
     vision: Option<&str>,
     head: Option<&str>,
+    max_seq: usize,
 ) -> Result<SourceAdmission, String> {
     let mut source = ModelSource::from_path(path)?;
     let arch_id = source
@@ -382,6 +383,12 @@ pub fn admit_source(
     }
     if let ModelSource::Hfq(hfq) = &source {
         df_lash_lm_head_admission(hfq, draft_path, gpu_arch)?;
+        // Gemma 4 lowered min-context: refuse before teardown/alloc so a
+        // small max_seq leaves the prior model serving. Eager stays exempt.
+        if matches!(arch_id, 13 | 22) {
+            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq, false);
+            hipfire_arch_gemma4::gemma4_context_admission(max_seq, use_lowered)?;
+        }
     }
     // Head overlay (`params.head`): validated AND attached to the retained
     // base here, so the admitted source is already effective and loading
@@ -528,6 +535,7 @@ mod tests {
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
                 None,
+                4096,
             )
             .expect("tower sidecar must admit");
             assert!(admitted.has_vision, "sidecar tower promotes trunk to VL");
@@ -554,6 +562,7 @@ mod tests {
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
                 None,
+                4096,
             )
             .map(|_| ())
             .expect_err("tower-less sidecar must refuse");
@@ -576,6 +585,7 @@ mod tests {
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
                 None,
+                4096,
             )
             .map(|_| ())
             .expect_err("wrong-arch sidecar must refuse");
@@ -664,6 +674,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(head.to_str().unwrap()),
+                4096,
             )
             .expect("valid maple head must admit");
             assert!(
@@ -691,6 +702,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(""),
+                4096,
             )
             .expect("empty head must admit as unset");
             assert_eq!(
@@ -722,6 +734,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(head.to_str().unwrap()),
+                4096,
             )
             .map(|_| ())
             .expect_err("non-maple head must refuse");
@@ -798,6 +811,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(head.to_str().unwrap()),
+                4096,
             )
             .map(|_| ())
             .expect_err("truncated head must refuse");
@@ -823,6 +837,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(head.to_str().unwrap()),
+                4096,
             )
             .map(|_| ())
             .expect_err("wrong-arch head must refuse");
@@ -851,6 +866,7 @@ mod tests {
                 "gfx1151",
                 None,
                 Some(head.to_str().unwrap()),
+                4096,
             )
             .map(|_| ())
             .expect_err("full model as head must refuse");
