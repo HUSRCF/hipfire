@@ -262,10 +262,28 @@ impl std::error::Error for FulfillError {}
 /// `(name, layer, device)` and captures the target origin once. The container
 /// itself has no consuming teardown API; lifecycle transitions are represented
 /// by [`WeightLoadTransaction`] and the architecture-private attached owner.
+///
+/// Two records survive after typed assembly takes every handle for
+/// publication: the allocation `journal` (insertion order, so rollback frees
+/// in exact reverse allocation order instead of `HashMap` iteration order)
+/// and the projection/alias census. Assembly takes a handle out of
+/// `placements` but never removes its projection or alias edge, so the
+/// published transaction still carries the complete validated provenance
+/// (every fulfilled identity, its immutable projection, and every tied alias
+/// source) beneath the crate-private attached owner. This census owns
+/// nothing: resident allocations belong to the typed architecture weights,
+/// and the census is dropped with the store without freeing.
 #[derive(Default)]
 pub struct WeightStore {
     placements: HashMap<WeightPlacementKey, WeightHandle>,
     projections: HashMap<WeightPlacementKey, WeightProjection>,
+    /// Every inserted identity in allocation order. Entries taken by assembly
+    /// stay journaled; rollback skips keys that are no longer resident, so a
+    /// key is freed at most once.
+    journal: Vec<WeightPlacementKey>,
+    /// Tied-source edges (`lm_head -> token_embd`) recorded at insert.
+    /// Retained after assembly takes the alias handle.
+    aliases: HashMap<WeightPlacementKey, String>,
     origin: Option<WeightOrigin>,
 }
 
@@ -344,6 +362,14 @@ impl WeightLoadTransaction {
             })
     }
 
+    /// Tied-source edge recorded for an alias identity, if it was staged as
+    /// one. Survives assembly like the projection census.
+    pub fn alias_source(&self, name: &str, layer: Option<usize>, device: usize) -> Option<&str> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.alias_source(name, layer, device))
+    }
+
     /// Start typed assembly while this load is still unpublished.
     pub fn begin_assembly(&mut self) -> WeightStoreAssembly<'_> {
         self.store
@@ -374,6 +400,8 @@ impl WeightStore {
         Self {
             placements: HashMap::new(),
             projections: HashMap::new(),
+            journal: Vec::new(),
+            aliases: HashMap::new(),
             origin: Some(origin),
         }
     }
@@ -421,6 +449,19 @@ impl WeightStore {
         devices
     }
 
+    /// Retained provenance census size: every fulfilled identity's projection,
+    /// including cells whose handles assembly already took. Owns nothing.
+    pub fn inventory_len(&self) -> usize {
+        self.projections.len()
+    }
+
+    /// Tied-source edge for an alias identity. Retained after assembly.
+    pub fn alias_source(&self, name: &str, layer: Option<usize>, device: usize) -> Option<&str> {
+        self.aliases
+            .get(&WeightPlacementKey::new(name, layer, device))
+            .map(String::as_str)
+    }
+
     fn insert(
         &mut self,
         key: WeightPlacementKey,
@@ -430,6 +471,10 @@ impl WeightStore {
         if self.placements.contains_key(&key) {
             return Err(WeightStoreError::DuplicatePlacement(key));
         }
+        if let WeightHandle::Alias(source) = &handle {
+            self.aliases.insert(key.clone(), source.clone());
+        }
+        self.journal.push(key.clone());
         self.placements.insert(key.clone(), handle);
         self.projections.insert(key, projection);
         Ok(())
@@ -454,10 +499,10 @@ impl WeightStore {
 
     /// Move a handle out of the store. This is private to the assembly
     /// capability so arbitrary store holders cannot independently tear down a
-    /// resident allocation.
+    /// resident allocation. The projection and alias edge stay behind as
+    /// retained provenance; only the handle leaves.
     fn take(&mut self, name: &str, layer: Option<usize>, device: usize) -> Option<WeightHandle> {
         let key = WeightPlacementKey::new(name, layer, device);
-        self.projections.remove(&key);
         self.placements.remove(&key)
     }
 
@@ -469,7 +514,7 @@ impl WeightStore {
     ) -> Option<(WeightHandle, WeightProjection)> {
         let key = WeightPlacementKey::new(name, layer, device);
         let handle = self.placements.remove(&key)?;
-        let projection = self.projections.remove(&key)?;
+        let projection = self.projections.get(&key)?.clone();
         Some((handle, projection))
     }
 
@@ -503,9 +548,19 @@ impl WeightStore {
         self.release_unchecked(gpu)
     }
 
-    fn release_unchecked(self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+    /// Free every resident buffer in exact reverse allocation order. The
+    /// allocation journal records insertion order, so unlike `HashMap`
+    /// iteration the teardown sequence is deterministic. Keys already taken
+    /// by assembly (or restored then re-taken) resolve to no placement and
+    /// are skipped, so each resident is freed at most once; aliases own no
+    /// buffer and are removed without GPU work.
+    fn release_unchecked(mut self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
         let mut first_error = None;
-        for handle in self.placements.into_values() {
+        for key in self.journal.drain(..).rev() {
+            let handle = match self.placements.remove(&key) {
+                Some(handle) => handle,
+                None => continue,
+            };
             if let WeightHandle::Resident(tensor) = handle {
                 match gpu.hip.free(tensor.buf) {
                     Ok(()) => {
@@ -619,12 +674,21 @@ fn rollback_fulfill_error(store: WeightStore, gpu: &Gpu, mut error: FulfillError
 /// The source callback is the architecture-owned namespace seam and returns
 /// raw bytes plus the actual source dtype. No file/GGUF/HFQ type crosses this
 /// API. On the first source, dtype, or upload failure every earlier resident is
-/// explicitly released before the error is returned.
+/// explicitly released in reverse allocation order before the error is returned.
+///
+/// `expected` is the target identity the carrier admitted at plan time (mesh
+/// epoch, logical rank, physical device). It is bound **before the first
+/// upload**: when the runtime mesh/GPU disagree with the admitted plan
+/// identity, fulfillment fails with no resident allocation to roll back.
+/// This is still a same-call-site binding — a genuinely independent
+/// cross-owner admission authority does not exist in-tree yet, so the
+/// post-publication attach check stays as the second gate.
 pub fn fulfill_manifest_single<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
     gpu: &Gpu,
+    expected: WeightOrigin,
     source: F,
 ) -> Result<WeightLoadTransaction, FulfillError>
 where
@@ -645,6 +709,16 @@ where
     }
 
     let origin = WeightOrigin::for_single(mesh, gpu);
+    if origin != expected {
+        return Err(FulfillError {
+            name: "<origin>".to_string(),
+            layer: None,
+            device: 0,
+            reason: format!(
+                "admitted target identity {expected:?} does not match runtime mesh/GPU {origin:?}; refusing before upload"
+            ),
+        });
+    }
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
@@ -788,17 +862,20 @@ where
 /// Canonical name used by the manifest fulfillment seam. The target is
 /// deliberately Single-only in this pilot; multi-device fulfillment belongs to
 /// the admitted mesh/G5 integration and must not grow a second owner here.
+/// `expected` is the plan-time admitted identity; see
+/// [`fulfill_manifest_single`].
 pub fn fulfill_manifest<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
     gpu: &Gpu,
+    expected: WeightOrigin,
     source: F,
 ) -> Result<WeightLoadTransaction, FulfillError>
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
-    fulfill_manifest_single(weights, mesh, n_layers, gpu, source)
+    fulfill_manifest_single(weights, mesh, n_layers, gpu, expected, source)
 }
 
 #[cfg(test)]
@@ -836,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_rollback_removes_handles_and_projection_together() {
+    fn staged_take_moves_handles_but_retains_projection_inventory() {
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
         let mut store = WeightStore::with_origin(origin);
@@ -847,13 +924,39 @@ mod tests {
             .stage_alias("second", Some(2), 0, "source", projection(DType::F16))
             .unwrap();
         assert_eq!(store.len(), 2);
+        assert_eq!(store.inventory_len(), 2);
         let first = store.take_with_projection("first", None, 0).unwrap();
         assert!(matches!(first.0, WeightHandle::Alias(_)));
-        assert!(store.projection("first", None, 0).is_none());
         assert_eq!(store.len(), 1);
+        // The taken cell's projection and alias edge stay behind as the
+        // retained publication inventory; only the handle leaves.
+        assert!(store.projection("first", None, 0).is_some());
+        assert_eq!(store.alias_source("first", None, 0), Some("source"));
+        assert_eq!(store.inventory_len(), 2);
         let second = store.take("second", Some(2), 0).unwrap();
         assert!(matches!(second, WeightHandle::Alias(_)));
         assert!(store.is_empty());
+        assert_eq!(store.inventory_len(), 2);
+    }
+
+    #[test]
+    fn allocation_journal_records_insertion_order_for_reverse_rollback() {
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let origin = WeightOrigin::from_parts(mesh.epoch(), 0, 0);
+        let mut store = WeightStore::with_origin(origin);
+        for name in ["first", "second", "third"] {
+            store
+                .stage_alias(name, None, 0, "source", projection(DType::F16))
+                .unwrap();
+        }
+        let order: Vec<String> = store.journal.iter().map(|key| key.name.clone()).collect();
+        assert_eq!(order, vec!["first", "second", "third"]);
+        // Taking a handle leaves its journal slot; rollback walks the journal
+        // in reverse and skips keys with no placement, so each resident is
+        // freed at most once in exact reverse allocation order.
+        let _taken = store.take("second", None, 0).unwrap();
+        let order: Vec<String> = store.journal.iter().map(|key| key.name.clone()).collect();
+        assert_eq!(order, vec!["first", "second", "third"]);
     }
 
     #[test]
@@ -882,7 +985,10 @@ mod tests {
             .unwrap();
         let _owned = store.take("x", None, 0).unwrap();
         assert!(store.take("x", None, 0).is_none());
-        assert!(store.projection("x", None, 0).is_none());
+        // The handle is gone exactly once, but its projection and alias edge
+        // remain as publication inventory.
+        assert!(store.projection("x", None, 0).is_some());
+        assert_eq!(store.alias_source("x", None, 0), Some("source"));
         assert!(store.is_empty());
     }
 
@@ -942,7 +1048,8 @@ mod tests {
                 source: "source".into(),
             },
         );
-        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &gpu, |_| {
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &gpu, expected, |_| {
             Ok((vec![0; 4], DType::F32))
         })
         .unwrap();
@@ -966,9 +1073,12 @@ mod tests {
         };
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
         let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| Ok((vec![0; 4], DType::F32)))
-                .unwrap();
+            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, expected, |_| {
+                Ok((vec![0; 4], DType::F32))
+            })
+            .unwrap();
         assert_eq!(transaction.len(), 1);
         assert!(matches!(
             transaction.get("resident", None, 0),
@@ -1009,9 +1119,12 @@ mod tests {
         RESIDENT_RELEASES.with(|count| count.set(0));
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
+        let admitted = WeightOrigin::for_single(&mesh, &gpu);
         let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, |_| Ok((vec![0; 4], DType::F32)))
-                .unwrap();
+            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, admitted, |_| {
+                Ok((vec![0; 4], DType::F32))
+            })
+            .unwrap();
         let expected = WeightOrigin::from_parts(mesh.epoch(), 1, gpu.device_id);
         let error = transaction.validate_origin_value(expected).unwrap_err();
         assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
@@ -1071,7 +1184,8 @@ mod tests {
             WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
         ];
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1112,7 +1226,8 @@ mod tests {
                 ShardPolicy::Replicate,
             ),
         ];
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1140,7 +1255,8 @@ mod tests {
             WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
         ];
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, |entry| {
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1151,5 +1267,32 @@ mod tests {
         assert_eq!(error.name, "second");
         assert!(error.reason.contains("payload"));
         assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn admitted_origin_mismatch_fails_before_any_upload() {
+        let Ok(gpu) = Gpu::init() else {
+            return;
+        };
+        test_support::reset();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let other = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        // A stale admitted identity (different mesh epoch) must fail before
+        // the first source read or upload: nothing is allocated, so there is
+        // nothing to roll back.
+        let stale = WeightOrigin::from_parts(other.epoch(), 0, gpu.device_id);
+        let entries = vec![
+            WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
+            WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
+        ];
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, stale, |_| {
+            panic!("source must not run after an admitted-identity mismatch")
+        })
+        .unwrap_err();
+        assert_eq!(error.name, "<origin>");
+        assert!(error.reason.contains("refusing before upload"));
+        assert_eq!(test_support::resident_allocations(), 0);
+        assert_eq!(test_support::resident_releases(), 0);
+        test_support::reset();
     }
 }

@@ -20,9 +20,9 @@ use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::weight_manifest::{
-    DTypeConstraint, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+    DTypeConstraint, FusedQkvLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry, StateKind,
+    WeightEntry,
 };
-use rdna_compute::{DType, Gpu};
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -245,13 +245,16 @@ impl Llama {
                 ));
             }
         }
-        manifest.push(WeightEntry::model_with_dtype_constraint(
-            "output_norm",
-            vec![dim],
-            DType::F32,
-            norm,
-            Replicate,
-        ));
+        manifest.push(
+            WeightEntry::model_with_dtype_constraint(
+                "output_norm",
+                vec![dim],
+                DType::F32,
+                norm,
+                Replicate,
+            )
+            .with_placement(PlacementHint::Pin(PinTarget::Output)),
+        );
         manifest.push(WeightEntry::model_with_dtype_constraint(
             "lm_head",
             vec![cfg.vocab_size, dim],
@@ -286,6 +289,10 @@ impl Llama {
             output.policy = ShardPolicy::Tied {
                 source: "token_embd".into(),
             };
+            // Replacing the `Pin(Output)` policy with `Tied` must not move the
+            // head to stage 0: keep the explicit final-stage placement hint so
+            // the exported plan stays correct on PP meshes (Single pilot: [0]).
+            output.placement = PlacementHint::Pin(PinTarget::Output);
         }
         manifest
     }

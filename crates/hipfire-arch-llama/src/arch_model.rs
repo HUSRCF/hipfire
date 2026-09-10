@@ -49,6 +49,10 @@ impl ArchModel for LlamaBundle {
             dspark_assets: _,
         } = *self;
         // Mirror the existing unload ordering: scratch → store/weights → kv.
+        // Single-owner truth: LlamaWeights owns every weight allocation and
+        // frees it here; the attached store retains only validated
+        // projection/alias provenance plus scratch/KV descriptors, so its
+        // drain releases zero residents and frees nothing twice.
         scratch.free_gpu(gpu);
         if let Some(store) = weight_store {
             // Attachment already checked the complete origin and created this

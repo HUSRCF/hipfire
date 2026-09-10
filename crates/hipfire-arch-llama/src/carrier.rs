@@ -36,7 +36,12 @@ pub struct LlamaBundle {
     pub manifest_plan: ManifestPlan,
     /// A pilot store is attached only after its handles are assembled under
     /// this bundle. It is crate-visible so callers cannot create an independent
-    /// unload owner; `ArchModel::free_gpu` is the sole release path.
+    /// unload owner; `ArchModel::free_gpu` is the sole release path. The
+    /// attached store owns no allocation: resident weights belong to
+    /// [`LlamaWeights`], scratch and KV stay bundle fields. It retains the
+    /// validated projection/alias provenance plus value-only descriptors of
+    /// the bundle-owned scratch/KV attachments — provenance, not ownership,
+    /// and never manifest fulfillment entries.
     pub(crate) weight_store: Option<AttachedWeightStore>,
     /// Exact target identity captured before publication. The attached store
     /// binds this identity into its private drain capability, so teardown
@@ -62,23 +67,79 @@ pub struct LlamaBundle {
 /// The runtime transaction stays public only long enough for the load carrier
 /// to assemble or roll it back. Once wrapped here, the only consuming path is
 /// the crate's [`hipfire_runtime::arch_model::ArchModel::free_gpu`] implementation.
+///
+/// Single-owner truth: [`LlamaWeights`] owns every weight allocation and
+/// frees it; scratch and KV are freed from the bundle fields in the existing
+/// order. This wrapper retains the validated projection/alias provenance and
+/// the scratch/KV attachment descriptors for post-publication description.
+/// It frees nothing twice: assembly took every handle, so drain-time rollback
+/// releases zero residents and the retained census drops without GPU work.
 pub(crate) struct AttachedWeightStore {
     transaction: WeightLoadTransaction,
+    attachments: AttachmentDescriptors,
+}
+
+/// Value-only descriptors of the bundle-owned scratch/KV attachments,
+/// captured when the manifest transaction attaches. No handles move here and
+/// nothing here is freed: scratch and KV were never manifest fulfillment
+/// entries and stay owned (and torn down) by the bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttachmentDescriptors {
+    /// Owned scratch output width (logits shape) at attach.
+    pub scratch_logits_shape: Vec<usize>,
+    /// Owned KV geometry at attach.
+    pub kv_dim: usize,
+    pub kv_max_seq: usize,
+    pub kv_physical_cap: usize,
+    pub kv_n_kv_heads: usize,
+    pub kv_head_dim: usize,
+    pub kv_n_layers: usize,
+}
+
+impl AttachmentDescriptors {
+    fn capture(scratch: &ForwardScratch, kv: &KvCache) -> Self {
+        Self {
+            scratch_logits_shape: scratch.logits.shape.clone(),
+            kv_dim: kv.kv_dim,
+            kv_max_seq: kv.max_seq,
+            kv_physical_cap: kv.physical_cap,
+            kv_n_kv_heads: kv.n_kv_heads,
+            kv_head_dim: kv.head_dim,
+            kv_n_layers: kv.k_gpu.len(),
+        }
+    }
 }
 
 impl AttachedWeightStore {
     fn from_transaction(
         transaction: WeightLoadTransaction,
         expected: WeightOrigin,
+        attachments: AttachmentDescriptors,
     ) -> Result<Self, (WeightLoadTransaction, WeightStoreError)> {
         if let Err(error) = transaction.validate_origin_value(expected) {
             return Err((transaction, error));
         }
-        Ok(Self { transaction })
+        Ok(Self {
+            transaction,
+            attachments,
+        })
     }
 
+    /// Consume the attached owner at unload. Assembly took every handle for
+    /// the typed weights, so rollback releases zero residents; the retained
+    /// provenance and attachment descriptors drop with the owner.
     pub(crate) fn drain(self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<()> {
         self.transaction.rollback(gpu)
+    }
+
+    /// Tied-source edge retained in provenance. Owns nothing.
+    pub(crate) fn alias_source(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<&str> {
+        self.transaction.alias_source(name, layer, device)
     }
 }
 
@@ -562,11 +623,15 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 }
                 HfqLoadRoute::ManifestPlainLlama => {
                     let manifest = Llama::weight_manifest_for_hfq(&config, has_separate_lm_head);
+                    // `weight_origin` was admitted with the plan above; binding
+                    // it here fails before the first upload when the runtime
+                    // mesh/GPU disagree with the plan identity.
                     let mut transaction = hipfire_runtime::weight_store::fulfill_manifest(
                         &manifest,
                         &mesh,
                         config.n_layers,
                         ctx.gpu,
+                        weight_origin,
                         |entry| hfq_source(&hfq, entry),
                     )
                     .map_err(|e| format!("llama: {e}"))?;
@@ -729,10 +794,15 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
 /// Alias matching the `load_<arch>_bundle` naming convention in the task.
 pub use load_bundle as load_llama_bundle;
 
-impl LlamaBundle {
     /// Attach an unpublished load transaction after validating the complete
     /// target identity. The resulting owner is crate-private and can only be
     /// consumed by `ArchModel::free_gpu`.
+    ///
+    /// The attached owner retains the transaction's validated
+    /// projection/alias provenance plus value-only descriptors of the
+    /// bundle-owned scratch/KV attachments. It owns no allocation: weights
+    /// belong to [`LlamaWeights`], scratch and KV stay bundle fields in the
+    /// existing teardown order.
     fn attach_weight_store(
         &mut self,
         transaction: WeightLoadTransaction,
@@ -740,8 +810,12 @@ impl LlamaBundle {
         if self.weight_store.is_some() {
             return Err((transaction, "llama: weight store already attached".into()));
         }
-        let attached = match AttachedWeightStore::from_transaction(transaction, self.weight_origin)
-        {
+        let attachments = AttachmentDescriptors::capture(&self.scratch, &self.kv);
+        let attached = match AttachedWeightStore::from_transaction(
+            transaction,
+            self.weight_origin,
+            attachments,
+        ) {
             Ok(attached) => attached,
             Err((transaction, error)) => {
                 return Err((
@@ -930,6 +1004,82 @@ mod tests {
         (path, hfq)
     }
 
+    /// Synthetic AWQ fixture on a *supported* quantized path: the q_proj trunk
+    /// is MQ4G256 (quant_type 13, in `DType::supports_awq_sidecar`) with the
+    /// same 1D-F16 length-K sidecar a real quantizer emits. The legacy loader
+    /// uploads MQ4 verbatim and attaches the sidecar; an F16 trunk would be
+    /// host-widened to F32, which is outside the allow-list, so the sidecar
+    /// would attach to nothing and the test would prove no AWQ math path.
+    ///
+    /// Valid kernel geometry: K = 256 satisfies the FWHT rotation
+    /// granularity the AWQ input-rotate path assumes; the pre-fix K = 32
+    /// fixture scale does not. Trunk payload bytes are zeros and the sidecar
+    /// is unit F16, so the AWQ divide (`x / 1.0`) is numerically neutral:
+    /// with and without the sidecar, forward must produce identical finite
+    /// logits. Full pre-scaled-weight AWQ numerics still need a genuine
+    /// quantizer-produced artifact plus GPU execution evidence.
+    fn fixture_awq_mq4_hfq(with_sidecar: bool) -> (PathBuf, HfqFile) {
+        const K: usize = 256;
+        let mut tensors = vec![
+            f32_hfq_tensor("model.embed_tokens.weight", &[2, 256], false),
+            f32_hfq_tensor("model.norm.weight", &[256], false),
+            hfq_tensor(
+                "model.layers.0.self_attn.q_proj.weight",
+                &[256, 256],
+                13,
+                K * K / 2,
+            ),
+            f16_hfq_tensor("model.layers.0.self_attn.k_proj.weight", &[256, 256]),
+            f16_hfq_tensor("model.layers.0.self_attn.v_proj.weight", &[256, 256]),
+            f16_hfq_tensor("model.layers.0.self_attn.o_proj.weight", &[256, 256]),
+            f16_hfq_tensor("model.layers.0.mlp.gate_proj.weight", &[256, 256]),
+            f16_hfq_tensor("model.layers.0.mlp.up_proj.weight", &[256, 256]),
+            f16_hfq_tensor("model.layers.0.mlp.down_proj.weight", &[256, 256]),
+            f32_hfq_tensor("model.layers.0.input_layernorm.weight", &[256], false),
+            f32_hfq_tensor(
+                "model.layers.0.post_attention_layernorm.weight",
+                &[256],
+                false,
+            ),
+        ];
+        if with_sidecar {
+            tensors.push(HfqMemTensor {
+                name: "model.layers.0.self_attn.q_proj.awq_scale.weight".into(),
+                quant_type: 1,
+                shape: vec![K as u32],
+                group_size: 0,
+                // Unit scales: F16 1.0. The AWQ divide is exactly neutral,
+                // so any deviation from the sidecar-free forward is a bug.
+                data: (0..K).flat_map(|_| 0x3c00u16.to_le_bytes()).collect(),
+            });
+        }
+        tensors.push(f32_hfq_tensor("lm_head.weight", &[2, 256], false));
+        let metadata = r#"{
+            "config": {
+                "model_type": "llama",
+                "hidden_size": 256,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "intermediate_size": 256,
+                "vocab_size": 2,
+                "head_dim": 256,
+                "rms_norm_eps": 0.00001,
+                "max_position_embeddings": 32,
+                "rope_theta": 10000.0
+            }
+        }"#;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("hipfire-g3-awq-{}-{nonce}.hfq", std::process::id()));
+        write_hfqm_package_mem(&path, 0, metadata, &tensors).expect("write AWQ fixture");
+        let hfq = HfqFile::open(&path).expect("open AWQ fixture");
+        (path, hfq)
+    }
+
     fn load_ctx<'a>(
         path: &'a Path,
         gpu: &'a mut rdna_compute::Gpu,
@@ -1000,6 +1150,36 @@ mod tests {
         assert!(manifest[1].dtype_constraint.accepts(DType::MQ4G256));
         assert!(manifest[9].dtype_constraint.accepts(DType::F32));
         assert!(!manifest[9].dtype_constraint.accepts(DType::F16));
+    }
+
+    /// Exported-manifest output placement on a PP mesh: the final norm and
+    /// both the separate and tied language head must resolve to the final
+    /// pipeline stage, while the embedding stays on stage zero. The Single
+    /// production pilot maps every stage to device 0 and cannot see this.
+    fn output_tensors_pin_to_final_pipeline_stage() {
+        use hipfire_runtime::device_mesh::DimKind;
+        use hipfire_runtime::weight_manifest::{placement_devices, PinTarget, PlacementHint};
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)])
+            .expect("two-stage pipeline mesh construction cannot overflow");
+        let manifest = Llama::weight_manifest(&config());
+        let devices = |name: &str| {
+            let entry = manifest
+                .iter()
+                .find(|entry| entry.name == name && entry.layer.is_none())
+                .expect("model-scope entry exists");
+            placement_devices(entry, &mesh, config().n_layers)
+        };
+        assert_eq!(devices("token_embd"), vec![0]);
+        assert_eq!(devices("output_norm"), vec![1]);
+        assert_eq!(devices("lm_head"), vec![1]);
+        let tied = Llama::weight_manifest_for_hfq(&config(), false);
+        let head = tied.last().expect("manifest has lm_head");
+        assert_eq!(head.placement, PlacementHint::Pin(PinTarget::Output));
+        assert_eq!(
+            placement_devices(head, &mesh, config().n_layers),
+            vec![1],
+            "tying lm_head must not move it to stage 0"
+        );
     }
 
     #[test]
@@ -1084,7 +1264,20 @@ mod tests {
             bundle.weights.output.buf.buf.as_ptr(),
             bundle.weights.token_embd.buf.as_ptr()
         );
-        assert!(bundle.weight_store.is_some());
+        // Attached provenance: the tied alias edge survives assembly, and the
+        // descriptors match the bundle-owned KV/scratch they describe. The
+        // store owns no allocation; these records are descriptive only.
+        let attached = bundle.weight_store.as_ref().expect("attached store");
+        assert_eq!(
+            attached.alias_source("lm_head", None, 0),
+            Some("token_embd")
+        );
+        assert_eq!(attached.attachments().kv_n_kv_heads, bundle.kv.n_kv_heads);
+        assert_eq!(attached.attachments().kv_max_seq, bundle.kv.max_seq);
+        assert_eq!(
+            attached.attachments().scratch_logits_shape,
+            bundle.scratch.logits.shape
+        );
         Box::new(bundle).free_gpu(&mut gpu);
         std::fs::remove_file(path).expect("remove HFQ fixture");
     }
@@ -1279,9 +1472,11 @@ mod tests {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.hipfire/models/qwen3-0.6b-llama.mq4")
         });
-        // Fixture lock: the tracker artifact identity. A substituted file of
-        // the wrong size cannot pass; route classification below additionally
-        // refuses non-plain / mis-tagged artifacts.
+        // Fixture lock: the tracker artifact identity, verified by content
+        // hash. Size alone cannot detect a same-length substitution, and the
+        // printed digest below is the freshly computed file hash, never a
+        // hardcoded string. Route classification below additionally refuses
+        // non-plain / mis-tagged artifacts.
         const PINNED_SIZE: u64 = 495_181_824;
         const PINNED_MD5: &str = "2579e10ba3a988818386f2b07632ee01";
         let Ok(meta) = std::fs::metadata(&fixture) else {
@@ -1293,16 +1488,18 @@ mod tests {
             PINNED_SIZE,
             "g3-oracle: fixture size mismatch — not the pinned qwen3:0.6b artifact (md5 {PINNED_MD5})"
         );
+        let actual_md5 = fixture_md5_hex(&fixture).expect("hash pinned fixture");
+        assert_eq!(
+            actual_md5, PINNED_MD5,
+            "g3-oracle: fixture content mismatch — not the pinned qwen3:0.6b artifact"
+        );
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             eprintln!("g3-oracle: no GPU; skipping");
             return;
         };
         let prompt = "The capital of France is located in";
         let max_seq = 64usize;
-        eprintln!(
-            "g3-oracle: fixture={fixture} size={} md5={PINNED_MD5}",
-            meta.len()
-        );
+        eprintln!("g3-oracle: fixture={fixture} size={} md5={actual_md5}", meta.len());
         eprintln!("g3-oracle: prompt={prompt:?} (prompt md5 recorded by the evidence run)");
 
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
@@ -1640,19 +1837,45 @@ mod tests {
         );
     }
 
-    /// AWQ-sidecar HFQ retains the legacy loader end to end on GPU: the
-    /// source is classified `LegacyAwq`, no manifest store is attached, and
-    /// decode works through the same weights path the manifest route replaces.
+    /// AWQ-sidecar HFQ on a supported quantized trunk retains the legacy
+    /// loader end to end on GPU: the source is classified `LegacyAwq`, no
+    /// manifest store is attached, the MQ4G256 q_proj keeps its quantized
+    /// dtype (not widened), and its AWQ scale sidecar is attached through the
+    /// `DType::supports_awq_sidecar` gate. Forward executes the AWQ input
+    /// path at valid K geometry and produces finite logits identical to the
+    /// sidecar-free trunk (unit scales are exactly neutral), proving the
+    /// sidecar path runs without perturbing numerics. Unload via the sole
+    /// consuming owner followed by an immediate reload re-attaches the
+    /// sidecar with identical numerics.
     #[test]
     fn production_awq_sidecar_loads_and_decodes_on_gpu_through_legacy_route() {
+        fn forward_logits(
+            gpu: &mut rdna_compute::Gpu,
+            bundle: &mut LlamaBundle,
+        ) -> Vec<f32> {
+            forward_scratch_embed(gpu, &bundle.weights, &bundle.config, 0, 0, &bundle.scratch)
+                .expect("AWQ embed");
+            forward_scratch_compute(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                0,
+                &mut bundle.kv,
+                &bundle.scratch,
+            )
+            .expect("AWQ compute");
+            gpu.download_f32(&bundle.scratch.logits)
+                .expect("AWQ logits")
+        }
         let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(true, false, false, false);
+        let (path, hfq) = fixture_awq_mq4_hfq(true);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
+        assert!(hfq.has_awq_sidecars());
         let cask = CaskConfig::default();
         let mut ctx = load_ctx(&path, &mut gpu, &cask);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy GPU load");
@@ -1661,30 +1884,49 @@ mod tests {
             bundle.weight_store.is_none(),
             "AWQ-sidecar sources must not attach a manifest store"
         );
-        forward_scratch_embed(
-            &mut gpu,
-            &bundle.weights,
-            &bundle.config,
-            0,
-            0,
-            &bundle.scratch,
-        )
-        .expect("AWQ legacy embed");
-        forward_scratch_compute(
-            &mut gpu,
-            &bundle.weights,
-            &bundle.config,
-            0,
-            &mut bundle.kv,
-            &bundle.scratch,
-        )
-        .expect("AWQ legacy compute");
-        let logits = gpu
-            .download_f32(&bundle.scratch.logits)
-            .expect("AWQ legacy logits");
-        assert_eq!(logits.len(), 2, "fixture vocab width");
+        assert_eq!(
+            bundle.weights.layers[0].wq.gpu_dtype,
+            DType::MQ4G256,
+            "supported AWQ trunk must keep its quantized dtype, not widen"
+        );
+        assert!(
+            bundle.weights.layers[0].wq.awq_scale.is_some(),
+            "AWQ scale sidecar must attach on the supported dtype path"
+        );
+        let awq_logits = forward_logits(&mut gpu, &mut bundle);
+        assert_eq!(awq_logits.len(), 2, "fixture vocab width");
+        assert!(
+            awq_logits.iter().all(|value| value.is_finite()),
+            "AWQ forward must produce finite logits, got {awq_logits:?}"
+        );
+        Box::new(bundle).free_gpu(&mut gpu);
+        // Same trunk without the sidecar: unit scales are exactly neutral,
+        // so the AWQ input path must produce bitwise-identical logits.
+        let (plain_path, plain_hfq) = fixture_awq_mq4_hfq(false);
+        assert_eq!(classify_hfq_route(&plain_hfq), HfqLoadRoute::ManifestPlainLlama);
+        let mut ctx = load_ctx(&plain_path, &mut gpu, &cask);
+        let mut plain = load_bundle(ModelSource::Hfq(plain_hfq), &mut ctx).expect("plain MQ4 load");
+        drop(ctx);
+        let plain_logits = forward_logits(&mut gpu, &mut plain);
+        assert_eq!(
+            awq_logits, plain_logits,
+            "unit-scale AWQ sidecar must leave forward numerics unchanged"
+        );
+        Box::new(plain).free_gpu(&mut gpu);
+        // Immediate reload of the sidecar file re-attaches the scale with
+        // identical numerics: unload released the scale-carrying weight
+        // exactly once with no manifest store involved.
+        let hfq = HfqFile::open(&path).expect("reopen AWQ fixture");
+        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy reload");
+        drop(ctx);
+        assert_eq!(bundle.weights.layers[0].wq.gpu_dtype, DType::MQ4G256);
+        assert!(bundle.weights.layers[0].wq.awq_scale.is_some());
+        let reload_logits = forward_logits(&mut gpu, &mut bundle);
+        assert_eq!(reload_logits, awq_logits, "AWQ reload decode parity");
         Box::new(bundle).free_gpu(&mut gpu);
         std::fs::remove_file(path).expect("remove AWQ fixture");
+        std::fs::remove_file(plain_path).expect("remove plain MQ4 fixture");
     }
 
     /// Repeated production load/unload cycles on the pinned fixture must not
@@ -1829,6 +2071,25 @@ mod tests {
         eprintln!("g3-legacy-vram: PASS — legacy-route cycles within the same VRAM floor");
     }
 
+    /// Stream a file's actual MD5 without a whole-file allocation. The G3
+    /// tracker identity is an MD5, so the fixture lock must hash content:
+    /// size alone cannot detect a same-length substitution and printing a
+    /// hardcoded digest proves nothing.
+    fn fixture_md5_hex(path: &str) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut context = md5::Context::new();
+        let mut chunk = vec![0u8; 8 << 20];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            context.consume(&chunk[..read]);
+        }
+        Ok(format!("{:x}", context.compute()))
+    }
+
     fn pinned_fixture_path() -> Option<String> {
         let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1844,6 +2105,11 @@ mod tests {
             meta.len(),
             PINNED_SIZE,
             "fixture size mismatch — not the pinned qwen3:0.6b artifact (md5 {PINNED_MD5})"
+        );
+        let actual = fixture_md5_hex(&fixture).expect("hash pinned fixture");
+        assert_eq!(
+            actual, PINNED_MD5,
+            "fixture content mismatch — not the pinned qwen3:0.6b artifact"
         );
         Some(fixture)
     }
