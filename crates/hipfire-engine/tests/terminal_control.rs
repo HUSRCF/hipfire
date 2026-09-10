@@ -308,6 +308,30 @@ fn singleton_generation_reuse_rejects_old_writer() {
 }
 
 #[test]
+fn singleton_delayed_writer_stays_inert_across_multiple_lifecycles() {
+    let _lock = begin_test();
+    assert!(!claim_terminal("inactive", 99));
+
+    activate_terminal_control("delayed", 17);
+    let first = terminal_generation("delayed", 17).expect("first generation");
+    clear_terminal_control();
+
+    activate_terminal_control("other", 18);
+    let second = terminal_generation("other", 18).expect("second generation");
+    assert_ne!(first, second);
+    assert!(!claim_terminal("delayed", 17));
+    assert!(!claim_terminal_at_generation("delayed", 17, first));
+    clear_terminal_control();
+
+    activate_terminal_control("delayed", 17);
+    let third = terminal_generation("delayed", 17).expect("third generation");
+    assert_ne!(first, third);
+    assert!(!claim_terminal_at_generation("delayed", 17, first));
+    assert!(claim_terminal_at_generation("delayed", 17, third));
+    reset();
+}
+
+#[test]
 fn active_done_error_race_has_one_wire_terminal() {
     let _lock = begin_test();
     activate_terminal_control("semantic-race", 88);

@@ -46,19 +46,12 @@ pub struct ActiveTerminalControl {
     pub terminal_claimed: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct RetiredTerminalControl {
-    pub id: String,
-    pub attempt_id: u64,
-    pub generation: u64,
-}
+
+// State intentionally carries no retired singleton key: a cleared lifecycle
+// must fail closed until an explicit activation establishes a new owner.
 
 pub struct TerminalControlState {
     pub active: Option<ActiveTerminalControl>,
-    /// The singleton has one active request, so one bounded tombstone is
-    /// enough to reject every late writer for the just-cleared generation.
-    /// A new activation supersedes it without retaining request history.
-    pub retired: Option<RetiredTerminalControl>,
     pub next_generation: u64,
 }
 
@@ -66,7 +59,6 @@ impl TerminalControlState {
     pub const fn new() -> Self {
         Self {
             active: None,
-            retired: None,
             next_generation: 0,
         }
     }
@@ -107,20 +99,14 @@ pub fn activate_terminal_control(id: &str, attempt_id: u64) {
 }
 
 /// Clear the active terminal-control transaction (request end / guard drop).
-/// The one-entry tombstone rejects late writers until the next lifecycle
-/// activation. A redundant clear is treated as a test/process reset.
+///
+/// Clearing is fail-closed: a writer may not infer ownership from a nonzero
+/// attempt after the lifecycle ends. Callers must explicitly activate the
+/// next transaction before any correlated terminal can be emitted.
 pub fn clear_terminal_control() {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    if let Some(active) = g.active.take() {
-        g.retired = Some(RetiredTerminalControl {
-            id: active.id,
-            attempt_id: active.attempt_id,
-            generation: active.generation,
-        });
-    } else {
-        g.retired = None;
-    }
+    g.active = None;
     cell.cv.notify_all();
 }
 
@@ -157,35 +143,26 @@ pub fn claim_terminal_at_generation(id: &str, attempt_id: u64, generation: u64) 
 
 /// Claim the sole terminal slot for the current request key.
 ///
-/// Unknown/mismatched active attempts and all attempt-zero writers fail
-/// closed. Before the first lifecycle activation, a nonzero attempt may still
-/// be emitted by unit-level producer helpers; once a request has been cleared,
-/// the bounded tombstone rejects late writers until a fresh activation.
+/// Unknown/mismatched active attempts, inactive lifecycles, and all
+/// attempt-zero writers fail closed. Pre-admission failures must use
+/// `emit_uncorrelated_error` instead of claiming a singleton lifecycle that
+/// has not been activated.
 pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
     if attempt_id == 0 {
         return false;
     }
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    if let Some(active) = g.active.as_mut() {
-        if active.id != id || active.attempt_id != attempt_id {
-            return false;
-        }
-        if active.terminal_claimed {
-            return false;
-        }
-        active.terminal_claimed = true;
-        return true;
-    }
-    if g.retired
-        .as_ref()
-        .is_some_and(|retired| retired.id == id && retired.attempt_id == attempt_id)
-    {
+    let Some(active) = g.active.as_mut() else {
+        return false;
+    };
+    if active.id != id || active.attempt_id != attempt_id {
         return false;
     }
-    // The daemon's first pre-admission producer helpers can run before the
-    // singleton is activated. They are still correlated by a nonzero attempt;
-    // attempt zero is reserved for emit_uncorrelated_error.
+    if active.terminal_claimed {
+        return false;
+    }
+    active.terminal_claimed = true;
     true
 }
 
