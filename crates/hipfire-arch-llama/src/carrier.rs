@@ -2010,7 +2010,6 @@ mod tests {
             return;
         };
         const SLACK: usize = 256 * 1024 * 1024;
-        const PER_CYCLE_ALLOWANCE: usize = 1024 * 1024 * 1024;
         let prompt = "The capital of France is located in";
         let max_seq = 64usize;
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
@@ -2061,20 +2060,28 @@ mod tests {
                 "g3-cycles: cycle {cycle} — published {delta} residents, free VRAM {free_before} -> {free_after}"
             );
             // Cycle 0 pays one-time context cost (kernel modules, stream and
-            // driver-side arena growth); later cycles must stay within the
-            // bounded floor of the stabilized post-cycle-0 level.
+            // driver-side arena growth); cycle 1 sets the post-warmup
+            // plateau level. Later cycles must hold that plateau within a
+            // small slack: post-teardown free VRAM that keeps declining per
+            // cycle is a leak, not pooling — pooling plateaus. (On current
+            // gfx1201 numbers this trips ~470MB/cycle; the legacy-route
+            // control receipt decides pool vs code: equal slope on the
+            // manifest-free legacy path exonerates these owners, whose
+            // teardown audit frees every buffer exactly once.)
             if cycle == 0 {
+                stabilized_free = free_after;
+            } else if cycle == 1 {
                 stabilized_free = free_after;
             } else {
                 assert!(
-                    free_after + SLACK + (cycle as usize) * PER_CYCLE_ALLOWANCE >= stabilized_free,
-                    "cycle {cycle} exceeded VRAM floor: {stabilized_free} -> {free_after}"
+                    free_after + SLACK >= stabilized_free,
+                    "cycle {cycle} broke post-warmup VRAM plateau: {stabilized_free} -> {free_after}"
                 );
             }
         }
         assert!(baseline_tokens.is_some());
         eprintln!(
-            "g3-cycles: PASS — 4 load/unload cycles, per-cycle baseline {published} residents, decode identical, VRAM within floor"
+            "g3-cycles: PASS — 4 load/unload cycles, per-cycle baseline {published} residents, decode identical, post-warmup VRAM plateau held"
         );
     }
 
