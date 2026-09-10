@@ -46,6 +46,21 @@ pub enum DeepseekV4HeterogeneousFault {
     AfterState,
     AfterScratch,
 }
+/// Deterministic DSpark failure points used to certify sidecar rollback.
+/// This is a typed test seam, never an environment-controlled product mode.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepseekV4DsparkFault {
+    /// Fail after one complete stage has been admitted to staging.
+    AfterLayer(usize),
+    /// Fail after the final stage's HC helper tensors and scalar are staged.
+    AfterHeadHelper,
+    /// Fail after the first global owner is staged.
+    AfterMainProj,
+    /// Fail after all optional and mandatory DSpark globals are staged.
+    AfterGlobal,
+}
+
 
 /// Load-scoped owner for partially populated DS4 weights. `GpuTensor` is an
 /// explicit resource handle rather than a `Drop` type, so every early `?`
@@ -146,6 +161,72 @@ impl Drop for DeepseekV4WeightStaging {
             if let Some(dense) = dense {
                 dense.free_gpu(dense_gpu);
             }
+        }
+    }
+}
+/// Load-scoped owner for a DSpark sidecar. Every successfully uploaded layer
+/// and global remains in this staging object until publication, so a late
+/// sidecar error can reclaim the exact set of owners through the same
+/// `DeepseekV4LayerWeights::free_gpu` path used by normal unload.
+struct DsparkLoadStaging {
+    cfg: DsparkConfig,
+    stages: Vec<DeepseekV4LayerWeights>,
+    main_proj: Option<rdna_compute::GpuTensor>,
+    main_norm: Option<rdna_compute::GpuTensor>,
+    markov_w1: Option<rdna_compute::GpuTensor>,
+    markov_w2: Option<rdna_compute::GpuTensor>,
+    confidence_proj: Option<rdna_compute::GpuTensor>,
+    draft_head: Option<rdna_compute::GpuTensor>,
+}
+
+impl DsparkLoadStaging {
+    fn new(cfg: DsparkConfig, n_stages: usize) -> Self {
+        Self {
+            cfg,
+            stages: Vec::with_capacity(n_stages),
+            main_proj: None,
+            main_norm: None,
+            markov_w1: None,
+            markov_w2: None,
+            confidence_proj: None,
+            draft_head: None,
+        }
+    }
+
+    fn free_opt(gpu: &mut Gpu, owner: &mut Option<rdna_compute::GpuTensor>) {
+        if let Some(tensor) = owner.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+
+    fn rollback(mut self, gpu: &mut Gpu) {
+        // Match DsparkWeights::free_gpu: globals first, then every layer,
+        // including a layer whose dense or routed upload failed mid-stage.
+        Self::free_opt(gpu, &mut self.main_proj);
+        Self::free_opt(gpu, &mut self.main_norm);
+        Self::free_opt(gpu, &mut self.markov_w1);
+        Self::free_opt(gpu, &mut self.markov_w2);
+        Self::free_opt(gpu, &mut self.confidence_proj);
+        Self::free_opt(gpu, &mut self.draft_head);
+        for stage in self.stages.drain(..) {
+            stage.free_gpu(gpu);
+        }
+    }
+
+    fn publish(&mut self) -> DsparkWeights {
+        DsparkWeights {
+            cfg: self.cfg.clone(),
+            stages: std::mem::take(&mut self.stages),
+            main_proj: Some(self.main_proj.take().expect("DSpark main_proj not staged")),
+            main_norm: Some(self.main_norm.take().expect("DSpark main_norm not staged")),
+            markov_w1: Some(self.markov_w1.take().expect("DSpark markov_w1 not staged")),
+            markov_w2: Some(self.markov_w2.take().expect("DSpark markov_w2 not staged")),
+            confidence_proj: Some(
+                self.confidence_proj
+                    .take()
+                    .expect("DSpark confidence_proj not staged"),
+            ),
+            draft_head: self.draft_head.take(),
         }
     }
 }
@@ -513,14 +594,16 @@ impl DeepseekV4 {
         debug_assert_eq!(w2_blob.len(), w2_stride * n_owned);
         debug_assert_eq!(gate_up_blob.len(), combined_stride * n_owned);
 
-        // Preserve the historical allocation order exactly: w2 owner, w2
-        // pointer table, gate_up owner, optional dummy, gate_up pointer table.
         let mut w2_blob_shape = vec![n_owned];
         w2_blob_shape.extend_from_slice(&w2_shape);
         let w2_tensor = gpu
             .upload_raw(&w2_blob, &w2_blob_shape)
             .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
         let w2_base = w2_tensor.buf.as_ptr() as u64;
+        // Attach each allocation before the next fallible operation. The
+        // caller's layer transaction can therefore reclaim a blob if pointer
+        // table allocation or upload fails.
+        layer.expert_w2_blob = Some(w2_tensor);
         let w2_ptrs: Vec<u64> = (0..n_exp)
             .map(|e| {
                 if owns(e) {
@@ -534,17 +617,24 @@ impl DeepseekV4 {
         let w2_ptr_tensor = gpu
             .alloc_tensor(&[2 * n_exp], DType::F32)
             .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
-        gpu.hip
-            .memcpy_htod(&w2_ptr_tensor.buf, &w2_ptr_bytes)
-            .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
-        layer.expert_w2_blob = Some(w2_tensor);
         layer.expert_w2_ptrs = Some(w2_ptr_tensor);
+        gpu.hip
+            .memcpy_htod(
+                &layer
+                    .expert_w2_ptrs
+                    .as_ref()
+                    .expect("w2 pointer table attached before copy")
+                    .buf,
+                &w2_ptr_bytes,
+            )
+            .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
         layer.expert_w2_stride = w2_stride;
 
         let gate_up_tensor = gpu
             .upload_raw(&gate_up_blob, &[n_owned, combined_stride])
             .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
         let gate_up_base = gate_up_tensor.buf.as_ptr() as u64;
+        layer.expert_gate_up_blob = Some(gate_up_tensor);
         let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
             Some(
                 gpu.zeros(&[combined_stride / 4], DType::F32)
@@ -553,7 +643,9 @@ impl DeepseekV4 {
         } else {
             None
         };
-        let dummy_ptr = dummy_gate_up
+        layer.expert_gate_up_dummy = dummy_gate_up;
+        let dummy_ptr = layer
+            .expert_gate_up_dummy
             .as_ref()
             .map(|tensor| tensor.buf.as_ptr() as u64)
             .unwrap_or(gate_up_base);
@@ -573,13 +665,18 @@ impl DeepseekV4 {
         let gate_up_ptr_tensor = gpu
             .alloc_tensor(&[2 * n_exp], DType::F32)
             .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
-        gpu.hip
-            .memcpy_htod(&gate_up_ptr_tensor.buf, &gate_up_ptr_bytes)
-            .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
-        layer.expert_gate_up_blob = Some(gate_up_tensor);
         layer.expert_gate_up_ptrs = Some(gate_up_ptr_tensor);
+        gpu.hip
+            .memcpy_htod(
+                &layer
+                    .expert_gate_up_ptrs
+                    .as_ref()
+                    .expect("gate_up pointer table attached before copy")
+                    .buf,
+                &gate_up_ptr_bytes,
+            )
+            .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
         layer.expert_gate_up_stride = combined_stride;
-        layer.expert_gate_up_dummy = dummy_gate_up;
         Ok(())
     }
 
@@ -672,6 +769,10 @@ impl DeepseekV4 {
                 .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
             drop(blob);
             let base_ptr = blob_tensor.buf.as_ptr() as u64;
+            // Attach each allocation before the next fallible operation. The
+            // caller's layer transaction can therefore reclaim a blob if
+            // pointer-table allocation or the copy fails.
+            layer.expert_w2_blob = Some(blob_tensor);
             // Owned e → compact slot; non-owned e → base (rotate input 0 ⇒
             // output 0 regardless of which down weights are read).
             let ptrs: Vec<u64> = (0..n_exp)
@@ -687,11 +788,17 @@ impl DeepseekV4 {
             let ptr_tensor = gpu
                 .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
-                .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
-            layer.expert_w2_blob = Some(blob_tensor);
             layer.expert_w2_ptrs = Some(ptr_tensor);
+            gpu.hip
+                .memcpy_htod(
+                    &layer
+                        .expert_w2_ptrs
+                        .as_ref()
+                        .expect("w2 pointer table attached before copy")
+                        .buf,
+                    &ptr_bytes,
+                )
+                .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
             layer.expert_w2_stride = stride;
         }
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
@@ -745,6 +852,7 @@ impl DeepseekV4 {
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
             drop(combined);
             let base_ptr = combined_tensor.buf.as_ptr() as u64;
+            layer.expert_gate_up_blob = Some(combined_tensor);
             // Non-owned gate_up ptr → a shared zeroed dummy (only when actually
             // sharding with some experts non-owned); else the compact base.
             // Owned (not mem::forget-leaked): the zeroed buffer is threaded into
@@ -762,7 +870,9 @@ impl DeepseekV4 {
             } else {
                 None
             };
-            let dummy_gu = dummy_gate_up
+            layer.expert_gate_up_dummy = dummy_gate_up;
+            let dummy_gu = layer
+                .expert_gate_up_dummy
                 .as_ref()
                 .map(|z| z.buf.as_ptr() as u64)
                 .unwrap_or(base_ptr);
@@ -779,15 +889,18 @@ impl DeepseekV4 {
             let ptr_tensor = gpu
                 .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
-                .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
-            layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
+            gpu.hip
+                .memcpy_htod(
+                    &layer
+                        .expert_gate_up_ptrs
+                        .as_ref()
+                        .expect("gate_up pointer table attached before copy")
+                        .buf,
+                    &ptr_bytes,
+                )
+                .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
             layer.expert_gate_up_stride = combined_stride;
-            // Store the owning handle (None on single-GPU / fully-owned shards).
-            // Its device pointer is already baked into `ptr_tensor` above.
-            layer.expert_gate_up_dummy = dummy_gate_up;
         }
         Ok(())
     }
@@ -2640,10 +2753,17 @@ impl DeepseekV4 {
         )?);
         let bias_gpu =
             Self::upload_global_f16_as_f32(source, gpu, &format!("{prefix}.ffn.gate.bias"))?;
-        layer.gate_bias_host = gpu
-            .download_f32(&bias_gpu)
-            .map_err(|e| format!("d2h dspark {prefix} gate_bias: {e:?}"))?;
+        // Publish the GPU owner before the fallible D2H cache fill. A failed
+        // download must still be reclaimed by the enclosing layer transaction.
         layer.gate_bias = Some(bias_gpu);
+        layer.gate_bias_host = gpu
+            .download_f32(
+                &layer
+                    .gate_bias
+                    .as_ref()
+                    .expect("DSpark gate bias attached before download"),
+            )
+            .map_err(|e| format!("d2h dspark {prefix} gate_bias: {e:?}"))?;
 
         // Shared expert.
         layer.shared_w1 = Some(Self::upload_quant_or_f16(
@@ -2677,6 +2797,30 @@ impl DeepseekV4 {
         source: &HfqFile,
         gpu: &mut Gpu,
         cfg: &DeepseekV4Config,
+    ) -> Result<Option<DsparkWeights>, String> {
+        Self::load_dspark_inner(source, gpu, cfg, None)
+    }
+
+    /// Deterministic fault-injection seam for DSpark ownership tests.
+    ///
+    /// The production route always calls [`Self::load_dspark`] without a
+    /// fault. Keeping the seam typed avoids environment-controlled behavior
+    /// and lets fixture tests exercise late layer, helper, and global errors.
+    #[doc(hidden)]
+    pub fn load_dspark_with_fault(
+        source: &HfqFile,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        fault: DeepseekV4DsparkFault,
+    ) -> Result<Option<DsparkWeights>, String> {
+        Self::load_dspark_inner(source, gpu, cfg, Some(fault))
+    }
+
+    fn load_dspark_inner(
+        source: &HfqFile,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        fault: Option<DeepseekV4DsparkFault>,
     ) -> Result<Option<DsparkWeights>, String> {
         let dspark_cfg = match DsparkConfig::from_metadata_json(&source.metadata_json) {
             Some(c) => c,
@@ -2714,104 +2858,132 @@ impl DeepseekV4 {
         eprintln!("deepseek4: DSpark drafter present — uploading {n_stages} stages");
 
         let last = n_stages - 1;
-        let mut stages: Vec<DeepseekV4LayerWeights> = Vec::with_capacity(n_stages);
-        for s in 0..n_stages {
-            let prefix = format!("mtp.{s}");
-            let mut layer = DeepseekV4LayerWeights::new_empty(0);
-            Self::load_dspark_stage_dense(source, gpu, &prefix, &mut layer)?;
-            Self::upload_layer_routed_experts(
+        let mut staging = DsparkLoadStaging::new(dspark_cfg, n_stages);
+        let result = (|| {
+            for s in 0..n_stages {
+                // Admit the empty layer before its first upload. If any dense
+                // or routed helper fails, the partially populated layer is
+                // still owned by the transaction and gets `free_gpu` cleanup.
+                staging
+                    .stages
+                    .push(DeepseekV4LayerWeights::new_empty(0));
+                let stage_idx = staging.stages.len() - 1;
+                let prefix = format!("mtp.{s}");
+                {
+                    let layer = &mut staging.stages[stage_idx];
+                    Self::load_dspark_stage_dense(source, gpu, &prefix, layer)?;
+                    Self::upload_layer_routed_experts(
+                        source,
+                        gpu,
+                        &prefix,
+                        cfg.n_routed_experts,
+                        layer,
+                        None,
+                        None,
+                    )?;
+                    if s == last {
+                        // Last stage carries the head-HC mix + final norm.
+                        layer.mtp_hc_head_fn = Some(Self::upload_global_raw(
+                            source,
+                            gpu,
+                            &format!("{prefix}.hc_head_fn"),
+                        )?);
+                        layer.mtp_hc_head_base = Some(Self::upload_global_raw(
+                            source,
+                            gpu,
+                            &format!("{prefix}.hc_head_base"),
+                        )?);
+                        {
+                            let scale_name = format!("{prefix}.hc_head_scale");
+                            let (info, bytes) = source
+                                .tensor_data_pread(&scale_name)
+                                .ok_or_else(|| format!("deepseek4: {scale_name} missing"))?;
+                            if info.shape != vec![1] {
+                                return Err(format!(
+                                    "deepseek4: {scale_name} unexpected shape {:?}",
+                                    info.shape
+                                ));
+                            }
+                            if bytes.len() < 2 {
+                                return Err(format!(
+                                    "deepseek4: {scale_name} has {} bytes; expected at least 2",
+                                    bytes.len()
+                                ));
+                            }
+                            layer.mtp_hc_head_scale =
+                                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                                    bytes[0], bytes[1],
+                                ]));
+                        }
+                        layer.mtp_final_norm = Some(Self::upload_global_f16_as_f32(
+                            source,
+                            gpu,
+                            &format!("{prefix}.norm.weight"),
+                        )?);
+                        if fault == Some(DeepseekV4DsparkFault::AfterHeadHelper) {
+                            return Err(
+                                "deepseek4: injected DSpark failure after head helper".into()
+                            );
+                        }
+                    }
+                }
+                if fault == Some(DeepseekV4DsparkFault::AfterLayer(s)) {
+                    return Err(format!(
+                        "deepseek4: injected DSpark failure after layer {s}"
+                    ));
+                }
+            }
+
+            // DSpark globals. main_proj/main_norm live on stage 0; the Markov
+            // head + confidence head live on the last stage.
+            staging.main_proj = Some(Self::upload_quant_or_f16(
                 source,
                 gpu,
-                &prefix,
-                cfg.n_routed_experts,
-                &mut layer,
-                None,
-                None,
-            )?;
-            if s == last {
-                // Last stage carries the head-HC mix + final norm.
-                layer.mtp_hc_head_fn = Some(Self::upload_global_raw(
-                    source,
-                    gpu,
-                    &format!("{prefix}.hc_head_fn"),
-                )?);
-                layer.mtp_hc_head_base = Some(Self::upload_global_raw(
-                    source,
-                    gpu,
-                    &format!("{prefix}.hc_head_base"),
-                )?);
-                {
-                    let scale_name = format!("{prefix}.hc_head_scale");
-                    let (info, bytes) = source
-                        .tensor_data_pread(&scale_name)
-                        .ok_or_else(|| format!("deepseek4: {scale_name} missing"))?;
-                    if info.shape != vec![1] {
-                        return Err(format!(
-                            "deepseek4: {scale_name} unexpected shape {:?}",
-                            info.shape
-                        ));
-                    }
-                    layer.mtp_hc_head_scale =
-                        hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                            bytes[0], bytes[1],
-                        ]));
-                }
-                layer.mtp_final_norm = Some(Self::upload_global_f16_as_f32(
-                    source,
-                    gpu,
-                    &format!("{prefix}.norm.weight"),
-                )?);
+                "mtp.0.main_proj.weight",
+            )?);
+            if fault == Some(DeepseekV4DsparkFault::AfterMainProj) {
+                return Err("deepseek4: injected DSpark failure after main_proj".into());
             }
-            stages.push(layer);
+            staging.main_norm = Some(Self::upload_global_f16_as_f32(
+                source,
+                gpu,
+                "mtp.0.main_norm.weight",
+            )?);
+            staging.markov_w1 = Some(Self::upload_quant_or_f16(
+                source,
+                gpu,
+                &format!("mtp.{last}.markov_head.markov_w1.weight"),
+            )?);
+            staging.markov_w2 = Some(Self::upload_quant_or_f16(
+                source,
+                gpu,
+                &format!("mtp.{last}.markov_head.markov_w2.weight"),
+            )?);
+            staging.confidence_proj = Some(Self::upload_quant_or_f16(
+                source,
+                gpu,
+                &format!("mtp.{last}.confidence_head.proj.weight"),
+            )?);
+            staging.draft_head = if source.find_tensor_info("draft_head.weight").is_some() {
+                eprintln!(
+                    "deepseek4: DSpark sidecar draft_head.weight present — \
+                     using it for draft logits only"
+                );
+                Some(Self::upload_quant_or_f16(source, gpu, "draft_head.weight")?)
+            } else {
+                None
+            };
+            if fault == Some(DeepseekV4DsparkFault::AfterGlobal) {
+                return Err("deepseek4: injected DSpark failure after globals".into());
+            }
+
+            Ok(staging.publish())
+        })();
+
+        if result.is_err() {
+            staging.rollback(gpu);
         }
-
-        // DSpark globals. main_proj/main_norm live on stage 0; the Markov
-        // head + confidence head live on the last stage.
-        let main_proj = Some(Self::upload_quant_or_f16(
-            source,
-            gpu,
-            "mtp.0.main_proj.weight",
-        )?);
-        let main_norm = Some(Self::upload_global_f16_as_f32(
-            source,
-            gpu,
-            "mtp.0.main_norm.weight",
-        )?);
-        let markov_w1 = Some(Self::upload_quant_or_f16(
-            source,
-            gpu,
-            &format!("mtp.{last}.markov_head.markov_w1.weight"),
-        )?);
-        let markov_w2 = Some(Self::upload_quant_or_f16(
-            source,
-            gpu,
-            &format!("mtp.{last}.markov_head.markov_w2.weight"),
-        )?);
-        let confidence_proj = Some(Self::upload_quant_or_f16(
-            source,
-            gpu,
-            &format!("mtp.{last}.confidence_head.proj.weight"),
-        )?);
-        let draft_head = if source.find_tensor_info("draft_head.weight").is_some() {
-            eprintln!(
-                "deepseek4: DSpark sidecar draft_head.weight present — \
-                 using it for draft logits only"
-            );
-            Some(Self::upload_quant_or_f16(source, gpu, "draft_head.weight")?)
-        } else {
-            None
-        };
-
-        Ok(Some(DsparkWeights {
-            cfg: dspark_cfg,
-            stages,
-            main_proj,
-            main_norm,
-            markov_w1,
-            markov_w2,
-            confidence_proj,
-            draft_head,
-        }))
+        result.map(Some)
     }
 }
 
