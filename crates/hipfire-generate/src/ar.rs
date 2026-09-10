@@ -1158,11 +1158,9 @@ pub fn generate(
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
             // The loader publishes one of two mutually-exclusive Gemma4 states:
             // eager dense (ModelState::Gemma4) and lowered/MoE
-            // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
-            // lowered load must fail loudly here rather than silently run eager
-            // against lowered weights. Admission now refuses lowered loads
-            // before any device allocation; this arm stays as the fail-closed
-            // net. Message is shared with the admission refusal by construction.
+            // (ModelState::Gemma4Lowered). Lowered models are served by
+            // generate_gemma4_lowered below; eager models continue through
+            // generate_gemma4.
             if m.gemma4_lowered_mut().is_some() {
                 crate::dense::generate_gemma4_lowered(
                     m,

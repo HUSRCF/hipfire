@@ -5961,8 +5961,8 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
 
 // ── Gate + lowered forward ───────────────────────────────────────────────
 
-/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. Default OFF until byte-parity
-/// validated. Escape hatch: `HIPFIRE_FORWARD_LOWERED=1` to opt in.
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. Default ON (byte-parity validated
+/// 2026-06-08); set `HIPFIRE_FORWARD_LOWERED=0` to force the legacy hand path.
 fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
