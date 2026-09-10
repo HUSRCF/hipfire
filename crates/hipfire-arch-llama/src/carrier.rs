@@ -1015,7 +1015,13 @@ mod tests {
     /// 128 B nibbles low-first — decoded as `w = scale * nibble + zero`.
     /// Every weight decodes to `scale * nibble + zero`, so the trunk is an
     /// exact known constant, not an opaque blob.
-    fn mq4g256_const_tensor(name: &str, m: usize, k: usize, scale: f32, nibble: u8) -> HfqMemTensor {
+    fn mq4g256_const_tensor(
+        name: &str,
+        m: usize,
+        k: usize,
+        scale: f32,
+        nibble: u8,
+    ) -> HfqMemTensor {
         assert_eq!(k % 256, 0, "MQ4G256 fixture geometry needs K % 256 == 0");
         assert!(nibble < 16, "one nibble per weight");
         let groups = k / 256;
@@ -1055,7 +1061,10 @@ mod tests {
     /// oracle (`lm_head` has no normalization downstream, so a uniform
     /// 2.0-vs-4.0 pair must forward at an exact 2:1 logit ratio). When
     /// `None`, the head stays F16 (distinct-head loader coverage).
-    fn fixture_awq_mq4_hfq(o_sidecar: Option<u16>, lm_scales: Option<Vec<u16>>) -> (PathBuf, HfqFile) {
+    fn fixture_awq_mq4_hfq(
+        o_sidecar: Option<u16>,
+        lm_scales: Option<Vec<u16>>,
+    ) -> (PathBuf, HfqFile) {
         const K: usize = 256;
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 256], false),
@@ -1559,7 +1568,10 @@ mod tests {
         };
         let prompt = "The capital of France is located in";
         let max_seq = 64usize;
-        eprintln!("g3-oracle: fixture={fixture} size={} md5={actual_md5}", meta.len());
+        eprintln!(
+            "g3-oracle: fixture={fixture} size={} md5={actual_md5}",
+            meta.len()
+        );
         eprintln!("g3-oracle: prompt={prompt:?} (prompt md5 recorded by the evidence run)");
 
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("open pinned fixture");
@@ -1913,10 +1925,7 @@ mod tests {
     /// re-attaches the sidecar with bitwise-identical numerics.
     #[test]
     fn production_awq_sidecar_loads_and_decodes_on_gpu_through_legacy_route() {
-        fn forward_logits(
-            gpu: &mut rdna_compute::Gpu,
-            bundle: &mut LlamaBundle,
-        ) -> Vec<f32> {
+        fn forward_logits(gpu: &mut rdna_compute::Gpu, bundle: &mut LlamaBundle) -> Vec<f32> {
             forward_scratch_embed(gpu, &bundle.weights, &bundle.config, 0, 0, &bundle.scratch)
                 .expect("AWQ embed");
             forward_scratch_compute(

@@ -1080,10 +1080,11 @@ mod tests {
             },
         );
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &mut gpu, expected, |_| {
-            Ok((vec![0; 4], DType::F32))
-        })
-        .unwrap();
+        let transaction =
+            fulfill_manifest_single(&[source, alias], &mesh, 1, &mut gpu, expected, |_| {
+                Ok((vec![0; 4], DType::F32))
+            })
+            .unwrap();
         assert_eq!(
             transaction.projection("alias", None, 0).unwrap().dtype,
             DType::F32
@@ -1105,11 +1106,10 @@ mod tests {
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, expected, |_| {
-                Ok((vec![0; 4], DType::F32))
-            })
-            .unwrap();
+        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, expected, |_| {
+            Ok((vec![0; 4], DType::F32))
+        })
+        .unwrap();
         assert_eq!(transaction.len(), 1);
         assert!(matches!(
             transaction.get("resident", None, 0),
@@ -1151,11 +1151,10 @@ mod tests {
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let admitted = WeightOrigin::for_single(&mesh, &gpu);
-        let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, admitted, |_| {
-                Ok((vec![0; 4], DType::F32))
-            })
-            .unwrap();
+        let transaction = fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, admitted, |_| {
+            Ok((vec![0; 4], DType::F32))
+        })
+        .unwrap();
         let expected = WeightOrigin::from_parts(mesh.epoch(), 1, gpu.device_id);
         let error = transaction.validate_origin_value(expected).unwrap_err();
         assert!(matches!(error, WeightStoreError::OriginMismatch { .. }));
