@@ -4056,12 +4056,22 @@ mod construction_tests {
         };
         let fresh_allocations = gpu.pool_stats().0;
 
-        let err = upload_raw_weight_with_copy(&mut gpu, &[9u8; 64], &[64], failing_copy)
-            .expect_err("injected raw copy failure must surface");
+        let err = match upload_raw_weight_with_copy(&mut gpu, &[9u8; 64], &[64], failing_copy) {
+            Err(error) => error,
+            Ok(tensor) => {
+                gpu.free_tensor(tensor).expect("free");
+                panic!("injected raw copy failure must surface");
+            }
+        };
         assert!(err.to_string().contains("injected"), "unexpected error: {err}");
 
-        let err = upload_f32_weight_with_copy(&mut gpu, &[1.5f32; 16], &[16], failing_copy)
-            .expect_err("injected F32 copy failure must surface");
+        let err = match upload_f32_weight_with_copy(&mut gpu, &[1.5f32; 16], &[16], failing_copy) {
+            Err(error) => error,
+            Ok(tensor) => {
+                gpu.free_tensor(tensor).expect("free");
+                panic!("injected F32 copy failure must surface");
+            }
+        };
         assert!(err.to_string().contains("injected"), "unexpected error: {err}");
 
         // Immediate retry reuses the returned allocations instead of growing
@@ -4133,15 +4143,20 @@ mod construction_tests {
 
         // Injected sidecar copy failure: the error surfaces and the trunk
         // owner is freed with it — no silent scale drop, no stranded owner.
-        let err = attach_awq_scale_with_copy(
+        let err = match attach_awq_scale_with_copy(
             &hfq,
             &mut gpu,
             trunk(&mut gpu, &weight_bytes),
             "w.weight",
             8,
             failing_copy,
-        )
-        .expect_err("injected sidecar copy failure must surface");
+        ) {
+            Err(error) => error,
+            Ok(wt) => {
+                wt.free_all(&mut gpu);
+                panic!("injected sidecar copy failure must surface");
+            }
+        };
         assert!(err.to_string().contains("injected"), "unexpected error: {err}");
 
         // Immediate retry reuses the trunk + sidecar buffers.
