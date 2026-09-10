@@ -2468,26 +2468,11 @@ pub fn generate(
                 history,
                 tools,
                 |msg| {
-                    let normalized =
-                        crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // Content-only turn: see the dflash sibling above for why `text` is
-                    // `msg.content`.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = crate::qwen::qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
                     if trace_cache {
+                        let normalized =
+                            crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
+                        let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         eprintln!(
                             "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
                             fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
@@ -4351,12 +4336,28 @@ pub fn generate(
                         .collect::<String>(),
                 );
             }
+            // Whole-envelope store (Qwen branch only): FULL generated body
+            // verbatim plus the producer reasoning text. The shared lookup
+            // replays R...A as one span on think-envelope templates;
+            // no-reasoning turns keep the primer-prepended single-slot path.
+            let tok = m.tokenizer.as_ref().unwrap();
             let _ = qwen_ar_apply_cache_action(
                 |fp, seq| {
+                    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                        tok,
+                        &seq,
+                        started_in_think,
+                    )
+                    .map(|text| {
+                        hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: Vec::new(),
+                            text,
+                        }
+                    });
                     m.asst_turn_cache.insert(
                         fp,
                         hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning: None,
+                            reasoning,
                             tools: Vec::new(),
                             content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
                                 token_ids: seq,

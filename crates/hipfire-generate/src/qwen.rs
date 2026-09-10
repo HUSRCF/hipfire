@@ -1452,7 +1452,11 @@ pub fn ep_serve_minimax(
             lcp += 1;
         }
         let cache_hit = lcp > 0 && lcp < prompt_n;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
                 prior_len,
@@ -1701,7 +1705,9 @@ pub fn ep_serve_minimax(
 /// byte-consistent — a mismatch would break the LCP forward-extension.
 pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
     hipfire_runtime::prompt_frame::qwen35_history_render(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         model_path,
     )
 }
@@ -1787,12 +1793,27 @@ pub fn plan_from_rendered(
         while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
             lcp += 1;
         }
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
                 prior_len,
                 rendered.len(),
                 lcp
+            );
+            // Bounded token evidence around the first divergence: at most 24 ids
+            // per side, enough to pin an envelope/span off-by-one without
+            // dumping whole conversations.
+            let lo = lcp.saturating_sub(8);
+            let prior_hi = (lcp + 16).min(prior_len);
+            let rend_hi = (lcp + 16).min(rendered.len());
+            eprintln!(
+                "[qwen-cache ids {trace_tag}] prior[{lo}..{prior_hi}]={:?} rendered[{lo}..{rend_hi}]={:?}",
+                &conversation_tokens[lo..prior_hi],
+                &rendered[lo..rend_hi],
             );
         }
         if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
@@ -1839,6 +1860,43 @@ pub fn plan_from_rendered(
         resume_from: None,
         rendered,
     }
+}
+
+/// Qwen jinja cache-lookup turn synthesis: fingerprint the message's normalized
+/// content (+ tool identity) and forward the stored producer reasoning so rich
+/// `reasoning_content` history satisfies the splice text check. Primer rule: a
+/// whole-envelope turn (reasoning present) replays verbatim — the template
+/// re-emits every marker around its slots, so prepending would duplicate the
+/// think opener. A primer-less full body (no reasoning) gets the generation
+/// primer prepended so the spliced stream byte-matches the end-of-turn bake on
+/// bare-history templates. Returns `None` on fingerprint miss or a content-less
+/// entry. Tool slots stay empty — Qwen history tool turns keep the existing
+/// safe miss via the count check.
+pub fn qwen_jinja_lookup_turn(
+    cache: &mut AsstTurnCache,
+    msg: &hipfire_runtime::prompt_frame::Message,
+    primer: &[u32],
+) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+    cache.get(&fp).and_then(|turn| {
+        turn.content.as_ref().map(|c| {
+            let mut v = if turn.reasoning.is_some() {
+                Vec::new()
+            } else {
+                primer.to_vec()
+            };
+            v.extend_from_slice(&c.token_ids);
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: turn.reasoning.clone(),
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: v,
+                    text: msg.content.clone(),
+                }),
+            }
+        })
+    })
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -2024,7 +2082,10 @@ pub fn generate_dflash(
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
     // fail closed (see match below).
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let mut started_in_think = matches!(
         assistant_prefix,
@@ -2176,7 +2237,10 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -2184,7 +2248,9 @@ pub fn generate_dflash(
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
     // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
+    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+        .ok()
+        .as_deref()
         != Some("0")
         && m.eviction.is_none();
     let dflash_ckpt_positions: Vec<usize> = m
@@ -2232,35 +2298,19 @@ pub fn generate_dflash(
                     primer
                 };
             let cache_ref = &mut m.asst_turn_cache;
-            let trace_cache =
-                hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+            let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1");
             let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 hist,
                 tools,
                 |msg| {
-                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // The qwen family has no Harmony reasoning/tool channels: its whole
-                    // assistant turn is one content slot. `text` must be the message's own
-                    // content so the splice's `content.text == m.content` guard
-                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
-                    // the pre-per-channel implementation.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
                     if trace_cache {
+                        let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+                        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         eprintln!(
                             "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
                             fp,
@@ -2359,7 +2409,9 @@ pub fn generate_dflash(
     // reach SpecEmit so ToolOutputRouter parses native XML; withholding them
     // used to leak `<tool_call>` as assistant content (Hermes never executed).
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
     let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
@@ -2383,7 +2435,10 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                 && temp <= 1e-6
                 && max_think_tokens == 1,
         });
@@ -2646,7 +2701,11 @@ pub fn generate_dflash(
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
                 if action.store {
-                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         eprintln!(
                             "[qwen-cache store dflash] fp_text.len={} tool_calls={} preview={:?}",
                             action.fingerprint_text.len(),
@@ -2654,21 +2713,40 @@ pub fn generate_dflash(
                             action.fingerprint_text.chars().take(60).collect::<String>(),
                         );
                     }
+                    // Whole-envelope store: FULL generated body verbatim plus
+                    // producer reasoning text when the turn thought. Splice
+                    // replays R...A as one span; primer stays lookup-side.
+                    let tok = m.tokenizer.as_ref().unwrap();
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, seq| {
-                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+                            let reasoning =
+                                hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                                    tok,
+                                    &seq,
+                                    started_in_think,
+                                )
+                                .map(|text| {
+                                    hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                        token_ids: Vec::new(),
+                                        text,
+                                    }
+                                });
+                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                                .ok()
+                                .as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
-                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
+                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} span={}",
                                     fp,
-                                    seq.len()
+                                    seq.len(),
+                                    reasoning.is_some(),
                                 );
                             }
                             m.asst_turn_cache.insert(
                                 fp,
                                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning: None,
+                                    reasoning,
                                     tools: Vec::new(),
                                     content: Some(
                                         hipfire_runtime::prompt_frame::CachedAssistantBody {
@@ -2814,13 +2892,19 @@ pub fn generate_dflash(
             let emit_text =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                     "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
+            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
+            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
             m.asst_turn_cache.insert(
                 fp,
                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
@@ -3019,7 +3103,11 @@ pub fn generate_spec(
         // bookkeeping remains.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
             prefill_start,
@@ -3664,7 +3752,10 @@ pub fn generate_spec(
                 }
             };
             if repaired
-                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
             {
                 eprintln!(
                     "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
@@ -4433,7 +4524,10 @@ pub fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -4720,7 +4814,9 @@ pub fn generate_multi(
     // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
@@ -4875,10 +4971,11 @@ pub fn generate_multi(
     // and runs to max_tokens. Mark the latch position and hard-EOS once
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
-    let post_latch_answer_budget: usize = hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(768);
+    let post_latch_answer_budget: usize =
+        hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
@@ -6544,5 +6641,92 @@ mod ep_serve_target_tests {
         assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
         assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
         assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    }
+}
+
+#[cfg(test)]
+mod qwen_lookup_primer_tests {
+    use super::qwen_jinja_lookup_turn;
+    use crate::common::{asst_turn_fingerprint, normalize_asst_turn_for_fingerprint};
+    use hipfire_loader::AsstTurnCache;
+
+    fn assistant_msg(content: &str) -> hipfire_runtime::prompt_frame::Message {
+        hipfire_runtime::prompt_frame::Message {
+            role: hipfire_runtime::prompt_frame::Role::Assistant,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    fn insert(
+        cache: &mut AsstTurnCache,
+        content: &str,
+        turn: hipfire_runtime::prompt_frame::CachedAssistantTurn,
+    ) {
+        let fp = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(content), &[]);
+        cache.insert(fp, turn);
+    }
+
+    fn body(ids: &[u32]) -> hipfire_runtime::prompt_frame::CachedAssistantBody {
+        hipfire_runtime::prompt_frame::CachedAssistantBody {
+            token_ids: ids.to_vec(),
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn span_turn_replays_verbatim_while_full_body_gets_primer() {
+        let mut cache = AsstTurnCache::new_from_env();
+        // Whole-envelope turn: text-only reasoning marker + verbatim full body;
+        // the template re-emits every marker, so no primer allowed.
+        insert(
+            &mut cache,
+            "answer B ",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text: "plan A\n".to_string(),
+                }),
+                tools: Vec::new(),
+                content: Some(body(&[1, 2, 3])),
+            },
+        );
+        // Full turn (no reasoning): primer prepended for bare-history replay.
+        insert(
+            &mut cache,
+            "plain answer",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: None,
+                tools: Vec::new(),
+                content: Some(body(&[7, 8])),
+            },
+        );
+        let span = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("answer B "), &[90, 91])
+            .expect("span hit");
+        assert_eq!(
+            span.content.expect("content").token_ids,
+            vec![1, 2, 3],
+            "envelope bodies must not gain the primer (duplicates the think opener)"
+        );
+        let rb = span.reasoning.expect("reasoning marker");
+        assert!(
+            rb.token_ids.is_empty(),
+            "reasoning marker carries text only"
+        );
+        assert_eq!(rb.text, "plan A\n");
+        let full = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("plain answer"), &[90, 91])
+            .expect("full hit");
+        assert_eq!(
+            full.content.expect("content").token_ids,
+            vec![90, 91, 7, 8],
+            "primer-less full bodies must regain the primer"
+        );
+        assert!(full.reasoning.is_none());
+        assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
     }
 }

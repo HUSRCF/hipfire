@@ -6,6 +6,7 @@
 - Registry-declared DFlash draft sidecars: `pull` fetches them, `auto`/`on` semantics, shared-sidecar-aware `rm` (#686).
 - DFlash prompt-cache repair on terminal overshoot (`RepairForTerminal`) (#695).
 - Template-aware primer splice (#692).
+- Qwen AR/DFlash: rich assistant reasoning history preserves the verbatim generated token span across template framing (whole-envelope store + Jinja splice); edited history falls back safely to plain retokenize.
 - Transactional DFlash constructors with emitter rollback (#691).
 - Qwen35 prefill/decode scratch and per-layer weight construction retain actual owners until publication, reclaiming every staged allocation on failure so immediate retries reuse the pool.
 - MQ-V2 prefill admit rule (#690).
