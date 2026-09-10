@@ -175,9 +175,9 @@ The key raw files are:
 The following blockers remain open:
 
 - Only one physical GPU was available; no RCCL multi-GPU proof was captured.
-- The DeepSeek4 run was noncanonical and did not use the full 82-GB target.
+- Local DeepSeek4 target/draft digest(s) do not match the canonical full-82GB fixture, and no canonical full route ran.
 - The canonical Qwen3.5 A3B artifact was absent.
-- Production direct-Qwen fault injection was missing at every boundary.
+- Production direct-Qwen fault injection does not cover every required load boundary (embedding/completed-layer/final-norm/output publication).
 - No deterministic canonical malformed-tool fixture exists.
 - No canonical accepted VL fixture exists; the available VL explorations failed.
 - No numerical or mutable-state oracle was captured; aggregate G4 promotion is not established.
