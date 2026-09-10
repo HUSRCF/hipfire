@@ -1929,63 +1929,6 @@ impl Gpu {
         )
     }
 
-    /// Exact paired K/V Q8_0 cache write for single-token decode. Uses the
-    /// same 32-lane block quantizer as `kv_cache_write_q8_0` and concatenates
-    /// the independent K and V block grids into one dispatch.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_cache_write_q8_0_pair(
-        &mut self,
-        dst: &GpuTensor,
-        src: &GpuTensor,
-        pos_buf: &DeviceBuffer,
-        n_kv_heads: usize,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        // The decode and batched entry points share ONE translation unit, and
-        // that file `#include`s kv_slot_desc.h for the batched one. The JIT
-        // compiles in a cache dir with no -I to kernels/src, so this wrapper
-        // must strip-and-prepend exactly like the batched wrapper — even
-        // though the decode kernel uses nothing from the header. Omitting it
-        // here still compiles in the batched path and fails only on the first
-        // decode step, which is how it was found.
-        if !self.functions.contains_key("kv_cache_write_bf16") {
-            let stripped =
-                kernels::KV_CACHE_WRITE_BF16_SRC.replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel("kv_cache_write_bf16", &src, "kv_cache_write_bf16")?;
-        }
-        let d = dst.buf.as_ptr();
-        let s = src.buf.as_ptr();
-        let p = pos_buf.as_ptr();
-        let nkv = n_kv_heads as i32;
-        let hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &d as *const _ as *mut c_void,
-            &s as *const _ as *mut c_void,
-            &p as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
-        let grid = (n_kv_heads * head_dim).div_ceil(64) as u32;
-        self.launch_maybe_blob(
-            "kv_cache_write_bf16",
-            [grid, 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b
-            },
-        )
-    }
-
     /// Flat BF16 KV write for batched prefill.
     ///
     /// `slot_descs`/`row_slot` are both-or-neither for the same reason as the
