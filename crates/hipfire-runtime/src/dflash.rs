@@ -26,9 +26,9 @@
 //!   equivalent to the reference's cropped draft-KV cache and avoids
 //!   one whole layer of persistence bookkeeping.
 
-use crate::hfq::{load_awq_scale, HfqFile};
+use crate::hfq::{awq_scale_f32_bytes, HfqFile};
 use crate::llama::WeightTensor;
-use hip_bridge::{Graph, GraphExec, HipResult};
+use hip_bridge::{DeviceBuffer, Graph, GraphExec, HipResult, HipRuntime};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
@@ -348,7 +348,59 @@ fn hfq_tensor_f32(
         f32_data.len(),
         expected,
     );
-    gpu.upload_f32(&f32_data, &shape)
+    upload_f32_weight(gpu, &f32_data, &shape)
+}
+
+/// Upload a DFlash raw weight through the reusable pool. The global raw-upload
+/// helper allocates directly from HIP, so an immediate constructor retry cannot
+/// reclaim a successfully staged predecessor. This local path also returns the
+/// allocation if the host-to-device copy itself fails.
+fn upload_raw_weight(gpu: &mut Gpu, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+    upload_raw_weight_with_copy(gpu, data, shape, HipRuntime::memcpy_htod)
+}
+
+/// [`upload_raw_weight`] with an injectable host-to-device copy step. The
+/// production path passes the real copy; regression tests pass a failing
+/// callback to prove the allocation-to-copy failure seam returns its pool
+/// allocation instead of stranding it outside the constructor ledgers.
+fn upload_raw_weight_with_copy(
+    gpu: &mut Gpu,
+    data: &[u8],
+    shape: &[usize],
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<GpuTensor> {
+    let mut tensor = gpu.alloc_tensor(&[data.len()], DType::Raw)?;
+    if let Err(error) = copy(&gpu.hip, &tensor.buf, data) {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
+    tensor.shape = shape.to_vec();
+    Ok(tensor)
+}
+
+/// Upload a DFlash F32 weight through the reusable pool. Same contract as
+/// [`upload_raw_weight`]: `Gpu::upload_f32` allocates from the pool but
+/// returns a copy failure without freeing the new owner, which would strand
+/// it before `gt!`/`wt!` can ledger it for constructor rollback.
+fn upload_f32_weight(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+    upload_f32_weight_with_copy(gpu, data, shape, HipRuntime::memcpy_htod)
+}
+
+/// [`upload_f32_weight`] with an injectable copy step; see
+/// [`upload_raw_weight_with_copy`].
+fn upload_f32_weight_with_copy(
+    gpu: &mut Gpu,
+    data: &[f32],
+    shape: &[usize],
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<GpuTensor> {
+    let tensor = gpu.alloc_tensor(shape, DType::F32)?;
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    if let Err(error) = copy(&gpu.hip, &tensor.buf, bytes) {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
+    Ok(tensor)
 }
 
 /// Load a matrix tensor as a `WeightTensor` carrying its native dtype.
@@ -379,7 +431,7 @@ fn hfq_weight(
     let (info, data) = hfq
         .tensor_data(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    let mut wt = match info.quant_type {
+    let wt = match info.quant_type {
         1 => {
             // F16 on disk. Default: upload as F16 (no lift) and dispatch through
             // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
@@ -395,7 +447,7 @@ fn hfq_weight(
                     m * k * 2,
                     "dflash {name} F16 byte-size mismatch"
                 );
-                let buf = gpu.upload_raw(data, &[m * k])?;
+                let buf = upload_raw_weight(gpu, data, &[m * k])?;
                 Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
                     buf,
                     gpu_dtype: DType::F16,
@@ -411,7 +463,7 @@ fn hfq_weight(
                     .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
-                let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+                let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
                 Ok(WeightTensor {
                     buf,
                     gpu_dtype: DType::F32,
@@ -429,7 +481,7 @@ fn hfq_weight(
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
-            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+            let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -443,7 +495,7 @@ fn hfq_weight(
         13 => {
             // MQ4-G256: 136 bytes per 256 weights. The buffer is opaque to
             // the engine; the gemm_hfq4g256 kernel reads it directly.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256,
@@ -457,7 +509,7 @@ fn hfq_weight(
         15 => {
             // MQ6-G256: 200 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4/MQ3; dispatch rotates activations and calls HFQ6 GEMM.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256,
@@ -472,7 +524,7 @@ fn hfq_weight(
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4. Dispatch path (`gemm_dispatch`) routes through
             // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256,
@@ -498,7 +550,7 @@ fn hfq_weight(
                     data.len()
                 );
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
@@ -522,7 +574,7 @@ fn hfq_weight(
                     data.len()
                 );
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256V2,
@@ -546,7 +598,7 @@ fn hfq_weight(
                     data.len()
                 );
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ5G256V2,
@@ -570,7 +622,7 @@ fn hfq_weight(
                     data.len()
                 );
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256V2,
@@ -594,7 +646,7 @@ fn hfq_weight(
                     data.len()
                 );
             }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_raw_weight(gpu, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256V2,
@@ -607,14 +659,54 @@ fn hfq_weight(
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
-    // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
-    // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
-    // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
-    // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
-    if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+    // AWQ sidecar attachment — same allow-list as hfq.rs::load_weight_tensor
+    // `DType::supports_awq_sidecar` so future widening (MQ6, MQ2, MQ3-Lloyd,
+    // MFP4) is a single helper edit. Sidecar absent → `awq_scale` stays None,
+    // dispatch path matches the pre-fix behavior.
+    attach_awq_scale(hfq, gpu, wt, name, k)
+}
+
+/// Attach the AWQ sidecar through the reusable pool. A genuine sidecar upload
+/// failure frees the already-built trunk owner and surfaces the error instead
+/// of silently dropping the scale (the pre-fix `load_awq_scale(...).ok()`
+/// converted a copy failure into a missing scale *and* leaked the direct
+/// allocation). Successful uploads are byte-identical to the direct path.
+fn attach_awq_scale(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    wt: WeightTensor,
+    name: &str,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    attach_awq_scale_with_copy(hfq, gpu, wt, name, k, HipRuntime::memcpy_htod)
+}
+
+/// [`attach_awq_scale`] with an injectable copy step; see
+/// [`upload_raw_weight_with_copy`].
+fn attach_awq_scale_with_copy(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    mut wt: WeightTensor,
+    name: &str,
+    k: usize,
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<WeightTensor> {
+    if !wt.gpu_dtype.supports_awq_sidecar() {
+        return Ok(wt);
     }
-    Ok(wt)
+    let Some(f32_bytes) = awq_scale_f32_bytes(hfq, name, k) else {
+        return Ok(wt);
+    };
+    match upload_raw_weight_with_copy(gpu, &f32_bytes, &[f32_bytes.len()], copy) {
+        Ok(scale) => {
+            wt.awq_scale = Some(scale);
+            Ok(wt)
+        }
+        Err(error) => {
+            wt.free_all(gpu);
+            Err(error)
+        }
+    }
 }
 
 impl DflashLayerWeights {
@@ -658,39 +750,59 @@ impl DflashWeights {
             && self.successor_codebook.is_some()
     }
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        // Transactional construction. Every GPU tensor allocated below is
-        // recorded in `live_t` (plain F32) / `live_w` (weight + sidecars) and
-        // taken exactly once into its final owner; completed layers accumulate
-        // in `layers`. Any failure frees the completed layers plus every
+        Self::load_with_boundaries(gpu, hfq, cfg, || Ok(()), || Ok(()))
+    }
+
+    fn load_with_boundaries(
+        gpu: &mut Gpu,
+        hfq: &HfqFile,
+        cfg: &DflashConfig,
+        mut after_owner: impl FnMut() -> HipResult<()>,
+        mut after_layer: impl FnMut() -> HipResult<()>,
+    ) -> HipResult<Self> {
+        // Transactional construction. Every GPU owner returned by the leaf
+        // loaders is recorded in `live_t` (plain F32) / `live_w` (weight +
+        // sidecars) and taken exactly once into its final owner; completed
+        // layers accumulate in `layers`. Any ordinary loader or injected
+        // boundary failure frees the completed layers plus every
         // recorded-but-unplaced tensor before returning Err — a bare `?`
-        // would leak them (`GpuTensor`/`DeviceBuffer` have no `Drop`). The
-        // leaf loaders (`hfq_weight`, `hfq_tensor_f32`) are single-alloc and
-        // need no cover. Mirrors the `or_free!` style in
-        // `hipfire-arch-qwen35`'s `load_dflash_state`.
+        // would leak them (`GpuTensor`/`DeviceBuffer` have no `Drop`). Mirrors
+        // the `or_free!` style in `hipfire-arch-qwen35`'s
+        // `load_dflash_state`.
         let mut live_t: Vec<Option<GpuTensor>> = Vec::new();
         let mut live_w: Vec<Option<WeightTensor>> = Vec::new();
         let mut layers: Vec<DflashLayerWeights> = Vec::with_capacity(cfg.n_layers);
+        macro_rules! cleanup {
+            () => {{
+                for l in layers.drain(..).rev() {
+                    l.free_gpu(gpu);
+                }
+                for slot in live_w.iter_mut().rev() {
+                    if let Some(w) = slot.take() {
+                        w.free_all(gpu);
+                    }
+                }
+                for slot in live_t.iter_mut().rev() {
+                    if let Some(t) = slot.take() {
+                        let _ = gpu.free_tensor(t);
+                    }
+                }
+            }};
+        }
         macro_rules! gt {
             ($e:expr) => {{
                 match $e {
                     Ok(t) => {
                         live_t.push(Some(t));
-                        live_t.len() - 1
+                        let index = live_t.len() - 1;
+                        if let Err(e) = after_owner() {
+                            cleanup!();
+                            return Err(e);
+                        }
+                        index
                     }
                     Err(e) => {
-                        for l in layers.drain(..) {
-                            l.free_gpu(gpu);
-                        }
-                        for slot in live_w.iter_mut() {
-                            if let Some(w) = slot.take() {
-                                w.free_all(gpu);
-                            }
-                        }
-                        for slot in live_t.iter_mut() {
-                            if let Some(t) = slot.take() {
-                                let _ = gpu.free_tensor(t);
-                            }
-                        }
+                        cleanup!();
                         return Err(e);
                     }
                 }
@@ -701,22 +813,15 @@ impl DflashWeights {
                 match $e {
                     Ok(w) => {
                         live_w.push(Some(w));
-                        live_w.len() - 1
+                        let index = live_w.len() - 1;
+                        if let Err(e) = after_owner() {
+                            cleanup!();
+                            return Err(e);
+                        }
+                        index
                     }
                     Err(e) => {
-                        for l in layers.drain(..) {
-                            l.free_gpu(gpu);
-                        }
-                        for slot in live_w.iter_mut() {
-                            if let Some(w) = slot.take() {
-                                w.free_all(gpu);
-                            }
-                        }
-                        for slot in live_t.iter_mut() {
-                            if let Some(t) = slot.take() {
-                                let _ = gpu.free_tensor(t);
-                            }
-                        }
+                        cleanup!();
                         return Err(e);
                     }
                 }
@@ -930,6 +1035,10 @@ impl DflashWeights {
                 mlp_conv_base: mlp_conv_base.map(|j| take_t!(j)),
                 mlp_conv_proj: mlp_conv_proj.map(|j| take_w!(j)),
             });
+            if let Err(e) = after_layer() {
+                cleanup!();
+                return Err(e);
+            }
         }
 
         // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
@@ -1490,11 +1599,35 @@ impl DflashScratch {
         max_ctx: usize,
         with_mq: bool,
     ) -> HipResult<Self> {
+        Self::new_windowed_with_boundary(
+            gpu,
+            cfg,
+            max_block_size,
+            w,
+            w_full,
+            max_ctx,
+            with_mq,
+            &mut || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the public constructor plus a test-only boundary.
+    fn new_windowed_with_boundary(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        w: usize,
+        w_full: usize,
+        max_ctx: usize,
+        with_mq: bool,
+        after_owner: &mut impl FnMut() -> HipResult<()>,
+    ) -> HipResult<Self> {
         // DFlash2 all-sliding: every layer shares the same W ring. Skip the
         // last-layer full replacement/backfill path and keep the footprint at
         // Legacy-at-ctx=w for all layers.
         if cfg.all_layers_sliding {
-            let mut s = Self::new_with_mq(gpu, cfg, max_block_size, w, with_mq)?;
+            let mut s =
+                Self::new_with_mq_with_boundary(gpu, cfg, max_block_size, w, with_mq, after_owner)?;
             s.max_ctx_len = max_ctx;
             s.ctx_mode = DraftCtxMode::Windowed { w, w_full: w };
             return Ok(s);
@@ -1506,7 +1639,7 @@ impl DflashScratch {
         let w_full = w_full.max(w);
         // Base at ctx=w: SWA rings, (w+B) concat buffers, w-row target_hidden
         // ring — the entire draft footprint except the one long-reach layer.
-        let mut s = Self::new_with_mq(gpu, cfg, b, w, with_mq)?;
+        let mut s = Self::new_with_mq_with_boundary(gpu, cfg, b, w, with_mq, after_owner)?;
         // The last (full-attention) layer gets w_full-row rings + its own
         // concat pair; its w-sized base caches are freed.
         if let Some(k) = s.k_ctx_cached.pop() {
@@ -1536,20 +1669,33 @@ impl DflashScratch {
                 }
             };
         }
+        macro_rules! boundary_or_free {
+            () => {
+                if let Err(e) = after_owner() {
+                    s.free_gpu(gpu);
+                    return Err(e);
+                }
+            };
+        }
         s.k_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        boundary_or_free!();
         s.v_full_cached = Some(alloc_or_free!(gpu.alloc_tensor(&[w_full * kvd], DType::F32)));
+        boundary_or_free!();
         s.k_cat_full = Some(alloc_or_free!(
             gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)
         ));
+        boundary_or_free!();
         s.v_cat_full = Some(alloc_or_free!(
             gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)
         ));
+        boundary_or_free!();
         // positions_k holds the last w_full context rows + the B noise rows
         // (the forward uploads only that suffix; every layer's span is one).
         // Allocate before freeing the old buffer so a failure still leaves
         // `s` intact for the error arm above.
         let new_positions_k = alloc_or_free!(gpu.alloc_tensor(&[w_full + b], DType::F32));
         let _ = gpu.free_tensor(std::mem::replace(&mut s.positions_k, new_positions_k));
+        boundary_or_free!();
         // The ctx bound is the target's physical capacity, not the window —
         // l may cross w_full (the last layer's span just slides).
         s.max_ctx_len = max_ctx;
@@ -1566,6 +1712,19 @@ impl DflashScratch {
         max_block_size: usize,
         max_ctx_len: usize,
         with_mq: bool,
+    ) -> HipResult<Self> {
+        Self::new_with_mq_with_boundary(gpu, cfg, max_block_size, max_ctx_len, with_mq, &mut || {
+            Ok(())
+        })
+    }
+
+    fn new_with_mq_with_boundary(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+        after_owner: &mut impl FnMut() -> HipResult<()>,
     ) -> HipResult<Self> {
         let b = max_block_size;
         let l = max_ctx_len;
@@ -1591,10 +1750,19 @@ impl DflashScratch {
                 match gpu.alloc_tensor($shape, $dtype) {
                     Ok(t) => {
                         live.push(Some(t));
-                        live.len() - 1
+                        let index = live.len() - 1;
+                        if let Err(e) = after_owner() {
+                            for slot in live.iter_mut().rev() {
+                                if let Some(t) = slot.take() {
+                                    let _ = gpu.free_tensor(t);
+                                }
+                            }
+                            return Err(e);
+                        }
+                        index
                     }
                     Err(e) => {
-                        for slot in live.iter_mut() {
+                        for slot in live.iter_mut().rev() {
                             if let Some(t) = slot.take() {
                                 let _ = gpu.free_tensor(t);
                             }
@@ -1718,8 +1886,7 @@ impl DflashScratch {
             k_ctx_cached.push(take!(ik));
             v_ctx_cached.push(take!(iv));
         }
-        debug_assert!(live.iter().all(|s| s.is_none()));
-        Ok(DflashScratch {
+        let scratch = DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
 
@@ -1761,7 +1928,9 @@ impl DflashScratch {
             v_cat_full: None,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
-        })
+        };
+        debug_assert!(live.iter().all(|s| s.is_none()));
+        Ok(scratch)
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this
@@ -3591,6 +3760,427 @@ mod ring_tests {
         assert_eq!(log.abs_positions(), &[0, 1, 2, 3]);
         assert_eq!(log.proj_cached_rows(), 3);
         assert_eq!(log.full_cached_rows(), 4);
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tiny_config() -> DflashConfig {
+        DflashConfig {
+            n_layers: 2,
+            hidden: 32,
+            intermediate: 64,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 16,
+            vocab_size: 64,
+            norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            block_size: 2,
+            mask_token_id: 0,
+            target_layer_ids: vec![0],
+            num_target_layers: 1,
+            declared_window: Some(2),
+            all_layers_sliding: false,
+            conv_group_size: Some(16),
+            conv_kernel_size: Some(2),
+            selector_rank: Some(8),
+            selector_top_k: Some(2),
+        }
+    }
+
+    fn draft_path() -> PathBuf {
+        PathBuf::from(std::env::var_os("HOME").expect("HOME is required"))
+            .join(".hipfire/models/qwen35-27b-dflash-mq4.hfq")
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and the canonical Qwen3.5-27B DFlash draft"]
+    fn late_weight_failure_reuses_every_staged_owner() {
+        let path = draft_path();
+        assert!(path.is_file(), "missing DFlash fixture: {}", path.display());
+        let hfq = HfqFile::open(&path).expect("open DFlash fixture");
+        let cfg = DflashConfig::from_hfq(&hfq).expect("parse DFlash config");
+        let mut gpu = Gpu::init().expect("GPU required for DFlash rollback");
+
+        let mut allocations = 0usize;
+        let warm = DflashWeights::load_with_boundaries(
+            &mut gpu,
+            &hfq,
+            &cfg,
+            || {
+                allocations += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("warm DFlash weights");
+        warm.free_gpu(&mut gpu);
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let mut attempted = 0usize;
+        let failure = DflashWeights::load_with_boundaries(
+            &mut gpu,
+            &hfq,
+            &cfg,
+            || {
+                attempted += 1;
+                if attempted == allocations {
+                    Err(hip_bridge::HipError::new(
+                        2,
+                        "injected failure after final DFlash weight owner",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(()),
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(weights) => {
+                weights.free_gpu(&mut gpu);
+                panic!("weight fault did not trigger");
+            }
+        }
+        assert_eq!(
+            attempted, allocations,
+            "failure must follow the final owner"
+        );
+
+        let retry = DflashWeights::load(&mut gpu, &hfq, &cfg)
+            .expect("immediate weight retry after late failure");
+        retry.free_gpu(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed weight construction lost reusable allocations",
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and the canonical Qwen3.5-27B DFlash draft"]
+    fn late_layer_failure_reuses_every_completed_layer() {
+        let path = draft_path();
+        assert!(path.is_file(), "missing DFlash fixture: {}", path.display());
+        let hfq = HfqFile::open(&path).expect("open DFlash fixture");
+        let cfg = DflashConfig::from_hfq(&hfq).expect("parse DFlash config");
+        let mut gpu = Gpu::init().expect("GPU required for DFlash rollback");
+
+        let warm = DflashWeights::load(&mut gpu, &hfq, &cfg).expect("warm DFlash weights");
+        warm.free_gpu(&mut gpu);
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let mut completed_layers = 0usize;
+        let failure = DflashWeights::load_with_boundaries(
+            &mut gpu,
+            &hfq,
+            &cfg,
+            || Ok(()),
+            || {
+                completed_layers += 1;
+                if completed_layers == cfg.n_layers {
+                    Err(hip_bridge::HipError::new(
+                        2,
+                        "injected failure after final DFlash layer",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(weights) => {
+                weights.free_gpu(&mut gpu);
+                panic!("layer fault did not trigger");
+            }
+        }
+        assert_eq!(
+            completed_layers, cfg.n_layers,
+            "failure must follow the final completed layer"
+        );
+
+        let retry =
+            DflashWeights::load(&mut gpu, &hfq, &cfg).expect("immediate retry after layer failure");
+        retry.free_gpu(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed layer construction lost reusable allocations",
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises real base-scratch rollback and retry"]
+    fn late_base_scratch_failure_reuses_every_staged_owner() {
+        let cfg = tiny_config();
+        let mut gpu = Gpu::init().expect("GPU required for DFlash rollback");
+
+        let mut allocations = 0usize;
+        let warm =
+            DflashScratch::new_with_mq_with_boundary(&mut gpu, &cfg, 2, 4, true, &mut || {
+                allocations += 1;
+                Ok(())
+            })
+            .expect("warm DFlash scratch");
+        warm.free_gpu(&mut gpu);
+
+        let mut attempted = 0usize;
+        let failure =
+            DflashScratch::new_with_mq_with_boundary(&mut gpu, &cfg, 2, 4, true, &mut || {
+                attempted += 1;
+                if attempted == allocations {
+                    Err(hip_bridge::HipError::new(
+                        2,
+                        "injected failure after final DFlash scratch owner",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(scratch) => {
+                scratch.free_gpu(&mut gpu);
+                panic!("base scratch fault did not trigger");
+            }
+        }
+        assert_eq!(
+            attempted, allocations,
+            "failure must follow the final owner"
+        );
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let retry = DflashScratch::new_with_mq(&mut gpu, &cfg, 2, 4, true)
+            .expect("immediate base-scratch retry");
+        retry.free_gpu(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed base-scratch construction lost reusable allocations",
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises real window-extension rollback and retry"]
+    fn late_window_extension_failure_reuses_base_and_extensions() {
+        let cfg = tiny_config();
+        let mut gpu = Gpu::init().expect("GPU required for DFlash rollback");
+
+        let mut allocations = 0usize;
+        let warm = DflashScratch::new_windowed_with_boundary(
+            &mut gpu,
+            &cfg,
+            2,
+            2,
+            8,
+            32,
+            true,
+            &mut || {
+                allocations += 1;
+                Ok(())
+            },
+        )
+        .expect("warm windowed DFlash scratch");
+        warm.free_gpu(&mut gpu);
+
+        let mut attempted = 0usize;
+        let failure = DflashScratch::new_windowed_with_boundary(
+            &mut gpu,
+            &cfg,
+            2,
+            2,
+            8,
+            32,
+            true,
+            &mut || {
+                attempted += 1;
+                if attempted == allocations {
+                    Err(hip_bridge::HipError::new(
+                        2,
+                        "injected failure after final DFlash window owner",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(scratch) => {
+                scratch.free_gpu(&mut gpu);
+                panic!("window fault did not trigger");
+            }
+        }
+        assert_eq!(
+            attempted, allocations,
+            "failure must follow the final owner"
+        );
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let retry = DflashScratch::new_windowed(&mut gpu, &cfg, 2, 2, 8, 32, true)
+            .expect("immediate windowed-scratch retry");
+        retry.free_gpu(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed window construction lost reusable allocations",
+        );
+        gpu.drain_pool();
+    }
+
+    /// Deterministic copy-failure callback for the leaf-upload seams: the
+    /// allocation is real, only the host-to-device copy itself fails.
+    fn failing_copy(_: &HipRuntime, _: &DeviceBuffer, _: &[u8]) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(2, "injected H2D copy failure"))
+    }
+
+    #[test]
+    fn leaf_upload_copy_failure_returns_pool_allocation() {
+        // Focused allocation→copy failure seam for the DFlash leaf uploaders.
+        // `Gpu::upload_f32` returns a copy error without freeing the fresh
+        // pool allocation; the local leaf helpers must not strand it outside
+        // the constructor ledgers. Real allocation and real free — only the
+        // copy is injected — with no test-only production API. Soft-skip
+        // without a GPU, like the dispatch rollback tests.
+        //
+        // The baseline is recorded after a successful warmup pass, not on an
+        // empty pool: `total_new` is cumulative, so the two first-touch
+        // mallocs belong outside the measured window, and the retry holds
+        // two live buffers at once — the pool must already hold both slots
+        // for the fail+retry cycle to stay flat. A leaked owner still fails
+        // this: the failure consumes a pooled slot without returning it, so
+        // the retry finds the list short and mallocs anew.
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let warm_raw = upload_raw_weight(&mut gpu, &[9u8; 64], &[64]).expect("warm raw");
+        let warm_staged = upload_f32_weight(&mut gpu, &[1.5f32; 16], &[16]).expect("warm F32");
+        gpu.free_tensor(warm_raw).expect("free warm raw");
+        gpu.free_tensor(warm_staged).expect("free warm F32");
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let err = match upload_raw_weight_with_copy(&mut gpu, &[9u8; 64], &[64], failing_copy) {
+            Err(error) => error,
+            Ok(tensor) => {
+                gpu.free_tensor(tensor).expect("free");
+                panic!("injected raw copy failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        let err = match upload_f32_weight_with_copy(&mut gpu, &[1.5f32; 16], &[16], failing_copy) {
+            Err(error) => error,
+            Ok(tensor) => {
+                gpu.free_tensor(tensor).expect("free");
+                panic!("injected F32 copy failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        // Immediate retry reuses the returned allocations instead of growing
+        // the pool: both freed owners are back on the free list.
+        let raw = upload_raw_weight(&mut gpu, &[9u8; 64], &[64]).expect("raw retry");
+        let staged = upload_f32_weight(&mut gpu, &[1.5f32; 16], &[16]).expect("F32 retry");
+        gpu.free_tensor(raw).expect("free raw");
+        gpu.free_tensor(staged).expect("free F32");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed leaf upload leaked its pool allocation",
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    fn awq_sidecar_copy_failure_propagates_and_frees_trunk() {
+        // The pre-fix path swallowed a sidecar copy failure into a missing
+        // scale (`upload_raw(...).ok()` → None) and leaked the direct
+        // allocation. The pooled attach must surface the error and free the
+        // already-built trunk owner; an immediate retry then reuses both
+        // pooled buffers. Tiny synthetic container, no model fixture.
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        use crate::hfq::hfq_test_fixture::write_min_hfq;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("awq.hfq");
+        let weight_bytes = vec![0xA5u8; 128];
+        let sidecar_f16: Vec<u8> = (0..8).flat_map(|_| [0x00u8, 0x3C]).collect();
+        write_min_hfq(
+            &path,
+            9,
+            &[
+                ("w.weight", 13, &[2, 8], &weight_bytes),
+                ("w.awq_scale.weight", 1, &[8], &sidecar_f16),
+            ],
+        );
+        let hfq = HfqFile::open(&path).expect("open AWQ fixture");
+
+        fn trunk(gpu: &mut Gpu, bytes: &[u8]) -> WeightTensor {
+            WeightTensor {
+                buf: upload_raw_weight(gpu, bytes, &[bytes.len()]).expect("trunk upload"),
+                gpu_dtype: DType::MQ4G256,
+                m: 2,
+                k: 8,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        }
+
+        // Success baseline: the sidecar attaches, then everything is freed
+        // back to the pool.
+        let staged = trunk(&mut gpu, &weight_bytes);
+        let attached =
+            attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8).expect("baseline attach");
+        assert!(attached.awq_scale.is_some(), "sidecar must attach");
+        attached.free_all(&mut gpu);
+        let fresh_allocations = gpu.pool_stats().0;
+
+        // Injected sidecar copy failure: the error surfaces and the trunk
+        // owner is freed with it — no silent scale drop, no stranded owner.
+        let staged = trunk(&mut gpu, &weight_bytes);
+        let err =
+            match attach_awq_scale_with_copy(&hfq, &mut gpu, staged, "w.weight", 8, failing_copy) {
+                Err(error) => error,
+                Ok(wt) => {
+                    wt.free_all(&mut gpu);
+                    panic!("injected sidecar copy failure must surface");
+                }
+            };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        // Immediate retry reuses the trunk + sidecar buffers.
+        let staged = trunk(&mut gpu, &weight_bytes);
+        let retry = attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8).expect("sidecar retry");
+        assert!(retry.awq_scale.is_some(), "retry must attach the scale");
+        retry.free_all(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed AWQ attach leaked trunk or sidecar allocation",
+        );
+        gpu.drain_pool();
     }
 }
 
