@@ -26,9 +26,9 @@
 //!   equivalent to the reference's cropped draft-KV cache and avoids
 //!   one whole layer of persistence bookkeeping.
 
-use crate::hfq::{load_awq_scale, HfqFile};
+use crate::hfq::{awq_scale_f32_bytes, HfqFile};
 use crate::llama::WeightTensor;
-use hip_bridge::{Graph, GraphExec, HipResult};
+use hip_bridge::{DeviceBuffer, Graph, GraphExec, HipResult, HipRuntime};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
@@ -348,7 +348,7 @@ fn hfq_tensor_f32(
         f32_data.len(),
         expected,
     );
-    gpu.upload_f32(&f32_data, &shape)
+    upload_f32_weight(gpu, &f32_data, &shape)
 }
 
 /// Upload a DFlash raw weight through the reusable pool. The global raw-upload
@@ -356,12 +356,50 @@ fn hfq_tensor_f32(
 /// reclaim a successfully staged predecessor. This local path also returns the
 /// allocation if the host-to-device copy itself fails.
 fn upload_raw_weight(gpu: &mut Gpu, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+    upload_raw_weight_with_copy(gpu, data, shape, HipRuntime::memcpy_htod)
+}
+
+/// [`upload_raw_weight`] with an injectable host-to-device copy step. The
+/// production path passes the real copy; regression tests pass a failing
+/// callback to prove the allocation-to-copy failure seam returns its pool
+/// allocation instead of stranding it outside the constructor ledgers.
+fn upload_raw_weight_with_copy(
+    gpu: &mut Gpu,
+    data: &[u8],
+    shape: &[usize],
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<GpuTensor> {
     let mut tensor = gpu.alloc_tensor(&[data.len()], DType::Raw)?;
-    if let Err(error) = gpu.hip.memcpy_htod(&tensor.buf, data) {
+    if let Err(error) = copy(&gpu.hip, &tensor.buf, data) {
         let _ = gpu.free_tensor(tensor);
         return Err(error);
     }
     tensor.shape = shape.to_vec();
+    Ok(tensor)
+}
+
+/// Upload a DFlash F32 weight through the reusable pool. Same contract as
+/// [`upload_raw_weight`]: `Gpu::upload_f32` allocates from the pool but
+/// returns a copy failure without freeing the new owner, which would strand
+/// it before `gt!`/`wt!` can ledger it for constructor rollback.
+fn upload_f32_weight(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+    upload_f32_weight_with_copy(gpu, data, shape, HipRuntime::memcpy_htod)
+}
+
+/// [`upload_f32_weight`] with an injectable copy step; see
+/// [`upload_raw_weight_with_copy`].
+fn upload_f32_weight_with_copy(
+    gpu: &mut Gpu,
+    data: &[f32],
+    shape: &[usize],
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<GpuTensor> {
+    let tensor = gpu.alloc_tensor(shape, DType::F32)?;
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    if let Err(error) = copy(&gpu.hip, &tensor.buf, bytes) {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
     Ok(tensor)
 }
 
@@ -393,7 +431,7 @@ fn hfq_weight(
     let (info, data) = hfq
         .tensor_data(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    let mut wt = match info.quant_type {
+    let wt = match info.quant_type {
         1 => {
             // F16 on disk. Default: upload as F16 (no lift) and dispatch through
             // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
@@ -425,7 +463,7 @@ fn hfq_weight(
                     .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
-                let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+                let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
                 Ok(WeightTensor {
                     buf,
                     gpu_dtype: DType::F32,
@@ -443,7 +481,7 @@ fn hfq_weight(
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
-            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+            let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -621,14 +659,54 @@ fn hfq_weight(
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
-    // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
-    // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
-    // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
-    // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
-    if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+    // AWQ sidecar attachment — same allow-list as hfq.rs::load_weight_tensor
+    // `DType::supports_awq_sidecar` so future widening (MQ6, MQ2, MQ3-Lloyd,
+    // MFP4) is a single helper edit. Sidecar absent → `awq_scale` stays None,
+    // dispatch path matches the pre-fix behavior.
+    attach_awq_scale(hfq, gpu, wt, name, k)
+}
+
+/// Attach the AWQ sidecar through the reusable pool. A genuine sidecar upload
+/// failure frees the already-built trunk owner and surfaces the error instead
+/// of silently dropping the scale (the pre-fix `load_awq_scale(...).ok()`
+/// converted a copy failure into a missing scale *and* leaked the direct
+/// allocation). Successful uploads are byte-identical to the direct path.
+fn attach_awq_scale(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    wt: WeightTensor,
+    name: &str,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    attach_awq_scale_with_copy(hfq, gpu, wt, name, k, HipRuntime::memcpy_htod)
+}
+
+/// [`attach_awq_scale`] with an injectable copy step; see
+/// [`upload_raw_weight_with_copy`].
+fn attach_awq_scale_with_copy(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    mut wt: WeightTensor,
+    name: &str,
+    k: usize,
+    copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+) -> HipResult<WeightTensor> {
+    if !wt.gpu_dtype.supports_awq_sidecar() {
+        return Ok(wt);
     }
-    Ok(wt)
+    let Some(f32_bytes) = awq_scale_f32_bytes(hfq, name, k) else {
+        return Ok(wt);
+    };
+    match upload_raw_weight_with_copy(gpu, &f32_bytes, &[f32_bytes.len()], copy) {
+        Ok(scale) => {
+            wt.awq_scale = Some(scale);
+            Ok(wt)
+        }
+        Err(error) => {
+            wt.free_all(gpu);
+            Err(error)
+        }
+    }
 }
 
 impl DflashLayerWeights {
@@ -3954,6 +4032,133 @@ mod construction_tests {
             gpu.pool_stats().0,
             fresh_allocations,
             "failed window construction lost reusable allocations",
+        );
+        gpu.drain_pool();
+    }
+
+    /// Deterministic copy-failure callback for the leaf-upload seams: the
+    /// allocation is real, only the host-to-device copy itself fails.
+    fn failing_copy(_: &HipRuntime, _: &DeviceBuffer, _: &[u8]) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(2, "injected H2D copy failure"))
+    }
+
+    #[test]
+    fn leaf_upload_copy_failure_returns_pool_allocation() {
+        // Focused allocation→copy failure seam for the DFlash leaf uploaders.
+        // `Gpu::upload_f32` returns a copy error without freeing the fresh
+        // pool allocation; the local leaf helpers must not strand it outside
+        // the constructor ledgers. Real allocation and real free — only the
+        // copy is injected — with no test-only production API. Soft-skip
+        // without a GPU, like the dispatch rollback tests.
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let err = upload_raw_weight_with_copy(&mut gpu, &[9u8; 64], &[64], failing_copy)
+            .expect_err("injected raw copy failure must surface");
+        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+
+        let err = upload_f32_weight_with_copy(&mut gpu, &[1.5f32; 16], &[16], failing_copy)
+            .expect_err("injected F32 copy failure must surface");
+        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+
+        // Immediate retry reuses the returned allocations instead of growing
+        // the pool: both freed owners are back on the free list.
+        let raw = upload_raw_weight(&mut gpu, &[9u8; 64], &[64]).expect("raw retry");
+        let staged = upload_f32_weight(&mut gpu, &[1.5f32; 16], &[16]).expect("F32 retry");
+        gpu.free_tensor(raw).expect("free raw");
+        gpu.free_tensor(staged).expect("free F32");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed leaf upload leaked its pool allocation",
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    fn awq_sidecar_copy_failure_propagates_and_frees_trunk() {
+        // The pre-fix path swallowed a sidecar copy failure into a missing
+        // scale (`upload_raw(...).ok()` → None) and leaked the direct
+        // allocation. The pooled attach must surface the error and free the
+        // already-built trunk owner; an immediate retry then reuses both
+        // pooled buffers. Tiny synthetic container, no model fixture.
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        use crate::hfq::hfq_test_fixture::write_min_hfq;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("awq.hfq");
+        let weight_bytes = vec![0xA5u8; 128];
+        let sidecar_f16: Vec<u8> = (0..8).flat_map(|_| [0x00u8, 0x3C]).collect();
+        write_min_hfq(
+            &path,
+            9,
+            &[
+                ("w.weight", 13, &[2, 8], &weight_bytes),
+                ("w.awq_scale.weight", 1, &[8], &sidecar_f16),
+            ],
+        );
+        let hfq = HfqFile::open(&path).expect("open AWQ fixture");
+
+        fn trunk(gpu: &mut Gpu, bytes: &[u8]) -> WeightTensor {
+            WeightTensor {
+                buf: upload_raw_weight(gpu, bytes, &[bytes.len()]).expect("trunk upload"),
+                gpu_dtype: DType::MQ4G256,
+                m: 2,
+                k: 8,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        }
+
+        // Success baseline: the sidecar attaches, then everything is freed
+        // back to the pool.
+        let attached = attach_awq_scale(
+            &hfq,
+            &mut gpu,
+            trunk(&mut gpu, &weight_bytes),
+            "w.weight",
+            8,
+        )
+        .expect("baseline attach");
+        assert!(attached.awq_scale.is_some(), "sidecar must attach");
+        attached.free_all(&mut gpu);
+        let fresh_allocations = gpu.pool_stats().0;
+
+        // Injected sidecar copy failure: the error surfaces and the trunk
+        // owner is freed with it — no silent scale drop, no stranded owner.
+        let err = attach_awq_scale_with_copy(
+            &hfq,
+            &mut gpu,
+            trunk(&mut gpu, &weight_bytes),
+            "w.weight",
+            8,
+            failing_copy,
+        )
+        .expect_err("injected sidecar copy failure must surface");
+        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+
+        // Immediate retry reuses the trunk + sidecar buffers.
+        let retry = attach_awq_scale(
+            &hfq,
+            &mut gpu,
+            trunk(&mut gpu, &weight_bytes),
+            "w.weight",
+            8,
+        )
+        .expect("sidecar retry");
+        assert!(retry.awq_scale.is_some(), "retry must attach the scale");
+        retry.free_all(&mut gpu);
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed AWQ attach leaked trunk or sidecar allocation",
         );
         gpu.drain_pool();
     }

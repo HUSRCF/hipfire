@@ -1481,15 +1481,18 @@ fn load_f16_tensor(
     gpu.upload_f32(&f32_data, shape)
 }
 
-/// Load an AWQ scale sidecar tensor from an HFQ file onto GPU.
+/// Resolve a validated AWQ scale sidecar payload as little-endian F32 bytes.
 ///
 /// Phase A Stage A — AWQ sidecar lookup. The quantizer emits per-tensor
 /// sidecars named `<weight_name>.awq_scale.weight` (1D F16, length K)
-/// alongside MQ4-quantized weights. The forward path uses these to apply
-/// `x /= awq_scale` before the rotation kernel, completing the AWQ
-/// math `(W·s) · (x/s) = W·x`. Backward-compatible: when no sidecar
-/// exists (the common case for pre-Stage-A .hfq files), this returns
-/// None and the runtime behaves identically to before.
+/// alongside MQ4-quantized weights. Returns `None` when no sidecar exists
+/// or it fails validation (callers keep `awq_scale` as `None`, matching
+/// pre-Stage-A behavior).
+///
+/// This is the single parse core for both the legacy direct uploader below
+/// and pool-aware constructor paths (e.g. DFlash): the naming convention,
+/// validation, and F16 → F32 conversion live here exactly once so the two
+/// upload paths cannot drift into parallel parsers.
 ///
 /// Naming convention: replace trailing `.weight` with `.awq_scale.weight`.
 /// Matches hipfire-quantize's emit pattern.
@@ -1498,7 +1501,7 @@ fn load_f16_tensor(
 /// + fadvise_dontneed (avoids page cache buildup on unified-memory APUs)
 /// and on non-Unix falls back to mmap. Sidecars are small (K ≤ ~12288
 /// elements, ~48 KB peak), so the owned-Vec copy is negligible.
-pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> Option<GpuTensor> {
+pub(crate) fn awq_scale_f32_bytes(hfq: &HfqFile, weight_name: &str, k: usize) -> Option<Vec<u8>> {
     let sidecar_name = match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
         None => format!("{weight_name}.awq_scale.weight"),
@@ -1527,7 +1530,17 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
         .chunks_exact(2)
         .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
-    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    Some(f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect())
+}
+
+/// Load an AWQ scale sidecar tensor from an HFQ file onto GPU.
+///
+/// The forward path uses these to apply `x /= awq_scale` before the rotation
+/// kernel, completing the AWQ math `(W·s) · (x/s) = W·x`. Backward-compatible:
+/// when no sidecar exists (the common case for pre-Stage-A .hfq files), this
+/// returns None and the runtime behaves identically to before.
+pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> Option<GpuTensor> {
+    let f32_bytes = awq_scale_f32_bytes(hfq, weight_name, k)?;
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
@@ -2412,13 +2425,15 @@ mod llama_config_tests {
     }
 }
 
-// ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
-
+/// Shared minimal-HFQ fixture writer for constructor regression tests.
+///
+/// Home for the writer previously private to `overlay_tests` so DFlash
+/// leaf-upload tests can build tiny containers (weight + AWQ sidecar)
+/// without duplicating the container layout.
 #[cfg(test)]
-mod overlay_tests {
-    use super::*;
-    use crate::model_source::ModelSource; // for `tensor_names`
+pub(crate) mod hfq_test_fixture {
     use std::io::Write;
+    use std::path::Path;
 
     /// Minimal HFQ writer mirroring `hipfire-quantize`'s `write_hfq`
     /// (`crates/hipfire-quantize/src/main.rs:3398`) byte-for-byte for the
@@ -2432,7 +2447,7 @@ mod overlay_tests {
     ///   - zero padding so the data region starts 4096-aligned.
     ///   - tensor data, concatenated in index order (offsets are derived at
     ///     read time cumulatively from `data_offset`).
-    fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
+    pub(crate) fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
         let metadata = b"{}"; // balanced JSON; brace-scan parser stops at the close brace
         let header_size: u64 = 32;
         let metadata_offset = header_size;
@@ -2472,6 +2487,15 @@ mod overlay_tests {
         }
         f.flush().unwrap();
     }
+}
+
+// ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use super::hfq_test_fixture::write_min_hfq;
+    use crate::model_source::ModelSource; // for `tensor_names`
 
     #[test]
     fn truncated_container_errors_instead_of_panicking() {
