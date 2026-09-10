@@ -112,7 +112,11 @@ fn main() {
             cfg.sliding_window,
         )
         .expect("kv sliding");
-        let mut kv_full = KvCache::new_gpu_asym3(
+        // Gemma4 full-attention head dimensions are not compatible with the
+        // Qwen3.5-only Asym3 D256 constructor. Use the generic Q8 cache for
+        // this parity harness so the comparison exercises model math rather
+        // than an unrelated KV format restriction.
+        let mut kv_full = KvCache::new_gpu_q8_capped(
             &mut gpu,
             cfg.n_layers,
             cfg.full_n_kv_heads,
