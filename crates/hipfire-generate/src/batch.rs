@@ -110,6 +110,73 @@ fn emit_lfm_assignment_capacity_error(
     let _ = stdout.flush();
 }
 
+/// Release one request's batch route/start latch and capture the exact
+/// singleton transaction before the outer batch guard is dropped.
+fn take_singleton_handoff(
+    key: &AttemptKey,
+    admission: BatchGeneration,
+    route: GenerationRoute,
+) -> Result<SingletonTransfer, String> {
+    let transfer = batch_handoff_to_singleton_and_clear(&key.id, key.attempt_id, admission)
+        .ok_or_else(|| {
+            format!(
+                "batch admission handoff failed for {}:{}",
+                key.id, key.attempt_id
+            )
+        })?;
+    if transfer.admission() != admission {
+        return Err(format!(
+            "batch admission changed during singleton handoff for {}:{}",
+            key.id, key.attempt_id
+        ));
+    }
+    // GenerationRouteScope releases only this request's start latch while
+    // preserving the prior route TLS. The sequential producer can therefore
+    // emit its fresh gen_start without a terminal/error side effect.
+    {
+        let _attempt = BatchAttemptScope::enter(key.attempt_id);
+        let _route = GenerationRouteScope::enter(route, &key.id);
+    }
+    Ok(transfer)
+}
+
+/// Retire a think-open lane only after its caller has reset GPU state, then
+/// hand its full original request and exact singleton transaction to main.
+fn handoff_started_in_think(
+    sched: &mut ContinuousBatchScheduler,
+    lane_idx: usize,
+    key: &AttemptKey,
+    pending: &BatchPendingRequest,
+    route: GenerationRoute,
+) -> Result<DaemonMsg, String> {
+    if !sched.retire_lane_for_singleton(lane_idx, key, pending.admission) {
+        return Err(format!(
+            "retire lane {lane_idx} for singleton handoff failed for {}:{}",
+            key.id, key.attempt_id
+        ));
+    }
+    let transfer = take_singleton_handoff(key, pending.admission, route)?;
+    Ok(daemon_singleton_with_admission(
+        pending.original_msg.clone(),
+        transfer,
+    ))
+}
+
+/// Handoff a think-open request encountered before it receives a batch lane.
+/// There is no GPU lane to reset, but ownership still transfers through the
+/// same explicit internal message and exact admission cleanup.
+fn handoff_admitted_started_in_think(
+    id: &str,
+    attempt_id: u64,
+    admission: BatchGeneration,
+    original_msg: serde_json::Value,
+    route: GenerationRoute,
+) -> Result<DaemonMsg, String> {
+    let key = AttemptKey::new(id, attempt_id);
+    let transfer = take_singleton_handoff(&key, admission, route)?;
+    Ok(daemon_singleton_with_admission(original_msg, transfer))
+}
+
 /// Cancellable LFM prefill helper. Attempts to use the arch's
 /// `prefill_lane_cancellable` when present; otherwise falls back to the
 /// standard `prefill_lane` with post-prefill abort handling. The closure is
@@ -552,6 +619,10 @@ pub fn drive_qwen_continuous_batch(
                     barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
                     break;
                 }
+                DaemonMsg::SingletonWithAdmission(json, transfer) => {
+                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -711,15 +782,19 @@ pub fn drive_qwen_continuous_batch(
                             }
                         };
                         if started_in_think {
-                            // Pre-latched abort must move to the sequential
-                            // singleton before this key leaves the batch plane.
-                            // Transfer clears the keyed entry exactly once.
-                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                            let handoff = match handoff_admitted_started_in_think(
                                 &id,
                                 attempt_id,
                                 admission,
-                            );
-                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
+                                json,
+                                GenerationRoute::QwenAr,
+                            ) {
+                                Ok(msg) => msg,
+                                Err(reason) => {
+                                    return fail_all(sched, gpu, batch_state, stdout, reason)
+                                }
+                            };
+                            barrier = Some(handoff);
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
@@ -759,6 +834,7 @@ pub fn drive_qwen_continuous_batch(
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
                             admission,
+                            original_msg: json.clone(),
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -823,17 +899,9 @@ pub fn drive_qwen_continuous_batch(
             let prompt_tokens = pending_req.prompt_tokens.clone();
             let started_in_think = pending_req.started_in_think;
             if started_in_think {
-                // Defensive: think-open prompts are sequential barriers. Transfer
-                // any pre-latched abort once, free the just-assigned lane, and
-                // push the generate back for outer sequential handling.
-                let prompt = pending_req.prompt.clone();
-                let admission = pending_req.admission;
-                let _ = batch_transfer_abort_to_singleton_and_clear(
-                    &key.id,
-                    key.attempt_id,
-                    admission,
-                );
-                let _ = sched.abort_lane(lane_idx, &key, admission);
+                // Think-open prompts are sequential barriers. Reset while the
+                // batch owner is still live, then retire and hand off the
+                // complete original request; never touch this lane again.
                 if let Err(err) = batch_state.reset_lane(gpu, &config, lane_idx) {
                     return fail_all(
                         sched,
@@ -843,16 +911,20 @@ pub fn drive_qwen_continuous_batch(
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                let requeued = serde_json::json!({
-                    "type": "generate",
-                    "id": key.id,
-                    "attempt_id": key.attempt_id,
-                    "prompt": prompt
-                });
-                inbox.push_front(daemon_regular_with_admission(
-                    requeued,
-                    Some(admission),
-                ));
+                let handoff = match handoff_started_in_think(
+                    sched,
+                    lane_idx,
+                    &key,
+                    &pending_req,
+                    GenerationRoute::QwenAr,
+                ) {
+                    Ok(msg) => msg,
+                    Err(reason) => {
+                        return fail_all(sched, gpu, batch_state, stdout, reason);
+                    }
+                };
+                inbox.push_front(handoff);
+                continue;
             }
 
             if let Err(e) = batch_state.reset_lane(gpu, &config, lane_idx) {
@@ -1573,6 +1645,10 @@ pub fn drive_lfm_continuous_batch(
                     barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
                     break;
                 }
+                DaemonMsg::SingletonWithAdmission(json, transfer) => {
+                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -1724,12 +1800,19 @@ pub fn drive_lfm_continuous_batch(
                             }
                         };
                         if started_in_think {
-                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                            let handoff = match handoff_admitted_started_in_think(
                                 &id,
                                 attempt_id,
                                 admission,
-                            );
-                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
+                                json,
+                                GenerationRoute::LfmAr,
+                            ) {
+                                Ok(msg) => msg,
+                                Err(reason) => {
+                                    return fail_all(sched, gpu, batch_state, stdout, reason)
+                                }
+                            };
+                            barrier = Some(handoff);
                             break;
                         }
                         if prompt_tokens.is_empty() {
@@ -1791,6 +1874,7 @@ pub fn drive_lfm_continuous_batch(
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
                             admission,
+                            original_msg: json.clone(),
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -1976,13 +2060,8 @@ pub fn drive_lfm_continuous_batch(
             let started_in_think = pending_req.started_in_think;
             let admission = pending_req.admission;
             if started_in_think {
-                let prompt = pending_req.prompt.clone();
-                let _ = batch_transfer_abort_to_singleton_and_clear(
-                    &key.id,
-                    key.attempt_id,
-                    admission,
-                );
-                let _ = sched.abort_lane(lane_idx, &key, admission);
+                // Reset while the batch owner remains live, then retire the
+                // lane and hand the complete original request to singleton.
                 if let Err(err) = batch_state.reset_lane(gpu, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -1992,16 +2071,19 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                let requeued = serde_json::json!({
-                    "type": "generate",
-                    "id": key.id,
-                    "attempt_id": key.attempt_id,
-                    "prompt": prompt
-                });
-                inbox.push_front(daemon_regular_with_admission(
-                    requeued,
-                    Some(admission),
-                ));
+                let handoff = match handoff_started_in_think(
+                    sched,
+                    lane_idx,
+                    &key,
+                    &pending_req,
+                    GenerationRoute::LfmAr,
+                ) {
+                    Ok(msg) => msg,
+                    Err(reason) => {
+                        return fail_all(sched, gpu, batch_state, stdout, reason);
+                    }
+                };
+                inbox.push_front(handoff);
                 break;
             }
             // Re-validate capacity at assignment time (defensive; lane_capacity is the source of truth).
@@ -2996,6 +3078,10 @@ pub fn drive_qwen35_ep_continuous_batch(
                     barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
                     break;
                 }
+                DaemonMsg::SingletonWithAdmission(json, transfer) => {
+                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -3158,13 +3244,19 @@ pub fn drive_qwen35_ep_continuous_batch(
                             }
                         };
                         if started_in_think {
-                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                            let handoff = match handoff_admitted_started_in_think(
                                 &id,
                                 attempt_id,
                                 admission,
-                            );
-                            barrier =
-                                Some(daemon_regular_with_admission(json, Some(admission)));
+                                json,
+                                GenerationRoute::QwenAr,
+                            ) {
+                                Ok(msg) => msg,
+                                Err(reason) => {
+                                    return fail_all(sched, gpus, batch_state, stdout, reason)
+                                }
+                            };
+                            barrier = Some(handoff);
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
@@ -3204,6 +3296,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
                             admission,
+                            original_msg: json.clone(),
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -3266,13 +3359,8 @@ pub fn drive_qwen35_ep_continuous_batch(
             let started_in_think = pending_req.started_in_think;
             let admission = pending_req.admission;
             if started_in_think {
-                let prompt = pending_req.prompt.clone();
-                let _ = batch_transfer_abort_to_singleton_and_clear(
-                    &key.id,
-                    key.attempt_id,
-                    admission,
-                );
-                let _ = sched.abort_lane(lane_idx, &key, admission);
+                // Reset while the batch owner remains live, then retire the
+                // lane and hand the complete original request to singleton.
                 if let Err(err) = batch_state.reset_lane(gpus, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -3282,16 +3370,19 @@ pub fn drive_qwen35_ep_continuous_batch(
                         format!("EP reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                let requeued = serde_json::json!({
-                    "type":"generate",
-                    "id":key.id,
-                    "attempt_id":key.attempt_id,
-                    "prompt":prompt
-                });
-                inbox.push_front(daemon_regular_with_admission(
-                    requeued,
-                    Some(admission),
-                ));
+                let handoff = match handoff_started_in_think(
+                    sched,
+                    lane_idx,
+                    &key,
+                    &pending_req,
+                    GenerationRoute::QwenAr,
+                ) {
+                    Ok(msg) => msg,
+                    Err(reason) => {
+                        return fail_all(sched, gpus, batch_state, stdout, reason);
+                    }
+                };
+                inbox.push_front(handoff);
                 break;
             }
             if let Err(e) = batch_state.reset_lane(gpus, config, lane_idx) {
@@ -3757,11 +3848,8 @@ pub fn emit_uncorrelated_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
-
-    fn lock() -> MutexGuard<'static, ()> {
-        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::ar::generation_test_lock()
     }
 
     #[test]
@@ -3834,6 +3922,270 @@ mod tests {
         }
     }
 
+    fn assert_started_in_think_handoff(
+        route: GenerationRoute,
+        id: &str,
+        attempt_id: u64,
+        abort_latched: bool,
+    ) {
+        let original = serde_json::json!({
+            "type": "generate",
+            "id": id,
+            "attempt_id": attempt_id,
+            "prompt": "full prompt",
+            "system": "full system",
+            "messages": [{"role": "user", "content": "full prompt"}],
+            "tools": [{"type": "function", "function": {"name": "keep"}}],
+            "stop": ["<done>"],
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "max_tokens": 7,
+            "seed": 9,
+            "reasoning_effort": "low",
+            "assistant_prefix": "open_think",
+        });
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+        let admission = batch_announce_terminal(id, attempt_id).expect("batch admission");
+        activate_terminal_control(id, attempt_id);
+        set_active_attempt_id(attempt_id);
+        if abort_latched {
+            apply_terminal_control("abort", id, attempt_id);
+            batch_apply_terminal_control("abort", id, attempt_id);
+        }
+        let singleton_generation =
+            terminal_generation(id, attempt_id).expect("singleton transaction");
+        assert!(batch_transition_to_queued(id, attempt_id, admission));
+        let key = AttemptKey::new(id, attempt_id);
+        let sampling = BatchSampling {
+            temp: 0.3,
+            top_p: 0.8,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        };
+        let mut sched = ContinuousBatchScheduler::new(1, 64);
+        assert!(sched.enqueue(BatchPendingRequest {
+            key: key.clone(),
+            admission,
+            original_msg: original.clone(),
+            prompt: "full prompt".to_string(),
+            prompt_tokens: vec![1, 2, 3],
+            started_in_think: true,
+            system: Some("full system".to_string()),
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+            max_think_tokens: 16,
+            max_tokens: 7,
+            client_seed: Some(9),
+            sampling,
+        }));
+        let (assigned_key, ticket) = sched.try_assign_one().expect("assigned think lane");
+        assert_eq!(assigned_key, key);
+
+        let mut output = Vec::new();
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            crate::ar::emit_generation_start(route, &mut output, id, true);
+        }
+        let pending = sched.pending.get(&key).cloned().expect("pending request");
+        let handoff = handoff_started_in_think(&mut sched, ticket.lane, &key, &pending, route)
+            .expect("singleton handoff");
+        assert_eq!(sched.active_count(), 0, "barrier lane retired");
+        assert!(
+            sched.pending.is_empty(),
+            "barrier request removed from batch"
+        );
+        assert!(
+            sched.try_assign_one().is_none(),
+            "barrier request cannot continue in GPU lane"
+        );
+        assert_eq!(batch_terminal_generation(id, attempt_id), None);
+
+        let (handoff_msg, transfer) = match handoff {
+            DaemonMsg::SingletonWithAdmission(value, transfer) => (value, transfer),
+            _ => panic!("think barrier did not produce singleton ownership"),
+        };
+        assert_eq!(handoff_msg, original, "full request payload was preserved");
+        assert_eq!(transfer.admission(), admission);
+
+        // The outer main transaction has ended; adoption restores the exact
+        // lifecycle generation and any pre-latched abort without reactivation.
+        clear_terminal_control();
+        assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+        assert_eq!(
+            terminal_generation(id, attempt_id),
+            Some(singleton_generation)
+        );
+        assert_eq!(check_abort(id), abort_latched);
+
+        {
+            let _scope = BatchAttemptScope::enter(attempt_id);
+            crate::ar::emit_generation_start(route, &mut output, id, true);
+            if abort_latched {
+                crate::ar::emit_active_route_cancel(&mut output, id, 0);
+            } else {
+                crate::ar::emit_generation_error(
+                    route,
+                    &mut output,
+                    Some(id),
+                    "think barrier normal terminal",
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+        }
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("UTF-8 events")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[1]["type"], "gen_start", "fresh sequential start");
+        if abort_latched {
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["type"], "aborted");
+            assert_eq!(events[3]["type"], "done");
+        } else {
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[2]["type"], "error");
+        }
+        assert_eq!(crate::ar::active_generation_route(), None);
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+    }
+
+    fn assert_admitted_started_in_think_handoff(
+        route: GenerationRoute,
+        id: &str,
+        attempt_id: u64,
+        abort_latched: bool,
+    ) {
+        let original = serde_json::json!({
+            "type": "generate",
+            "id": id,
+            "attempt_id": attempt_id,
+            "prompt": "full prompt",
+            "messages": [{"role": "user", "content": "full prompt"}],
+            "tools": [{"type": "function", "function": {"name": "keep"}}],
+            "stop": ["<done>"],
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "max_tokens": 7,
+            "seed": 9,
+            "reasoning_effort": "low",
+            "assistant_prefix": "open_think",
+        });
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+        let admission = batch_announce_terminal(id, attempt_id).expect("batch admission");
+        activate_terminal_control(id, attempt_id);
+        set_active_attempt_id(attempt_id);
+        if abort_latched {
+            apply_terminal_control("abort", id, attempt_id);
+            batch_apply_terminal_control("abort", id, attempt_id);
+        }
+        let singleton_generation =
+            terminal_generation(id, attempt_id).expect("singleton transaction");
+        let mut output = Vec::new();
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            crate::ar::emit_generation_start(route, &mut output, id, true);
+        }
+        let handoff =
+            handoff_admitted_started_in_think(id, attempt_id, admission, original.clone(), route)
+                .expect("admitted singleton handoff");
+        assert_eq!(batch_terminal_generation(id, attempt_id), None);
+        let (handoff_msg, transfer) = match handoff {
+            DaemonMsg::SingletonWithAdmission(value, transfer) => (value, transfer),
+            _ => panic!("admitted think barrier did not produce singleton ownership"),
+        };
+        assert_eq!(handoff_msg, original, "full admitted payload was preserved");
+        assert_eq!(transfer.admission(), admission);
+
+        clear_terminal_control();
+        assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+        assert_eq!(
+            terminal_generation(id, attempt_id),
+            Some(singleton_generation)
+        );
+        assert_eq!(check_abort(id), abort_latched);
+        {
+            let _scope = BatchAttemptScope::enter(attempt_id);
+            crate::ar::emit_generation_start(route, &mut output, id, true);
+            if abort_latched {
+                crate::ar::emit_active_route_cancel(&mut output, id, 0);
+            } else {
+                crate::ar::emit_generation_error(
+                    route,
+                    &mut output,
+                    Some(id),
+                    "admitted think barrier normal terminal",
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+        }
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("UTF-8 events")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[1]["type"], "gen_start", "fresh sequential start");
+        if abort_latched {
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["type"], "aborted");
+            assert_eq!(events[3]["type"], "done");
+        } else {
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[2]["type"], "error");
+        }
+        assert_eq!(crate::ar::active_generation_route(), None);
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn admitted_started_in_think_barrier_preserves_all_batch_routes() {
+        let _guard = lock();
+        for (route, id, attempt_id, abort_latched) in [
+            (GenerationRoute::QwenAr, "qwen-admitted-think", 504, true),
+            (GenerationRoute::LfmAr, "lfm-admitted-think", 505, false),
+            (GenerationRoute::QwenAr, "ep-admitted-think", 506, false),
+        ] {
+            assert_admitted_started_in_think_handoff(route, id, attempt_id, abort_latched);
+        }
+    }
+
+    #[test]
+    fn qwen_started_in_think_barrier_preserves_singleton_owner() {
+        let _guard = lock();
+        assert_started_in_think_handoff(GenerationRoute::QwenAr, "qwen-think", 501, true);
+    }
+
+    #[test]
+    fn lfm_started_in_think_barrier_preserves_full_request() {
+        let _guard = lock();
+        assert_started_in_think_handoff(GenerationRoute::LfmAr, "lfm-think", 502, false);
+    }
+
+    #[test]
+    fn ep_started_in_think_barrier_preserves_full_request() {
+        let _guard = lock();
+        assert_started_in_think_handoff(GenerationRoute::QwenAr, "ep-think", 503, false);
+    }
+
     #[test]
     fn lfm_assignment_capacity_error_releases_route_latch_for_reuse() {
         let _guard = lock();
@@ -3859,6 +4211,13 @@ mod tests {
         assert!(sched.enqueue(BatchPendingRequest {
             key: key.clone(),
             admission,
+            original_msg: serde_json::json!({
+                "type": "generate",
+                "id": id,
+                "attempt_id": attempt_id,
+                "prompt": "oversized",
+                "max_tokens": 4,
+            }),
             prompt: "oversized".to_string(),
             prompt_tokens: vec![1; 7],
             started_in_think: false,
@@ -3910,7 +4269,8 @@ mod tests {
         assert_eq!(batch_terminal_generation(id, attempt_id), None);
 
         // Reusing the exact wire key must claim a fresh route start rather
-        let reuse_admission = batch_announce_terminal(id, attempt_id).expect("reused batch admission");
+        let reuse_admission =
+            batch_announce_terminal(id, attempt_id).expect("reused batch admission");
         {
             let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, reuse_admission);
             crate::ar::emit_generation_start(

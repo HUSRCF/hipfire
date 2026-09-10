@@ -5263,18 +5263,22 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) fn generation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 mod route_scope_tests {
     use super::*;
     use hipfire_engine::terminal::{
         activate_terminal_control, clear_terminal_control, set_active_attempt_id,
     };
-    use std::sync::{LazyLock, Mutex, MutexGuard};
-
-    fn route_lock() -> MutexGuard<'static, ()> {
-        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn route_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::generation_test_lock()
     }
-
     fn parse_events(sink: &[u8]) -> Vec<serde_json::Value> {
         std::str::from_utf8(sink)
             .unwrap()

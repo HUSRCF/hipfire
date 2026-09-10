@@ -61,7 +61,13 @@ fn req(key: AttemptKey, sampling: BatchSampling) -> BatchPendingRequest {
         batch_terminal_generation(&key.id, key.attempt_id).expect("live batch admission");
     BatchPendingRequest {
         admission,
-        key,
+        key: key.clone(),
+        original_msg: serde_json::json!({
+            "type": "generate",
+            "id": key.id.clone(),
+            "attempt_id": key.attempt_id,
+            "prompt": "hi",
+        }),
         prompt: "hi".into(),
         prompt_tokens: vec![1, 2, 3],
         started_in_think: false,

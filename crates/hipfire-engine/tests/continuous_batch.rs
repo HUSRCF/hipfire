@@ -95,6 +95,12 @@ fn batch_transfer_abort_to_singleton_and_clear(id: &str, attempt_id: u64) -> boo
 fn req(key: AttemptKey, sampling: BatchSampling) -> BatchPendingRequest {
     BatchPendingRequest {
         admission: admission(&key),
+        original_msg: serde_json::json!({
+            "type": "generate",
+            "id": key.id.clone(),
+            "attempt_id": key.attempt_id,
+            "prompt": "hi",
+        }),
         key,
         prompt: "hi".into(),
         prompt_tokens: vec![1, 2, 3],
@@ -1118,7 +1124,13 @@ fn req_with_tokens(
 ) -> BatchPendingRequest {
     BatchPendingRequest {
         admission: admission(&key),
-        key,
+        key: key.clone(),
+        original_msg: serde_json::json!({
+            "type": "generate",
+            "id": key.id.clone(),
+            "attempt_id": key.attempt_id,
+            "prompt": "hi",
+        }),
         prompt: "hi".into(),
         prompt_tokens: tokens,
         started_in_think: think,

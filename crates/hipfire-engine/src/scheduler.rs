@@ -10,10 +10,11 @@
 use std::time::Instant;
 
 use crate::terminal::{
-    batch_active_owner_matches, batch_bind_active, batch_check_abort, batch_clear_terminal_at_generation,
-    batch_is_current, batch_mark_ready_with_pending, batch_poll_decision,
-    batch_ready_owner_matches, batch_transition_to_queued, AttemptKey, BatchGeneration,
-    ClientTerminalDecision, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_active_owner_matches, batch_bind_active, batch_check_abort,
+    batch_clear_terminal_at_generation, batch_is_current, batch_mark_ready_with_pending,
+    batch_poll_decision, batch_ready_owner_matches, batch_transition_to_queued, AttemptKey,
+    BatchGeneration, ClientTerminalDecision, LaneTicket, SingletonTransfer,
+    CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -150,6 +151,9 @@ pub struct BatchPendingRequest {
     /// Opaque terminal-registry admission owner. This is independent of the
     /// scheduler's lane reuse generation.
     pub admission: BatchGeneration,
+    /// Exact wire request retained for a singleton handoff. Batch barriers
+    /// must not reconstruct a reduced generate payload.
+    pub original_msg: serde_json::Value,
     pub prompt: String,
     pub prompt_tokens: Vec<u32>,
     pub started_in_think: bool,
@@ -442,6 +446,51 @@ impl ContinuousBatchScheduler {
         self.pending_sampling.remove(expected);
         self.inbox.retain(|k| k != expected);
         batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    /// Retire a lane after a successful GPU reset while keeping the exact
+    /// batch terminal owner live for an immediate singleton handoff.
+    ///
+    /// Unlike [`Self::abort_lane`], this deliberately does not clear the
+    /// keyed terminal registry. The caller must consume that owner with
+    /// `batch_handoff_to_singleton_and_clear`; clearing it first would make a
+    /// reset failure or stale requeue unclaimable.
+    pub fn retire_lane_for_singleton(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => {
+                (t.ticket, t.ticket.generation)
+            }
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || !batch_active_owner_matches(
+                &expected.id,
+                expected.attempt_id,
+                admission,
+                ticket,
+            )
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        self.inbox.retain(|k| k != expected);
         self.maybe_clear_cohort();
         true
     }
@@ -990,7 +1039,20 @@ pub enum DaemonMsg {
     /// capability and must never be recovered by looking up the request key
     /// after the message has been admitted.
     RegularWithAdmission(serde_json::Value, BatchGeneration),
+    /// A batch think-barrier handoff that already owns the singleton
+    /// terminal transaction. Main must adopt the snapshot; it must not
+    /// re-announce or rediscover the retired batch admission.
+    SingletonWithAdmission(serde_json::Value, SingletonTransfer),
     ParseError(String),
+}
+
+/// Preserve an explicit singleton owner while a batch driver parks a full
+/// request as a sequential barrier.
+pub fn daemon_singleton_with_admission(
+    value: serde_json::Value,
+    transfer: SingletonTransfer,
+) -> DaemonMsg {
+    DaemonMsg::SingletonWithAdmission(value, transfer)
 }
 
 /// Preserve an admission token while a batch driver parks a message as a

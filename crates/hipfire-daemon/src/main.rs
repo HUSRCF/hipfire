@@ -914,9 +914,13 @@ fn main() {
     });
     let mut inbox = DaemonInbox::new(msg_rx);
     while let Ok(daemon_msg) = inbox.recv() {
-        let (msg, admission_from_message) = match daemon_msg {
-            DaemonMsg::Regular(m) => (m, None),
-            DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission)),
+        let (msg, admission_from_message, mut singleton_transfer_from_message) = match daemon_msg {
+            DaemonMsg::Regular(m) => (m, None, None),
+            DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission), None),
+            DaemonMsg::SingletonWithAdmission(m, transfer) => {
+                let admission = transfer.admission();
+                (m, Some(admission), Some(transfer))
+            }
             DaemonMsg::ParseError(e) => {
                 tracing::warn!(error = %e, "daemon received invalid JSON");
                 emit_uncorrelated_error(
@@ -2268,6 +2272,7 @@ fn main() {
                 set_active_attempt_id(gen_attempt_id);
                 let _attempt_guard = ActiveAttemptGuard;
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let singleton_handoff = singleton_transfer_from_message.is_some();
                 let admission = match admission_from_message {
                     Some(admission) => admission,
                     None => {
@@ -2393,16 +2398,35 @@ fn main() {
                     continue;
                 }
 
-                // Fresh terminal-control transaction for this generate attempt.
-                // Cleared by TerminalControlGuard on all exits from this arm.
-                activate_terminal_control(id, gen_attempt_id);
+                // Fresh terminal-control transaction for ordinary generates.
+                // A think-barrier message instead restores the exact singleton
+                // snapshot captured before the driver's outer guard dropped.
+                if let Some(transfer) = singleton_transfer_from_message.take() {
+                    if !adopt_singleton_transfer(id, gen_attempt_id, transfer) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id),
+                            "singleton handoff ownership is invalid",
+                            "internal",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                } else {
+                    activate_terminal_control(id, gen_attempt_id);
+                }
                 let _terminal_control_guard = TerminalControlGuard;
-                let mut batch_scope =
-                    BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                let mut batch_scope = if singleton_handoff {
+                    BatchAttemptScope::enter_for(id, gen_attempt_id)
+                } else {
+                    BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission)
+                };
                 let _batch_cleanup = BatchTerminalCleanup {
                     id: id.to_owned(),
                     attempt_id: gen_attempt_id,
-                    admission: Some(admission),
+                    admission: (!singleton_handoff).then_some(admission),
                 };
                 gpu.replay.begin_replay_observation_window();
                 let prompt = msg
@@ -3057,17 +3081,18 @@ fn main() {
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
                     });
-                    let ep_batch_eligible = if batch_scheduler.is_some() && m.ep.is_some() {
-                        is_qwen_ep_batch_request_eligible(
-                            &msg,
-                            m,
-                            continuous_batch_size,
-                            serve_continuous_batch,
-                            pflash_active,
-                        )
-                    } else {
-                        false
-                    };
+                    let ep_batch_eligible =
+                        if !singleton_handoff && batch_scheduler.is_some() && m.ep.is_some() {
+                            is_qwen_ep_batch_request_eligible(
+                                &msg,
+                                m,
+                                continuous_batch_size,
+                                serve_continuous_batch,
+                                pflash_active,
+                            )
+                        } else {
+                            false
+                        };
                     if ep_batch_eligible {
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         if batch_check_abort(id, gen_attempt_id, admission) {
@@ -3150,6 +3175,7 @@ fn main() {
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 admission,
+                                original_msg: msg.clone(),
                                 prompt: prompt_owned.clone(),
                                 prompt_tokens: prompt_tokens.clone(),
                                 started_in_think,
@@ -3204,7 +3230,8 @@ fn main() {
                         }
                     }
                     // Enforce batch-only for EP: if EP batch is staged, non-eligible must fail closed, not silently fall back.
-                    let ep_batch_staged = batch_scheduler.is_some()
+                    let ep_batch_staged = !singleton_handoff
+                        && batch_scheduler.is_some()
                         && m.ep
                             .as_ref()
                             .is_some_and(|ep| matches!(ep.inner, EpArch::Qwen35 { .. }));
@@ -3223,7 +3250,7 @@ fn main() {
                             continue;
                         }
                     }
-                    let batch_eligible = if batch_scheduler.is_some() {
+                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
                         is_batch_request_eligible(
                             &msg,
                             m,
@@ -3323,6 +3350,7 @@ fn main() {
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 admission,
+                                original_msg: msg.clone(),
                                 prompt: prompt_owned.clone(),
                                 prompt_tokens: prompt_tokens.clone(),
                                 started_in_think,
@@ -3456,13 +3484,16 @@ fn main() {
                             continue;
                         }
                     } else {
-                        // Sequential/default mode does not need the keyed batch
-                        // announcement the reader made for this generate. Transfer
-                        // any pre-latched abort into the singleton, then clear the
-                        // keyed entry so default service cannot leak state across
-                        // request-key reuse or a later batch-enabled load.
-                        let _ =
-                            batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id, admission);
+                        // Ordinary sequential mode transfers the reader-owned
+                        // batch key here. A dedicated singleton handoff has
+                        // already retired it and must only rebind the scope.
+                        if !singleton_handoff {
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
+                        }
                         batch_scope.rebind_for(gen_attempt_id);
                     }
                     // Did the request explicitly set a non-temperature sampling

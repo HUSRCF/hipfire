@@ -35,6 +35,7 @@ pub enum TerminalControlDecision {
 /// via [`await_client_terminal_commit`]. Terminal writers claim the
 /// transaction before emitting a terminal so an abort/error race cannot
 /// produce a second terminal.
+#[derive(Debug, Clone)]
 pub struct ActiveTerminalControl {
     pub id: String,
     pub attempt_id: u64,
@@ -44,6 +45,29 @@ pub struct ActiveTerminalControl {
     pub ready: bool,
     pub decision: Option<TerminalControlDecision>,
     pub terminal_claimed: bool,
+}
+
+/// Ownership handed from a batch lane to the sequential singleton.
+///
+/// The batch admission is provenance only after handoff; the singleton
+/// transaction snapshot is restored verbatim by the main loop. In particular,
+/// a pre-latched abort and its lifecycle generation must survive the driver's
+/// return and the outer terminal-control guard.
+#[derive(Debug, Clone)]
+pub struct SingletonTransfer {
+    admission: BatchGeneration,
+    batch_abort_latched: bool,
+    singleton: Option<ActiveTerminalControl>,
+}
+
+impl SingletonTransfer {
+    pub fn admission(&self) -> BatchGeneration {
+        self.admission
+    }
+
+    pub fn batch_abort_latched(&self) -> bool {
+        self.batch_abort_latched
+    }
 }
 
 // State intentionally carries no retired singleton key: a cleared lifecycle
@@ -622,30 +646,80 @@ pub fn batch_wait_decision(
     }
 }
 
+/// Remove an exact batch admission while capturing ownership of the currently
+/// active singleton transaction. The caller must retire its lane only after
+/// any fallible GPU reset succeeds; this function then makes the batch owner
+/// unavailable exactly once and returns the snapshot for the outer main loop.
+pub fn batch_handoff_to_singleton_and_clear(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> Option<SingletonTransfer> {
+    let singleton = {
+        let cell = terminal_control();
+        let g = cell.mu.lock().unwrap();
+        g.active
+            .as_ref()
+            .filter(|active| active.id == id && active.attempt_id == attempt_id)
+            .cloned()
+    };
+    let (batch_abort_latched, removed) = {
+        let cell = batch_terminal_control();
+        let mut g = cell.mu.lock().unwrap();
+        let key = AttemptKey::new(id, attempt_id);
+        let entry = g.entries.get(&key)?;
+        if entry.generation != generation {
+            return None;
+        }
+        let batch_abort_latched = entry.abort_latched;
+        g.entries.remove(&key);
+        cell.cv.notify_all();
+        (batch_abort_latched, true)
+    };
+    removed.then_some(SingletonTransfer {
+        admission: generation,
+        batch_abort_latched,
+        singleton,
+    })
+}
+
+/// Restore a transferred singleton transaction without allocating a new
+/// lifecycle generation or resetting an already-latched decision.
+pub fn adopt_singleton_transfer(id: &str, attempt_id: u64, transfer: SingletonTransfer) -> bool {
+    let Some(singleton) = transfer.singleton else {
+        return false;
+    };
+    if singleton.id != id || singleton.attempt_id != attempt_id {
+        return false;
+    }
+    let cell = terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    g.active = Some(singleton);
+    cell.cv.notify_all();
+    true
+}
+
 /// Transfer an exact batch admission to the sequential singleton. The batch
 /// lock is released before taking the singleton lock or applying control.
+///
+/// Existing callers that do not carry an explicit handoff message retain the
+/// historical behavior: create a singleton transaction only when the batch
+/// side had an abort latched.
 pub fn batch_transfer_abort_to_singleton_and_clear(
     id: &str,
     attempt_id: u64,
     generation: BatchGeneration,
 ) -> bool {
-    let had_abort = {
-        let cell = batch_terminal_control();
-        let mut g = cell.mu.lock().unwrap();
-        let key = AttemptKey::new(id, attempt_id);
-        let Some(entry) = g.entries.get(&key) else {
-            return false;
-        };
-        if entry.generation != generation {
-            return false;
-        }
-        let had_abort = entry.abort_latched;
-        g.entries.remove(&key);
-        cell.cv.notify_all();
-        had_abort
+    let Some(transfer) = batch_handoff_to_singleton_and_clear(id, attempt_id, generation) else {
+        return false;
     };
-    if had_abort {
+    let had_abort = transfer.batch_abort_latched();
+    if transfer.singleton.is_none() {
         activate_terminal_control(id, attempt_id);
+        if had_abort {
+            apply_terminal_control("abort", id, attempt_id);
+        }
+    } else if had_abort && !check_abort(id) {
         apply_terminal_control("abort", id, attempt_id);
     }
     had_abort
