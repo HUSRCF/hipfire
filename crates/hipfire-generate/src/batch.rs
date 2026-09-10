@@ -45,20 +45,24 @@ use std::time::Instant;
 struct BatchTerminalCleanup {
     id: String,
     attempt_id: u64,
+    generation: Option<u64>,
 }
 
 impl BatchTerminalCleanup {
-    fn new(key: &AttemptKey) -> Self {
+    fn new(key: &AttemptKey, generation: Option<u64>) -> Self {
         Self {
             id: key.id.clone(),
             attempt_id: key.attempt_id,
+            generation,
         }
     }
 }
 
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
-        batch_clear_terminal(&self.id, self.attempt_id);
+        if let Some(generation) = self.generation {
+            batch_clear_terminal_at_generation(&self.id, self.attempt_id, generation);
+        }
     }
 }
 
@@ -391,7 +395,7 @@ pub fn drive_qwen_continuous_batch(
             producers[idx] = None;
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             // Transactional commit: reset GPU first, then host commit_lane,
             // and only then emit the staged done. Never done+error.
             let reset_ok = match batch_state.reset_lane(gpu, &config, idx) {
@@ -409,7 +413,7 @@ pub fn drive_qwen_continuous_batch(
             let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
             // Keep the keyed registry alive through the terminal writer. This
             // also clears it on error/early return after the host transition.
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -1330,7 +1334,7 @@ pub fn drive_lfm_continuous_batch(
             let _ = sched.abort_lane(idx, &key);
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let reset_ok = match batch_state.reset_lane(gpu, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -1344,7 +1348,7 @@ pub fn drive_lfm_continuous_batch(
                 }
             };
             let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -2723,7 +2727,7 @@ pub fn drive_qwen35_ep_continuous_batch(
             producers[idx] = None;
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let reset_ok = match batch_state.reset_lane(gpus, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -2737,7 +2741,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 }
             };
             let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!(),
                 BatchCommitTeardownClass::CommitFailed => {

@@ -109,11 +109,14 @@ fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Di
 struct BatchTerminalCleanup {
     id: String,
     attempt_id: u64,
+    generation: Option<u64>,
 }
 
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
-        batch_clear_terminal(&self.id, self.attempt_id);
+        if let Some(generation) = self.generation {
+            batch_clear_terminal_at_generation(&self.id, self.attempt_id, generation);
+        }
     }
 }
 
@@ -2347,6 +2350,7 @@ fn main() {
                 let _batch_cleanup = BatchTerminalCleanup {
                     id: id.to_owned(),
                     attempt_id: gen_attempt_id,
+                    generation: batch_scope.admission_generation(),
                 };
                 gpu.replay.begin_replay_observation_window();
                 let prompt = msg

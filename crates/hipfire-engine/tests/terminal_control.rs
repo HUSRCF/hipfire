@@ -10,10 +10,11 @@
 
 use hipfire_engine::emit::emit_active_attempt_error;
 use hipfire_engine::terminal::{
-    activate_terminal_control, apply_terminal_control, await_client_terminal_commit,
-    batch_announce_terminal, batch_bind_active, batch_clear_all_terminals, batch_clear_terminal,
-    batch_terminal_control, batch_transition_to_queued, check_abort, claim_terminal,
-    claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
+    activate_terminal_control, active_batch_generation, apply_terminal_control,
+    await_client_terminal_commit, batch_announce_terminal, batch_bind_active,
+    batch_clear_all_terminals, batch_clear_terminal, batch_clear_terminal_at_generation,
+    batch_terminal_control, batch_terminal_generation, batch_transition_to_queued, check_abort,
+    claim_terminal, claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
     emit_staged_terminal_done, mark_terminal_control_ready, set_active_attempt_id,
     terminal_control, terminal_generation, wait_terminal_control_decision, BatchAttemptScope,
     ClientTerminalDecision, LaneTicket, TerminalControlDecision,
@@ -448,5 +449,84 @@ fn batch_generation_reuse_rejects_stale_scope_without_retirement_growth() {
     assert!(state.entries.is_empty());
     drop(state);
     batch_clear_all_terminals();
+    reset();
+}
+
+#[test]
+fn batch_conditional_cleanup_preserves_reused_key() {
+    let _lock = begin_test();
+    let id = "batch-reuse";
+    let attempt_id = 41;
+    assert!(batch_announce_terminal(id, attempt_id));
+    let scope_a = BatchAttemptScope::enter_for(id, attempt_id);
+    let generation_a = scope_a.admission_generation().expect("generation A");
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+
+    assert!(batch_announce_terminal(id, attempt_id));
+    let generation_b = batch_terminal_generation(id, attempt_id).expect("generation B");
+    assert_ne!(generation_a, generation_b);
+    assert!(!batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+    assert_eq!(
+        batch_terminal_generation(id, attempt_id),
+        Some(generation_b)
+    );
+    drop(scope_a);
+
+    let scope_b = BatchAttemptScope::enter_for(id, attempt_id);
+    assert_eq!(scope_b.admission_generation(), Some(generation_b));
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_b
+    ));
+    drop(scope_b);
+    reset();
+}
+
+#[test]
+fn batch_rebind_clears_tls_without_binding_reused_generation() {
+    let _lock = begin_test();
+    let id = "batch-rebind";
+    let attempt_id = 42;
+    assert!(batch_announce_terminal(id, attempt_id));
+    let mut scope_a = BatchAttemptScope::enter_for(id, attempt_id);
+    let generation_a = scope_a.admission_generation().expect("generation A");
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+
+    assert!(batch_announce_terminal(id, attempt_id));
+    let generation_b = batch_terminal_generation(id, attempt_id).expect("generation B");
+    scope_a.rebind_for(id, attempt_id);
+    assert_eq!(active_batch_generation(), None);
+    assert!(!batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+    assert_eq!(
+        batch_terminal_generation(id, attempt_id),
+        Some(generation_b)
+    );
+
+    let scope_b = BatchAttemptScope::enter_for(id, attempt_id);
+    assert_eq!(scope_b.admission_generation(), Some(generation_b));
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_b
+    ));
+    drop(scope_b);
+    drop(scope_a);
     reset();
 }

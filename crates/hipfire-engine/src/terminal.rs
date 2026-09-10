@@ -46,7 +46,6 @@ pub struct ActiveTerminalControl {
     pub terminal_claimed: bool,
 }
 
-
 // State intentionally carries no retired singleton key: a cleared lifecycle
 // must fail closed until an explicit activation establishes a new owner.
 
@@ -399,6 +398,41 @@ pub fn batch_clear_terminal(id: &str, attempt_id: u64) {
     cell.cv.notify_all();
 }
 
+/// Return the admission generation for an exact batch key.
+///
+/// Callers may capture this while entering a request-owned scope, but cleanup
+/// must pass the captured value to [`batch_clear_terminal_at_generation`]
+/// rather than looking it up again after work completes.
+pub fn batch_terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    g.entries
+        .get(&AttemptKey::new(id, attempt_id))
+        .map(|entry| entry.generation)
+}
+
+/// Remove a batch entry only when its admission generation still matches.
+///
+/// A request that has retired generation A must not remove a later admission
+/// B that reuses the same `(id, attempt_id)` key.
+pub fn batch_clear_terminal_at_generation(id: &str, attempt_id: u64, generation: u64) -> bool {
+    if generation == 0 {
+        return false;
+    }
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    let matches = g
+        .entries
+        .get(&key)
+        .is_some_and(|entry| entry.generation == generation);
+    if matches {
+        g.entries.remove(&key);
+        cell.cv.notify_all();
+    }
+    matches
+}
+
 pub fn batch_clear_all_terminals() {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -660,6 +694,7 @@ impl Drop for ActiveAttemptGuard {
 pub struct BatchAttemptScope {
     pub previous: u64,
     previous_batch_generation: Option<u64>,
+    admission_generation: Option<u64>,
 }
 
 impl BatchAttemptScope {
@@ -674,9 +709,13 @@ impl BatchAttemptScope {
     /// Rebind an existing outer scope after its keyed batch entry is retired.
     /// Sequential fallback then remains eligible for the singleton claim while
     /// preserving the scope's original TLS values for Drop restoration.
-    pub fn rebind_for(&mut self, id: &str, attempt_id: u64) {
+    pub fn rebind_for(&mut self, _id: &str, attempt_id: u64) {
         set_active_attempt_id(attempt_id);
-        ACTIVE_BATCH_GENERATION.with(|c| c.set(batch_generation_for(Some(id), attempt_id)));
+        ACTIVE_BATCH_GENERATION.with(|c| c.set(None));
+    }
+
+    pub fn admission_generation(&self) -> Option<u64> {
+        self.admission_generation
     }
 
     fn enter_with_generation(attempt_id: u64, generation: Option<u64>) -> Self {
@@ -687,6 +726,7 @@ impl BatchAttemptScope {
         Self {
             previous,
             previous_batch_generation,
+            admission_generation: generation,
         }
     }
 }
