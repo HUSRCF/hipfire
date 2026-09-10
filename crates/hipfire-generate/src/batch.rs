@@ -4044,6 +4044,214 @@ mod tests {
         let _guard = lock();
         assert_multi_lane_route_latches_release(GenerationRoute::QwenAr, MultiLaneTerminal::Error);
     }
+    struct FlushGateWriter {
+        pending: Vec<u8>,
+        visible: Vec<u8>,
+    }
+
+    impl FlushGateWriter {
+        fn events(&self) -> Vec<serde_json::Value> {
+            std::str::from_utf8(&self.visible)
+                .expect("visible terminal bytes are UTF-8")
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).expect("visible terminal event is JSON"))
+                .collect()
+        }
+    }
+
+    impl Write for FlushGateWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.pending.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.visible.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn route_terminals_flush_visible_done_error_and_cancel() {
+        let _guard = lock();
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+
+        let done_lanes = [
+            (
+                "flush-done-a",
+                701_u64,
+                batch_announce_terminal("flush-done-a", 701).expect("done A admission"),
+            ),
+            (
+                "flush-done-b",
+                702_u64,
+                batch_announce_terminal("flush-done-b", 702).expect("done B admission"),
+            ),
+        ];
+        let mut output = FlushGateWriter {
+            pending: Vec::new(),
+            visible: Vec::new(),
+        };
+        for &(id, attempt_id, admission) in &done_lanes {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            crate::ar::emit_generation_start(
+                GenerationRoute::QwenAr,
+                &mut output,
+                id,
+                false,
+            );
+            output.flush().expect("start flush");
+        }
+        for (done_index, &(id, attempt_id, admission)) in done_lanes.iter().enumerate() {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": attempt_id,
+                "finish_reason": "stop",
+            });
+            assert!(crate::ar::emit_generation_done_value(
+                GenerationRoute::QwenAr,
+                &mut output,
+                &pending,
+            ));
+            assert_eq!(
+                output
+                    .events()
+                    .iter()
+                    .filter(|event| event["type"] == "done" && event["id"] == id)
+                    .count(),
+                1,
+                "route done {done_index} must be visible after route emission"
+            );
+            assert!(batch_clear_terminal_at_generation(id, attempt_id, admission));
+        }
+
+        let error_admission =
+            batch_announce_terminal("flush-error", 703).expect("error admission");
+        {
+            let _scope =
+                BatchAttemptScope::enter_for_generation("flush-error", 703, error_admission);
+            crate::ar::emit_generation_start(
+                GenerationRoute::QwenAr,
+                &mut output,
+                "flush-error",
+                false,
+            );
+            output.flush().expect("error start flush");
+            assert!(crate::ar::emit_generation_error(
+                GenerationRoute::QwenAr,
+                &mut output,
+                Some("flush-error"),
+                "representative error",
+                "internal",
+                false,
+                true,
+            ));
+        }
+        assert_eq!(
+            output
+                .events()
+                .iter()
+                .filter(|event| event["type"] == "error" && event["id"] == "flush-error")
+                .count(),
+            1,
+            "route error must be visible after route emission"
+        );
+        assert!(batch_clear_terminal_at_generation(
+            "flush-error",
+            703,
+            error_admission
+        ));
+
+        let cancel_admission =
+            batch_announce_terminal("flush-cancel", 704).expect("cancel admission");
+        {
+            let _scope =
+                BatchAttemptScope::enter_for_generation("flush-cancel", 704, cancel_admission);
+            crate::ar::emit_generation_start(
+                GenerationRoute::QwenAr,
+                &mut output,
+                "flush-cancel",
+                false,
+            );
+            output.flush().expect("cancel start flush");
+            assert!(crate::ar::emit_generation_cancel(
+                GenerationRoute::QwenAr,
+                &mut output,
+                "flush-cancel",
+                1,
+            ));
+        }
+        assert_eq!(
+            output
+                .events()
+                .iter()
+                .filter(|event| event["type"] == "aborted" && event["id"] == "flush-cancel")
+                .count(),
+            1,
+            "route cancel must be visible after route emission"
+        );
+        assert!(batch_clear_terminal_at_generation(
+            "flush-cancel",
+            704,
+            cancel_admission
+        ));
+
+        let events = output.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "done"
+                    && (event["id"] == "flush-done-a" || event["id"] == "flush-done-b"))
+                .count(),
+            2,
+            "both committed done envelopes must be visible after route emission"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error" && event["id"] == "flush-error")
+                .count(),
+            1,
+            "route errors must be visible after route emission"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "aborted" && event["id"] == "flush-cancel")
+                .count(),
+            1,
+            "route cancels must be visible after route emission"
+        );
+
+        // A stale duplicate cannot write a second terminal, even though the
+        // route writer still performs its successful flush.
+        for &(id, attempt_id, _) in &done_lanes {
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": attempt_id,
+                "finish_reason": "stop",
+            });
+            let before = output.visible.len();
+            let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+            crate::ar::emit_generation_done_value(
+                GenerationRoute::QwenAr,
+                &mut output,
+                &pending,
+            );
+            assert_eq!(output.visible.len(), before);
+        }
+
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
 
     #[test]
     fn direct_driver_admission_errors_are_correlated_once_and_cleared() {

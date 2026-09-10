@@ -18,8 +18,8 @@ use hipfire_engine::terminal::{
     batch_apply_terminal_control, batch_clear_all_terminals, batch_clear_terminal,
     batch_clear_terminal_at_generation, batch_commit_teardown_class, batch_hit_length_cap,
     batch_lane_at_capacity, batch_terminal_control, batch_terminal_generation,
-    batch_should_finish_decode, emit_staged_terminal_done, AttemptKey, BatchAttemptScope,
-    BatchCommitTeardownClass, BatchGeneration, ClientTerminalDecision,
+    batch_should_finish_decode, batch_wait_decision, emit_staged_terminal_done, AttemptKey,
+    BatchAttemptScope, BatchCommitTeardownClass, BatchGeneration, ClientTerminalDecision,
 };
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -347,6 +347,123 @@ fn retained_commit_keeps_registry_until_single_done_claim() {
 
     batch_clear_terminal(&k.id, k.attempt_id);
     assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+}
+
+#[test]
+fn two_live_lanes_commit_independently_and_reuse_keys() {
+    let _l = begin();
+    let keys = [
+        AttemptKey::new("two-lane-a", 201),
+        AttemptKey::new("two-lane-b", 202),
+    ];
+    for key in &keys {
+        assert!(batch_announce_terminal(&key.id, key.attempt_id));
+    }
+
+    let mut sched = ContinuousBatchScheduler::new(2, 4096);
+    for key in &keys {
+        assert!(sched.enqueue(req(key.clone(), sampling(0.3, 1.0))));
+    }
+    let tickets = [
+        sched.try_assign_one().expect("lane A assignment"),
+        sched.try_assign_one().expect("lane B assignment"),
+    ];
+    assert_ne!(tickets[0].1.lane, tickets[1].1.lane);
+
+    let pending = [
+        serde_json::json!({
+            "type": "done",
+            "id": keys[0].id,
+            "attempt_id": keys[0].attempt_id,
+            "tokens": 1
+        }),
+        serde_json::json!({
+            "type": "done",
+            "id": keys[1].id,
+            "attempt_id": keys[1].attempt_id,
+            "tokens": 1
+        }),
+    ];
+    for (idx, (_, ticket)) in tickets.iter().enumerate() {
+        assert!(sched.mark_awaiting_commit(ticket.lane, pending[idx].clone()));
+    }
+    let generations = [
+        admission(&keys[0]),
+        admission(&keys[1]),
+    ];
+    let waiters = keys
+        .iter()
+        .zip(generations)
+        .map(|(key, generation)| {
+            let id = key.id.clone();
+            let attempt_id = key.attempt_id;
+            std::thread::spawn(move || {
+                batch_wait_decision(&id, attempt_id, generation, Duration::from_secs(1))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Both exact controls arrive while both lanes are live/ready.
+    for key in &keys {
+        batch_apply_terminal_control("commit", &key.id, key.attempt_id);
+    }
+    for waiter in waiters {
+        assert_eq!(
+            waiter.join().expect("commit waiter"),
+            ClientTerminalDecision::Commit
+        );
+    }
+
+    let mut sink = Vec::new();
+    for (idx, (key, ticket)) in tickets.iter().enumerate() {
+        let scope =
+            BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, generations[idx]);
+        assert_eq!(scope.admission_generation(), Some(generations[idx]));
+        assert!(sched.commit_lane_retain_terminal(
+            ticket.lane,
+            key,
+            generations[idx]
+        ));
+        emit_staged_terminal_done(&mut sink, &pending[idx]);
+        assert!(batch_clear_terminal_at_generation(
+            &key.id,
+            key.attempt_id,
+            generations[idx]
+        ));
+        drop(scope);
+        assert!(sched.lanes[ticket.lane].is_empty());
+
+        // A second emission from the retired owner must not create a duplicate.
+        emit_staged_terminal_done(&mut sink, &pending[idx]);
+    }
+
+    let events = String::from_utf8(sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["id"], keys[0].id);
+    assert_eq!(events[1]["id"], keys[1].id);
+    assert!(events.iter().all(|event| event["type"] == "done"));
+
+    // Same wire keys can be admitted again, while stale cleanup tokens cannot
+    // clear the replacement generations.
+    for (key, old_generation) in keys.iter().zip(generations) {
+        assert!(batch_announce_terminal(&key.id, key.attempt_id));
+        let new_generation = admission(key);
+        assert_ne!(new_generation, old_generation);
+        assert!(!batch_clear_terminal_at_generation(
+            &key.id,
+            key.attempt_id,
+            old_generation
+        ));
+        assert!(batch_clear_terminal_at_generation(
+            &key.id,
+            key.attempt_id,
+            new_generation
+        ));
+    }
 }
 
 #[test]

@@ -1323,7 +1323,7 @@ pub fn await_client_terminal_commit(
 pub fn emit_staged_terminal_done(
     stdout: &mut impl std::io::Write,
     pending_done: &serde_json::Value,
-) {
+) -> bool {
     if let Some(obj) = pending_done.as_object() {
         if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
             let attempt_id = obj
@@ -1331,12 +1331,14 @@ pub fn emit_staged_terminal_done(
                 .and_then(|value| value.as_u64())
                 .unwrap_or_else(active_attempt_id);
             if !claim_wire_terminal(id, attempt_id) {
-                return;
+                return false;
             }
         }
     }
-    let _ = writeln!(stdout, "{}", pending_done);
-    let _ = stdout.flush();
+    if writeln!(stdout, "{}", pending_done).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
 }
 
 /// Force-answer target request ID, set by the stdin-reader thread on

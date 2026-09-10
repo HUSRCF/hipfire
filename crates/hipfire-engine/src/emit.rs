@@ -192,16 +192,16 @@ pub fn emit_active_attempt_error(
     class: &str,
     retryable: bool,
     rolled_back: bool,
-) {
+) -> bool {
     let attempt_id = active_attempt_id();
     // Attempt zero is the uncorrelated pre-admission channel. It must never
     // be emitted by an active terminal writer.
     if attempt_id == 0 {
-        return;
+        return false;
     }
     if let Some(id) = id {
         if !claim_wire_terminal(id, attempt_id) {
-            return;
+            return false;
         }
     }
     write_error_envelope(
@@ -212,7 +212,7 @@ pub fn emit_active_attempt_error(
         retryable,
         rolled_back,
         attempt_id,
-    );
+    )
 }
 
 pub fn emit_uncorrelated_error(
@@ -223,7 +223,7 @@ pub fn emit_uncorrelated_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
+    let _ = write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
 }
 fn write_error_envelope(
     stdout: &mut impl std::io::Write,
@@ -233,7 +233,7 @@ fn write_error_envelope(
     retryable: bool,
     rolled_back: bool,
     attempt_id: u64,
-) {
+) -> bool {
     let mut envelope = serde_json::json!({
         "type": "error",
         "message": message,
@@ -245,8 +245,10 @@ fn write_error_envelope(
     if let Some(id) = id {
         envelope["id"] = serde_json::Value::String(id.to_owned());
     }
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
+    if writeln!(stdout, "{}", envelope).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
 }
 
 /// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
@@ -282,14 +284,18 @@ pub fn emit_qwen_ar_cancelled(
     stdout: &mut impl std::io::Write,
     id: &str,
     completion_tokens: usize,
-) {
+) -> bool {
     if !claim_wire_terminal(id, active_attempt_id()) {
-        return;
+        return false;
     }
     let attempt_id = active_attempt_id();
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
+    if writeln!(stdout, "{}", aborted).is_err() {
+        return false;
+    }
     let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
+    if writeln!(stdout, "{}", done).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
 }

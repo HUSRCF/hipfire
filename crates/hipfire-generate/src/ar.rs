@@ -881,7 +881,8 @@ pub enum RouteTerminalEvent<'a> {
 }
 
 pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
-pub type RouteTerminalAdapter = for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>);
+pub type RouteTerminalAdapter =
+    for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>) -> bool;
 
 thread_local! {
     /// A route can fall through from speculative capacity checks into AR.
@@ -979,7 +980,7 @@ impl GenerationRouteAdapter {
         id: &str,
         attempt: u64,
         terminal: RouteTerminal,
-    ) {
+    ) -> bool {
         let event = match terminal {
             RouteTerminal::Done => RouteTerminalEvent::Done { pending: None },
             RouteTerminal::Error => RouteTerminalEvent::Error {
@@ -993,7 +994,7 @@ impl GenerationRouteAdapter {
                 completion_tokens: 0,
             },
         };
-        self.emit_terminal_event(output, id, attempt, event);
+        self.emit_terminal_event(output, id, attempt, event)
     }
 
     pub fn emit_done(
@@ -1002,7 +1003,7 @@ impl GenerationRouteAdapter {
         id: &str,
         attempt: u64,
         pending: &serde_json::Value,
-    ) {
+    ) -> bool {
         self.emit_terminal_event(
             output,
             id,
@@ -1010,7 +1011,7 @@ impl GenerationRouteAdapter {
             RouteTerminalEvent::Done {
                 pending: Some(pending),
             },
-        );
+        )
     }
 
     pub fn emit_error(
@@ -1022,7 +1023,7 @@ impl GenerationRouteAdapter {
         class: &str,
         retryable: bool,
         rolled_back: bool,
-    ) {
+    ) -> bool {
         self.emit_terminal_event(
             output,
             id.unwrap_or(""),
@@ -1034,7 +1035,7 @@ impl GenerationRouteAdapter {
                 retryable,
                 rolled_back,
             },
-        );
+        )
     }
 
     pub fn emit_cancel(
@@ -1043,13 +1044,13 @@ impl GenerationRouteAdapter {
         id: &str,
         attempt: u64,
         completion_tokens: usize,
-    ) {
+    ) -> bool {
         self.emit_terminal_event(
             output,
             id,
             attempt,
             RouteTerminalEvent::Cancel { completion_tokens },
-        );
+        )
     }
 
     fn emit_terminal_event(
@@ -1058,9 +1059,12 @@ impl GenerationRouteAdapter {
         id: &str,
         attempt: u64,
         event: RouteTerminalEvent<'_>,
-    ) {
-        (self.terminal)(output, id, attempt, event);
-        release_route_start(id, attempt);
+    ) -> bool {
+        let delivered = (self.terminal)(output, id, attempt, event);
+        if delivered {
+            release_route_start(id, attempt);
+        }
+        delivered
     }
 }
 
@@ -1070,14 +1074,12 @@ fn emit_route_terminal(
     _attempt: u64,
     event: RouteTerminalEvent<'_>,
     route_name: &'static str,
-) {
+) -> bool {
     let mut buffer = Vec::new();
-    match event {
+    let staged = match event {
         RouteTerminalEvent::Done {
             pending: Some(pending),
-        } => {
-            emit_staged_terminal_done(&mut buffer, pending);
-        }
+        } => emit_staged_terminal_done(&mut buffer, pending),
         RouteTerminalEvent::Done { pending: None } => {
             let pending = serde_json::json!({
                 "type": "done",
@@ -1085,7 +1087,7 @@ fn emit_route_terminal(
                 "attempt_id": active_attempt_id(),
                 "finish_reason": "stop",
             });
-            emit_staged_terminal_done(&mut buffer, &pending);
+            emit_staged_terminal_done(&mut buffer, &pending)
         }
         RouteTerminalEvent::Error {
             id: event_id,
@@ -1109,13 +1111,16 @@ fn emit_route_terminal(
                 class,
                 retryable,
                 rolled_back,
-            );
+            )
         }
         RouteTerminalEvent::Cancel { completion_tokens } => {
-            emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+            emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens)
         }
+    };
+    if !staged || output.write_all(&buffer).is_err() {
+        return false;
     }
-    let _ = output.write_all(&buffer);
+    output.flush().is_ok()
 }
 
 macro_rules! define_route_start {
@@ -1135,8 +1140,13 @@ macro_rules! define_route_start {
 
 macro_rules! define_route_terminal {
     ($name:ident, $route:expr) => {
-        fn $name(output: &mut dyn Write, id: &str, attempt: u64, event: RouteTerminalEvent<'_>) {
-            emit_route_terminal(output, id, attempt, event, $route.name());
+        fn $name(
+            output: &mut dyn Write,
+            id: &str,
+            attempt: u64,
+            event: RouteTerminalEvent<'_>,
+        ) -> bool {
+            emit_route_terminal(output, id, attempt, event, $route.name())
         }
     };
 }
@@ -1343,20 +1353,22 @@ pub fn emit_generation_done(
     output: &mut dyn Write,
     id: &str,
     pending: &serde_json::Value,
-) {
-    production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
+) -> bool {
+    let delivered =
+        production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
     clear_generation_route();
+    delivered
 }
 pub fn emit_generation_done_value(
     route: GenerationRoute,
     output: &mut dyn Write,
     pending: &serde_json::Value,
-) {
+) -> bool {
     let id = pending
         .get("id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    emit_generation_done(route, output, id, pending);
+    emit_generation_done(route, output, id, pending)
 }
 
 pub fn emit_generation_error(
@@ -1367,8 +1379,8 @@ pub fn emit_generation_error(
     class: &str,
     retryable: bool,
     rolled_back: bool,
-) {
-    production_route_adapter(route).emit_error(
+) -> bool {
+    let delivered = production_route_adapter(route).emit_error(
         output,
         id,
         active_attempt_id(),
@@ -1378,6 +1390,7 @@ pub fn emit_generation_error(
         rolled_back,
     );
     clear_generation_route();
+    delivered
 }
 
 pub fn emit_generation_cancel(
@@ -1385,9 +1398,15 @@ pub fn emit_generation_cancel(
     output: &mut dyn Write,
     id: &str,
     completion_tokens: usize,
-) {
-    production_route_adapter(route).emit_cancel(output, id, active_attempt_id(), completion_tokens);
+) -> bool {
+    let delivered = production_route_adapter(route).emit_cancel(
+        output,
+        id,
+        active_attempt_id(),
+        completion_tokens,
+    );
     clear_generation_route();
+    delivered
 }
 
 pub fn emit_active_route_error(
