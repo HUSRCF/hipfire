@@ -35,9 +35,7 @@ pub mod forward;
 pub mod gemma4;
 pub mod lowered;
 pub mod speculative;
-pub use carrier::{
-    load_gemma4_bundle, Gemma4Bundle, Gemma4EagerBundle, Gemma4LoweredBundle,
-};
+pub use carrier::{load_gemma4_bundle, Gemma4Bundle, Gemma4EagerBundle, Gemma4LoweredBundle};
 
 pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};

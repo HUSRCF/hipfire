@@ -457,10 +457,7 @@ fn redline_prepare_gemma4(
     gpu.scale_f32(&bundle.scratch.x, bundle.config.embed_scale)
         .map_err(|error| error.to_string())?;
     gpu.hip
-        .memcpy_htod(
-            &bundle.scratch.pos_buf,
-            &(position as i32).to_ne_bytes(),
-        )
+        .memcpy_htod(&bundle.scratch.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|error| error.to_string())
 }
 

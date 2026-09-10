@@ -39,7 +39,6 @@ fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result
     Ok(())
 }
 
-
 // ─── Bundle types ─────────────────────────────────────────────────────────
 
 pub struct Gemma4EagerBundle {

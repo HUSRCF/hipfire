@@ -6880,7 +6880,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -7723,7 +7724,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -7930,7 +7932,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8080,7 +8083,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8243,7 +8247,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8637,7 +8642,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8780,7 +8786,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -10309,13 +10316,19 @@ impl Gpu {
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
-                    || hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP", false));
+                    || hipfire_config::developer_bool(
+                        "HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP",
+                        false,
+                    ));
             let gfx1151_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER", false);
             let gfx1151_route_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
-                && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER", false);
+                && hipfire_config::developer_bool(
+                    "HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER",
+                    false,
+                );
             let gfx1151_pair_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER", false);
@@ -12385,7 +12398,8 @@ impl Gpu {
             bytes,
         );
         let grid_x = if self.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_MOE_DOWN_TIGHT_GRID", false) {
+            && hipfire_config::developer_bool("HIPFIRE_MOE_DOWN_TIGHT_GRID", false)
+        {
             (m as u32).div_ceil(4)
         } else {
             m as u32

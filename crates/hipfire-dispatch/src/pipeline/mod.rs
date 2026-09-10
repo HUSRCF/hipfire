@@ -1796,7 +1796,6 @@ fn run_moe_decode_cpu_fallback(
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
-
     // EP (Ship 6 substrate-EP) is not wired through the generic CPU-top-K
     // fallback yet — it still accumulates into x_residual directly. The
     // fast-path (use_gpu_topk) covers all current EP-target MoE models
