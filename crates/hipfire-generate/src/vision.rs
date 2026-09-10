@@ -2283,6 +2283,9 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
+    let route = crate::ar::GenerationRoute::DotsOcr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, id);
+    crate::ar::emit_generation_start(route, stdout, id, false);
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
 
@@ -2792,6 +2795,9 @@ pub fn generate_lfm2_vl(
 ) {
     let route = crate::ar::GenerationRoute::LfmAr;
     let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
+    // Stream contract opener must precede every validation result, including
+    // tokenizer and vision-capability errors.
+    crate::ar::emit_generation_start(route, stdout, params.id, false);
     let GenerateVLParams {
         id,
         prompt,
@@ -2829,10 +2835,6 @@ pub fn generate_lfm2_vl(
             return;
         }
     };
-
-    // Stream contract opener BEFORE any GPU work or event emission — the
-    // HTTP gate rejects a `token` that arrives without gen_start first.
-    crate::ar::emit_generation_start(route, stdout, id, false);
 
     // Full-turn clock: preprocess + tower encode + prefill + decode. The
     // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),

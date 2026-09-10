@@ -5268,9 +5268,24 @@ mod route_scope_tests {
     use hipfire_engine::terminal::{
         activate_terminal_control, clear_terminal_control, set_active_attempt_id,
     };
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    fn route_lock() -> MutexGuard<'static, ()> {
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn parse_events(sink: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 
     #[test]
     fn vision_route_scope_restores_route_and_releases_same_key_start() {
+        let _guard = route_lock();
         let id = "vision-route-scope";
         let attempt = 91_001;
         let mut sink = Vec::new();
@@ -5329,6 +5344,111 @@ mod route_scope_tests {
             events
                 .iter()
                 .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn standalone_dots_ocr_starts_before_error_and_deduplicates_nested_scope() {
+        let _guard = route_lock();
+        let id = "dots-ocr-standalone";
+        let attempt = 91_101;
+        let mut sink = Vec::new();
+
+        clear_terminal_control();
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _outer = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            {
+                let _inner = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+                emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+            }
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let first = parse_events(&sink);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0]["type"], "gen_start");
+        assert_eq!(first[1]["type"], "error");
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            1
+        );
+        assert_eq!(first[1]["attempt_id"], attempt);
+
+        // A later request reusing the same wire key must get a fresh start;
+        // dropping the nested/outer scopes released only the old latch.
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+        }
+        let reused = parse_events(&sink);
+        assert_eq!(
+            reused
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            2
+        );
+        assert_eq!(reused[2]["type"], "gen_start");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn lfm_vl_early_error_follows_generation_start() {
+        let _guard = route_lock();
+        let id = "lfm-vl-early-error";
+        let attempt = 91_102;
+        let mut sink = Vec::new();
+
+        clear_terminal_control();
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::LfmAr, id);
+            emit_generation_start(GenerationRoute::LfmAr, &mut sink, id, false);
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["attempt_id"], attempt);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
                 .count(),
             1
         );
