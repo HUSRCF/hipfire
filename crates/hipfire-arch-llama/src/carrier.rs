@@ -141,6 +141,11 @@ impl AttachedWeightStore {
     ) -> Option<&str> {
         self.transaction.alias_source(name, layer, device)
     }
+
+    /// Value-only descriptors of the bundle-owned scratch/KV attachments.
+    pub(crate) fn attachments(&self) -> &AttachmentDescriptors {
+        &self.attachments
+    }
 }
 
 fn with_weight_rollback_error(reason: String, rollback: hip_bridge::HipResult<()>) -> String {
@@ -794,7 +799,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
 /// Alias matching the `load_<arch>_bundle` naming convention in the task.
 pub use load_bundle as load_llama_bundle;
 
-    /// Attach an unpublished load transaction after validating the complete
+impl LlamaBundle {
     /// target identity. The resulting owner is crate-private and can only be
     /// consumed by `ArchModel::free_gpu`.
     ///
@@ -1004,6 +1009,32 @@ mod tests {
         (path, hfq)
     }
 
+    /// Constant-valued MQ4G256 trunk (quant_type 13) for AWQ math tests.
+    /// Layout transcribed from `kernels/src/gemv_mq4g256.hip`: 136 B per
+    /// 256-group row — `[0..4)` f32 scale, `[4..8)` f32 zero, `[8..136)`
+    /// 128 B nibbles low-first — decoded as `w = scale * nibble + zero`.
+    /// Every weight decodes to `scale * nibble + zero`, so the trunk is an
+    /// exact known constant, not an opaque blob.
+    fn mq4g256_const_tensor(name: &str, m: usize, k: usize, scale: f32, nibble: u8) -> HfqMemTensor {
+        assert_eq!(k % 256, 0, "MQ4G256 fixture geometry needs K % 256 == 0");
+        assert!(nibble < 16, "one nibble per weight");
+        let groups = k / 256;
+        let byte = nibble | (nibble << 4);
+        let mut data = Vec::with_capacity(m * groups * 136);
+        for _ in 0..m * groups {
+            data.extend_from_slice(&scale.to_le_bytes());
+            data.extend_from_slice(&0f32.to_le_bytes());
+            data.extend_from_slice(&vec![byte; 128]);
+        }
+        HfqMemTensor {
+            name: name.into(),
+            quant_type: 13,
+            shape: vec![m as u32, k as u32],
+            group_size: 0,
+            data,
+        }
+    }
+
     /// Synthetic AWQ fixture on a *supported* quantized path: the q_proj trunk
     /// is MQ4G256 (quant_type 13, in `DType::supports_awq_sidecar`) with the
     /// same 1D-F16 length-K sidecar a real quantizer emits. The legacy loader
@@ -1011,24 +1042,19 @@ mod tests {
     /// host-widened to F32, which is outside the allow-list, so the sidecar
     /// would attach to nothing and the test would prove no AWQ math path.
     ///
-    /// Valid kernel geometry: K = 256 satisfies the FWHT rotation
-    /// granularity the AWQ input-rotate path assumes; the pre-fix K = 32
-    /// fixture scale does not. Trunk payload bytes are zeros and the sidecar
-    /// is unit F16, so the AWQ divide (`x / 1.0`) is numerically neutral:
-    /// with and without the sidecar, forward must produce identical finite
-    /// logits. Full pre-scaled-weight AWQ numerics still need a genuine
-    /// quantizer-produced artifact plus GPU execution evidence.
+    /// Valid kernel geometry: K = 256 satisfies the FWHT rotation granularity
+    /// the AWQ input-rotate path assumes. Nontrivial scales: the trunk is the
+    /// constant 1.0 (as a pre-scaled `(W·s)` stand-in) and the sidecar holds
+    /// 2.0, so forward through the AWQ path must equal half the sidecar-free
+    /// forward on the same trunk — a unit sidecar would only prove loader
+    /// neutrality, not that the divide shapes numerics.
     fn fixture_awq_mq4_hfq(with_sidecar: bool) -> (PathBuf, HfqFile) {
         const K: usize = 256;
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 256], false),
             f32_hfq_tensor("model.norm.weight", &[256], false),
-            hfq_tensor(
-                "model.layers.0.self_attn.q_proj.weight",
-                &[256, 256],
-                13,
-                K * K / 2,
-            ),
+            // Constant 1.0 trunk: scale 0.5, nibble 2, zero 0.0.
+            mq4g256_const_tensor("model.layers.0.self_attn.q_proj.weight", 256, 256, 0.5, 2),
             f16_hfq_tensor("model.layers.0.self_attn.k_proj.weight", &[256, 256]),
             f16_hfq_tensor("model.layers.0.self_attn.v_proj.weight", &[256, 256]),
             f16_hfq_tensor("model.layers.0.self_attn.o_proj.weight", &[256, 256]),
@@ -1048,9 +1074,10 @@ mod tests {
                 quant_type: 1,
                 shape: vec![K as u32],
                 group_size: 0,
-                // Unit scales: F16 1.0. The AWQ divide is exactly neutral,
-                // so any deviation from the sidecar-free forward is a bug.
-                data: (0..K).flat_map(|_| 0x3c00u16.to_le_bytes()).collect(),
+                // Non-unit scales: F16 2.0 against the constant-1.0 trunk.
+                // Forward through the AWQ path must equal half the
+                // sidecar-free forward on the same trunk.
+                data: (0..K).flat_map(|_| 0x4000u16.to_le_bytes()).collect(),
             });
         }
         tensors.push(f32_hfq_tensor("lm_head.weight", &[2, 256], false));
@@ -1156,6 +1183,7 @@ mod tests {
     /// both the separate and tied language head must resolve to the final
     /// pipeline stage, while the embedding stays on stage zero. The Single
     /// production pilot maps every stage to device 0 and cannot see this.
+    #[test]
     fn output_tensors_pin_to_final_pipeline_stage() {
         use hipfire_runtime::device_mesh::DimKind;
         use hipfire_runtime::weight_manifest::{placement_devices, PinTarget, PlacementHint};
@@ -1841,12 +1869,13 @@ mod tests {
     /// loader end to end on GPU: the source is classified `LegacyAwq`, no
     /// manifest store is attached, the MQ4G256 q_proj keeps its quantized
     /// dtype (not widened), and its AWQ scale sidecar is attached through the
-    /// `DType::supports_awq_sidecar` gate. Forward executes the AWQ input
-    /// path at valid K geometry and produces finite logits identical to the
-    /// sidecar-free trunk (unit scales are exactly neutral), proving the
-    /// sidecar path runs without perturbing numerics. Unload via the sole
-    /// consuming owner followed by an immediate reload re-attaches the
-    /// sidecar with identical numerics.
+    /// `DType::supports_awq_sidecar` gate. The sidecar holds non-unit 2.0
+    /// scales over a constant-1.0 trunk, so forward through the AWQ input
+    /// path must differ from the sidecar-free forward (proving the scale is
+    /// consumed, not ignored) at half the magnitude (proving divide
+    /// direction, not multiply or garbage). Unload via the sole consuming
+    /// owner followed by an immediate reload re-attaches the sidecar with
+    /// bitwise-identical numerics.
     #[test]
     fn production_awq_sidecar_loads_and_decodes_on_gpu_through_legacy_route() {
         fn forward_logits(
@@ -1899,23 +1928,39 @@ mod tests {
             awq_logits.iter().all(|value| value.is_finite()),
             "AWQ forward must produce finite logits, got {awq_logits:?}"
         );
+        assert!(
+            awq_logits.iter().any(|value| value.abs() > 1e-3),
+            "AWQ forward must compute nonzero output, got {awq_logits:?}"
+        );
         Box::new(bundle).free_gpu(&mut gpu);
-        // Same trunk without the sidecar: unit scales are exactly neutral,
-        // so the AWQ input path must produce bitwise-identical logits.
+        // Same constant trunk without the sidecar (manifest route): the AWQ
+        // divide must show up as a real numeric difference at half magnitude.
+        // Bitwise difference proves the sidecar is consumed; the ratio proves
+        // divide-by-2 rather than multiply or garbage. Tolerance is generous
+        // (routes select different kernels) but tight enough to catch any
+        // wrong-direction or missing scale application.
         let (plain_path, plain_hfq) = fixture_awq_mq4_hfq(false);
         assert_eq!(classify_hfq_route(&plain_hfq), HfqLoadRoute::ManifestPlainLlama);
         let mut ctx = load_ctx(&plain_path, &mut gpu, &cask);
         let mut plain = load_bundle(ModelSource::Hfq(plain_hfq), &mut ctx).expect("plain MQ4 load");
         drop(ctx);
         let plain_logits = forward_logits(&mut gpu, &mut plain);
-        assert_eq!(
+        assert_ne!(
             awq_logits, plain_logits,
-            "unit-scale AWQ sidecar must leave forward numerics unchanged"
+            "non-unit AWQ sidecar must change forward numerics"
         );
+        for (index, (awq, plain)) in awq_logits.iter().zip(plain_logits.iter()).enumerate() {
+            let expect = 2.0 * awq;
+            let tolerance = 1e-2 * (1.0 + plain.abs());
+            assert!(
+                (plain - expect).abs() <= tolerance,
+                "logit {index}: sidecar-free {plain} must equal 2x AWQ-path {awq}"
+            );
+        }
         Box::new(plain).free_gpu(&mut gpu);
         // Immediate reload of the sidecar file re-attaches the scale with
-        // identical numerics: unload released the scale-carrying weight
-        // exactly once with no manifest store involved.
+        // bitwise-identical numerics: unload released the scale-carrying
+        // weight exactly once with no manifest store involved.
         let hfq = HfqFile::open(&path).expect("reopen AWQ fixture");
         let mut ctx = load_ctx(&path, &mut gpu, &cask);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy reload");
@@ -2087,7 +2132,7 @@ mod tests {
             }
             context.consume(&chunk[..read]);
         }
-        Ok(format!("{:x}", context.compute()))
+        Ok(format!("{:x}", context.finalize()))
     }
 
     fn pinned_fixture_path() -> Option<String> {

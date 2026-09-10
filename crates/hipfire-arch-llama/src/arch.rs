@@ -23,6 +23,7 @@ use hipfire_runtime::weight_manifest::{
     DTypeConstraint, FusedQkvLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry, StateKind,
     WeightEntry,
 };
+use rdna_compute::{DType, Gpu};
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
