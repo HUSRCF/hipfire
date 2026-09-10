@@ -315,6 +315,34 @@ pub fn emit_fail_closed_error(
     let _ = stdout.flush();
 }
 
+/// Emit a fail-closed error through an explicitly selected producer route.
+/// Batch drivers use this variant so one lane cannot clear the global route
+/// before another lane releases its own `(id, attempt_id)` start latch.
+pub fn emit_fail_closed_error_for_route(
+    route: crate::ar::GenerationRoute,
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    epilogue: &RollbackEpilogue,
+) {
+    let full = match &epilogue.context {
+        Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
+        _ => message.to_string(),
+    };
+    crate::ar::emit_generation_error(
+        route,
+        stdout,
+        id,
+        &full,
+        class,
+        retryable,
+        epilogue.rolled_back,
+    );
+    let _ = stdout.flush();
+}
+
 /// DS4 does not advertise semantic contract v2 (`gen_start.contract_version`).
 /// Task 6 capability denial relies on this remaining unset until a later
 /// producer registration proves full semantic-v2 shape.

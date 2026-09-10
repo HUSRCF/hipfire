@@ -1347,6 +1347,17 @@ pub fn emit_generation_done(
     production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
     clear_generation_route();
 }
+pub fn emit_generation_done_value(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    pending: &serde_json::Value,
+) {
+    let id = pending
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    emit_generation_done(route, output, id, pending);
+}
 
 pub fn emit_generation_error(
     route: GenerationRoute,
