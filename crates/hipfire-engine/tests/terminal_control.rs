@@ -507,7 +507,7 @@ fn batch_rebind_clears_tls_without_binding_reused_generation() {
 
     assert!(batch_announce_terminal(id, attempt_id));
     let generation_b = batch_terminal_generation(id, attempt_id).expect("generation B");
-    scope_a.rebind_for(id, attempt_id);
+    scope_a.rebind_for(attempt_id);
     assert_eq!(active_batch_generation(), None);
     assert!(!batch_clear_terminal_at_generation(
         id,

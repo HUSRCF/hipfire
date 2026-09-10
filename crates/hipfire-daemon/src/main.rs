@@ -812,7 +812,30 @@ fn main() {
     // even read the abort line until after the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
     if let Some(message) = pending_message {
-        let _ = msg_tx.send(message);
+        let should_dispatch = match &message {
+            DaemonMsg::Regular(value) => match announce_generate_terminal(value) {
+                Some((id, attempt_id, true)) => {
+                    tracing::debug!(
+                        request_id = id,
+                        attempt_id,
+                        "announced startup generate request"
+                    );
+                    true
+                }
+                Some((id, attempt_id, false)) => {
+                    eprintln!(
+                        "[batch] duplicate startup generate dropped id={} attempt_id={}; preserving live registry",
+                        id, attempt_id
+                    );
+                    false
+                }
+                None => true,
+            },
+            DaemonMsg::ParseError(_) => true,
+        };
+        if should_dispatch {
+            let _ = msg_tx.send(message);
+        }
     }
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -2705,7 +2728,7 @@ fn main() {
 
                 if has_image {
                     let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                    batch_scope.rebind_for(id, gen_attempt_id);
+                    batch_scope.rebind_for(gen_attempt_id);
                 }
                 if has_image && !has_vl {
                     match vision_gated_off.as_deref() {
@@ -3059,7 +3082,7 @@ fn main() {
                         };
                         if started_in_think {
                             let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                            batch_scope.rebind_for(id, gen_attempt_id);
+                            batch_scope.rebind_for(gen_attempt_id);
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
                                 emit_batch_admission_error(
@@ -3215,7 +3238,7 @@ fn main() {
                             // barriers. Transfer any pre-latched abort exactly once
                             // (transfer itself clears the keyed entry).
                             let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                            batch_scope.rebind_for(id, gen_attempt_id);
+                            batch_scope.rebind_for(gen_attempt_id);
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
@@ -3367,7 +3390,7 @@ fn main() {
                         // keyed entry so default service cannot leak state across
                         // request-key reuse or a later batch-enabled load.
                         let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                        batch_scope.rebind_for(id, gen_attempt_id);
+                        batch_scope.rebind_for(gen_attempt_id);
                     }
                     // Did the request explicitly set a non-temperature sampling
                     // control? (gates temp>0 spec routing — see generate()).
@@ -4590,7 +4613,15 @@ mod tests {
         // entry before cleanup retires it.
         let early_id = "admission-no-model";
         let early_attempt = 70_001;
-        assert!(batch_announce_terminal(early_id, early_attempt));
+        let early_msg = serde_json::json!({
+            "type": "generate",
+            "id": early_id,
+            "attempt_id": early_attempt,
+        });
+        assert_eq!(
+            announce_generate_terminal(&early_msg),
+            Some((early_id, early_attempt, true))
+        );
         let mut early_out = Vec::new();
         {
             let _scope = BatchAttemptScope::enter_for(early_id, early_attempt);

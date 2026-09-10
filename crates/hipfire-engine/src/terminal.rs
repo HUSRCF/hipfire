@@ -709,7 +709,7 @@ impl BatchAttemptScope {
     /// Rebind an existing outer scope after its keyed batch entry is retired.
     /// Sequential fallback then remains eligible for the singleton claim while
     /// preserving the scope's original TLS values for Drop restoration.
-    pub fn rebind_for(&mut self, _id: &str, attempt_id: u64) {
+    pub fn rebind_for(&mut self, attempt_id: u64) {
         set_active_attempt_id(attempt_id);
         ACTIVE_BATCH_GENERATION.with(|c| c.set(None));
     }
