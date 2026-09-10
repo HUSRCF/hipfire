@@ -2017,6 +2017,31 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2048_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Gemma4 lowered decode specialization: K=2816 is eleven HFQ4-G256 groups,
+/// including a three-group tail. Exposing that count to LLVM keeps the kernel
+/// correct without introducing private scratch on retained-PM4 routes.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+/// Gemma4 lowered MQ4 decode specialization: MQ4G256 shares HFQ4G256's
+/// 136-byte/group layout, so K=2816 is the same eleven groups with a
+/// three-group tail. Exposing that count to LLVM keeps the lowered MQ4 route
+/// correct without introducing private scratch on retained-PM4 routes.
+/// FWHT input rotation stays caller-side (see
+/// `gemv_mq4g256_moe_gate_up_k8_indexed`).
+pub const GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_mq4g256_moe_gate_up_k8_indexed_k2816\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1151 structural gate producer for MQ4R A3B decode. Gate and up are
 /// intentionally compiled as separate fixed-K=2048 kernels so Redline can
 /// overlap their independent weight streams on retained PM4 queues.
@@ -2232,6 +2257,33 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC: &str = concat!
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_DLC_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
     "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_GLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 1\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 2\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_DLC_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 4\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
@@ -3429,7 +3481,6 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
 /// Requires K % 512 == 0; HIPFIRE_GATEUP_LDSSTAGE default-on exact gfx1100.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage.hip");
-
 
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
