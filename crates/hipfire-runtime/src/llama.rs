@@ -559,7 +559,6 @@ impl WeightTensor {
     }
 }
 
-
 impl WeightTensor {
     /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
     /// AWQ + row_stride so GemvFamily sees everything a weight needs.
@@ -721,7 +720,6 @@ impl LayerWeights {
         self.w_down.free_all(gpu);
     }
 }
-
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.

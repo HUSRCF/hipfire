@@ -1934,6 +1934,64 @@ pub fn load_weights_hfq(
     })
 }
 
+struct PendingLlamaLayer {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+}
+
+impl PendingLlamaLayer {
+    fn cleanup<B: WeightBackend>(&mut self, b: &mut B) {
+        fn free_weight<B: WeightBackend>(b: &mut B, weight: WeightTensor) {
+            if let Some(paro) = weight.paro {
+                if !paro.is_alias {
+                    b.free_tensor(paro.pairs);
+                    b.free_tensor(paro.theta);
+                    b.free_tensor(paro.channel_scales);
+                }
+            }
+            if let Some(awq) = weight.awq_scale {
+                b.free_tensor(awq);
+            }
+            b.free_tensor(weight.buf);
+        }
+
+        for weight in [
+            self.w_down.take(),
+            self.w_up.take(),
+            self.w_gate.take(),
+            self.wo.take(),
+            self.wv.take(),
+            self.wk.take(),
+            self.wq.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            free_weight(b, weight);
+        }
+        for tensor in [
+            self.ffn_norm.take(),
+            self.k_norm.take(),
+            self.q_norm.take(),
+            self.attn_norm.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            b.free_tensor(tensor);
+        }
+    }
+}
+
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
 /// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
 /// exact dims it already computes.
@@ -1945,26 +2003,80 @@ pub fn load_layer<B: WeightBackend>(
     i: usize,
 ) -> HipResult<LayerWeights> {
     b.set_layer(i);
+    let mut pending = PendingLlamaLayer {
+        attn_norm: None,
+        wq: None,
+        wk: None,
+        wv: None,
+        wo: None,
+        q_norm: None,
+        k_norm: None,
+        ffn_norm: None,
+        w_gate: None,
+        w_up: None,
+        w_down: None,
+    };
+    macro_rules! stage {
+        ($slot:ident, $load:expr) => {
+            match $load {
+                Ok(owner) => pending.$slot = Some(owner),
+                Err(err) => {
+                    pending.cleanup(b);
+                    return Err(err);
+                }
+            }
+        };
+    }
+    macro_rules! take {
+        ($slot:ident) => {
+            pending.$slot.take().expect(concat!(
+                "load_layer: missing staged owner ",
+                stringify!($slot)
+            ))
+        };
+    }
+
+    stage!(attn_norm, b.norm("input_layernorm.weight", &[config.dim]));
+    stage!(wq, b.proj("self_attn.q_proj", q_out_dim, config.dim));
+    stage!(wk, b.proj("self_attn.k_proj", kv_dim, config.dim));
+    stage!(wv, b.proj("self_attn.v_proj", kv_dim, config.dim));
+    stage!(wo, b.proj("self_attn.o_proj", config.dim, q_out_dim));
+    if config.has_qk_norm {
+        stage!(
+            q_norm,
+            b.norm("self_attn.q_norm.weight", &[config.head_dim])
+        );
+        stage!(
+            k_norm,
+            b.norm("self_attn.k_norm.weight", &[config.head_dim])
+        );
+    }
+    stage!(
+        ffn_norm,
+        b.norm("post_attention_layernorm.weight", &[config.dim])
+    );
+    stage!(
+        w_gate,
+        b.proj("mlp.gate_proj", config.hidden_dim, config.dim)
+    );
+    stage!(w_up, b.proj("mlp.up_proj", config.hidden_dim, config.dim));
+    stage!(
+        w_down,
+        b.proj("mlp.down_proj", config.dim, config.hidden_dim)
+    );
+
     Ok(LayerWeights {
-        attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-        wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
-        wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
-        wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
-        wo: b.proj("self_attn.o_proj", config.dim, q_out_dim)?,
-        q_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        k_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-        w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-        w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-        w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
+        attn_norm: take!(attn_norm),
+        wq: take!(wq),
+        wk: take!(wk),
+        wv: take!(wv),
+        wo: take!(wo),
+        q_norm: pending.q_norm.take(),
+        k_norm: pending.k_norm.take(),
+        ffn_norm: take!(ffn_norm),
+        w_gate: take!(w_gate),
+        w_up: take!(w_up),
+        w_down: take!(w_down),
     })
 }
 
@@ -1987,75 +2099,27 @@ pub fn config_from_safetensors_llama(
 }
 
 /// Load a ParoQuant-quantized weight tensor from a safetensors source.
-/// Repacks AWQ INT4 data to HFQ4G128 and uploads ParoQuant rotation metadata.
+/// The shared Paro loader owns every upload until all rotation metadata has
+/// succeeded, so a missing sidecar or failed upload cannot leak a partial
+/// output head.
 fn load_paroquant_weight_from_source(
     source: &dyn crate::model_source::ModelSource,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     tensor_prefix: &str, // e.g. "model.layers.0.mlp.gate_proj"
     out_dim: usize,      // M
     in_dim: usize,       // K
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
-    use crate::llama::ParoRotation;
-
-    let qw_name = format!("{tensor_prefix}.qweight");
-    let qz_name = format!("{tensor_prefix}.qzeros");
-    let sc_name = format!("{tensor_prefix}.scales");
-    let pairs_name = format!("{tensor_prefix}.pairs");
-    let theta_name = format!("{tensor_prefix}.theta");
-    let cs_name = format!("{tensor_prefix}.channel_scales");
-
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
-
-    let hfq_data = crate::paro::repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
+    crate::paro::load_paro_weight(
+        source,
+        gpu,
+        tensor_prefix,
         out_dim,
         in_dim,
-        group_size as usize,
-    );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
-
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
-
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
-
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::ParoQ4G128,
-        m: out_dim,
-        k: in_dim,
-        row_stride: 0,
-        paro: Some(ParoRotation {
-            pairs,
-            theta,
-            channel_scales,
-            krot: krot as u32,
-            group_size,
-            is_alias: false,
-        }),
-        awq_scale: None,
-    })
+        group_size,
+        krot,
+    )
 }
 
 /// Load an FP16 weight tensor from safetensors as F32 on GPU.

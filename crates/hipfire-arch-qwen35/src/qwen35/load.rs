@@ -2546,15 +2546,13 @@ impl WeightSource for HfqSource<'_> {
             c.vocab_size,
             c.dim,
             |gpu| {
-                let (lm_info, lm_data) =
-                    qwen35_tensor_data_cow(hfq, "lm_head.weight")
-                        .ok_or_else(|| HipError::new(0, "lm_head present"))?;
+                let (lm_info, lm_data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
+                    .ok_or_else(|| HipError::new(0, "lm_head present"))?;
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
-                let (embd_meta, embd_data) =
-                    qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
-                        .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
+                let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
+                    .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
         )?;
