@@ -117,6 +117,13 @@ fn take_singleton_handoff(
     admission: BatchGeneration,
     route: GenerationRoute,
 ) -> Result<SingletonTransfer, String> {
+    // Requests arriving through the batch driver's inbox never passed through
+    // the outer singleton activation in daemon::main. Bootstrap an owner here
+    // before removing the keyed admission so the transfer always carries a
+    // real singleton transaction into the sequential path.
+    if terminal_generation(&key.id, key.attempt_id).is_none() {
+        activate_terminal_control(&key.id, key.attempt_id);
+    }
     let transfer = batch_handoff_to_singleton_and_clear(&key.id, key.attempt_id, admission)
         .ok_or_else(|| {
             format!(
@@ -134,7 +141,7 @@ fn take_singleton_handoff(
     // preserving the prior route TLS. The sequential producer can therefore
     // emit its fresh gen_start without a terminal/error side effect.
     {
-        let _attempt = BatchAttemptScope::enter(key.attempt_id);
+        let _attempt = BatchAttemptScope::enter_singleton(key.attempt_id);
         let _route = GenerationRouteScope::enter(route, &key.id);
     }
     Ok(transfer)
@@ -4337,6 +4344,113 @@ mod tests {
             assert_eq!(events[2]["type"], "error");
         }
         assert_eq!(crate::ar::active_generation_route(), None);
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn admitted_think_batch_driver_bootstraps_singleton_and_reuses_key() {
+        let _guard = lock();
+        let route = GenerationRoute::QwenAr;
+        let id = "qwen-later-think";
+        let attempt_id = 507_u64;
+        let original = serde_json::json!({
+            "type": "generate",
+            "id": id,
+            "attempt_id": attempt_id,
+            "prompt": "later queued prompt",
+            "messages": [{"role": "user", "content": "later queued prompt"}],
+            "max_tokens": 7,
+            "reasoning_effort": "low",
+        });
+        let mut output = Vec::new();
+        let mut admissions = Vec::new();
+        let mut singleton_generations = Vec::new();
+
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+
+        for _ in 0..2 {
+            // This is the batch-driver admission path: the request is queued
+            // before the think-open barrier, without singleton activation.
+            let admission = batch_announce_terminal(id, attempt_id).expect("batch admission");
+            assert!(batch_transition_to_queued(id, attempt_id, admission));
+            assert_eq!(
+                terminal_generation(id, attempt_id),
+                None,
+                "batch-driver request has no manually activated singleton"
+            );
+
+            let handoff = handoff_admitted_started_in_think(
+                id,
+                attempt_id,
+                admission,
+                original.clone(),
+                route,
+            )
+            .expect("admitted singleton handoff");
+            let (handoff_msg, transfer) = match handoff {
+                DaemonMsg::SingletonWithAdmission(value, transfer) => (value, transfer),
+                _ => panic!("admitted think barrier did not produce singleton ownership"),
+            };
+            assert_eq!(handoff_msg, original, "full queued payload was preserved");
+            assert_eq!(transfer.admission(), admission);
+            assert_eq!(batch_terminal_generation(id, attempt_id), None);
+
+            // Handoff bootstraps and then preserves the exact singleton
+            // lifecycle; main adopts this transfer instead of rediscovering it.
+            let singleton_generation =
+                terminal_generation(id, attempt_id).expect("bootstrapped singleton transaction");
+            clear_terminal_control();
+            assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+            assert_eq!(
+                terminal_generation(id, attempt_id),
+                Some(singleton_generation)
+            );
+            admissions.push(admission);
+            singleton_generations.push(singleton_generation);
+
+            {
+                let _attempt = BatchAttemptScope::enter_singleton(attempt_id);
+                let _route = GenerationRouteScope::enter(route, id);
+                crate::ar::emit_generation_start(route, &mut output, id, true);
+                crate::ar::emit_generation_error(
+                    route,
+                    &mut output,
+                    Some(id),
+                    "admitted think barrier terminal",
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+            assert_eq!(crate::ar::active_generation_route(), None);
+            clear_terminal_control();
+        }
+
+        assert_ne!(admissions[0], admissions[1], "same key received fresh admissions");
+        assert_ne!(
+            singleton_generations[0], singleton_generations[1],
+            "same key received fresh singleton lifecycles"
+        );
+
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("UTF-8 events")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events.len(), 4, "one start and one terminal per reuse");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().expect("event type"))
+                .collect::<Vec<_>>(),
+            vec!["gen_start", "error", "gen_start", "error"]
+        );
+
         clear_terminal_control();
         batch_clear_all_terminals();
         set_active_attempt_id(0);
