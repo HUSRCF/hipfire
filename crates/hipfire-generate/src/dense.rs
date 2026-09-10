@@ -2050,7 +2050,7 @@ pub fn generate_gemma4_lowered(
 
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+        let try_jinja = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
             && m.chat_template.is_some();
         let mut ids = if try_jinja {
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
