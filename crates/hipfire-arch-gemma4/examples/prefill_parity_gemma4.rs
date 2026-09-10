@@ -11,7 +11,7 @@
 //! batched prefill on gfx12 where the daemon refuses.
 //!
 //! Usage:
-//!   prefill_parity_gemma4 --model <hfq> [--prompt <text>] [--decode N]
+//!   prefill_parity_gemma4 --model <hfq> [--prompt <text>] [--prompt-tokens N] [--decode N]
 //!
 //! Env: HIPFIRE_GEMMA4_DUMP=1 + HIPFIRE_BATCHED_PREFILL / HIPFIRE_WMMA_PREFILL
 //! affect only the lowered internals (run_prefill_gemm WMMA arm); this harness
@@ -34,6 +34,7 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt =
         "The capital of France is a city with many famous museums and lovely streets".to_string();
+    let mut prompt_tokens: Option<usize> = None;
     let mut decode_n: usize = 24;
     let mut i = 1;
     while i < argv.len() {
@@ -54,6 +55,10 @@ fn main() {
                 decode_n = argv[i + 1].parse().expect("--decode");
                 i += 2;
             }
+            "--prompt-tokens" => {
+                prompt_tokens = Some(argv[i + 1].parse().expect("--prompt-tokens"));
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(1);
@@ -71,6 +76,10 @@ fn main() {
     let mut ids = tok.encode(&prompt);
     if ids.first() != Some(&cfg.bos_token) {
         ids.insert(0, cfg.bos_token);
+    }
+    if let Some(limit) = prompt_tokens {
+        assert!(limit > 0, "--prompt-tokens must be positive");
+        ids.truncate(limit);
     }
     let max_seq = (ids.len() + decode_n + 16).max(cfg.sliding_window + 1);
     let scratch = lowered::Gemma4Scratch::new(&mut gpu, &cfg, max_seq).expect("scratch");
@@ -102,7 +111,9 @@ fn main() {
         (bi, bv)
     };
 
-    let mut run = |label: &str, batched: bool| -> (Vec<f32>, Vec<u32>) {
+    let mut run = |label: &str, batched: bool| -> (Vec<f32>, Vec<u32>, Vec<u8>, Vec<u8>) {
+        lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
+            .expect("reset scratch consts");
         let mut kv_sliding = KvCache::new_gpu_q8_capped(
             &mut gpu,
             cfg.n_layers,
@@ -112,16 +123,13 @@ fn main() {
             cfg.sliding_window,
         )
         .expect("kv sliding");
-        // Gemma4 full-attention head dimensions are not compatible with the
-        // Qwen3.5-only Asym3 D256 constructor. Use the generic Q8 cache for
-        // this parity harness so the comparison exercises model math rather
-        // than an unrelated KV format restriction.
-        let mut kv_full = KvCache::new_gpu_q8_capped(
+        // Match the production carrier: Gemma4 full attention uses the
+        // model-specific D512 Asym3 cache, not the Qwen3.5 D256 constructor.
+        let mut kv_full = KvCache::new_gpu_asym3_gemma4(
             &mut gpu,
             cfg.n_layers,
             cfg.full_n_kv_heads,
             cfg.full_head_dim,
-            max_seq,
             max_seq,
         )
         .expect("kv full");
@@ -201,13 +209,29 @@ fn main() {
         }
         eprintln!("[{label}] cont ids:  {:?}", cont);
         eprintln!("[{label}] cont text: {:?}", tok.decode(&cont));
-        kv_sliding.free_gpu(&mut gpu);
-        kv_full.free_gpu(&mut gpu);
-        (logits, cont)
+        let mut full_k = vec![0u8; kv_full.k_gpu[0].byte_size()];
+        let mut full_v = vec![0u8; kv_full.v_gpu[0].byte_size()];
+        gpu.hip
+            .memcpy_dtoh(&mut full_k, &kv_full.k_gpu[0].buf)
+            .expect("download full K");
+        gpu.hip
+            .memcpy_dtoh(&mut full_v, &kv_full.v_gpu[0].buf)
+            .expect("download full V");
+        kv_sliding.free_gpu(&mut gpu).expect("free sliding KV");
+        kv_full.free_gpu(&mut gpu).expect("free full KV");
+        (logits, cont, full_k, full_v)
     };
 
-    let (la, ca) = run("per-token", false);
-    let (lb, cb) = run("batched  ", true);
+    let (la, ca, ka, va) = run("per-token", false);
+    let (lb, cb, kb, vb) = run("batched  ", true);
+
+    let report_bytes = |name: &str, a: &[u8], b: &[u8]| {
+        let n_diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+        let first = a.iter().zip(b).position(|(x, y)| x != y);
+        println!("{name}: n_diff={n_diff}/{} first_diff={first:?}", a.len());
+    };
+    report_bytes("full K cache", &ka, &kb);
+    report_bytes("full V cache", &va, &vb);
 
     let mut max_abs = 0f32;
     let mut max_i = 0usize;

@@ -456,6 +456,19 @@ fn dispatch_kv_write(
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
+            if io.head_dim == 512 {
+                return hip!(gpu.kv_cache_write_asym3_hd512(
+                    io.k_cache,
+                    io.v_cache,
+                    io.k,
+                    io.v,
+                    io.pos_buf,
+                    ct,
+                    st,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ));
+            }
             hip!(gpu.kv_cache_write_asym3_fused(
                 io.k_cache,
                 io.v_cache,
@@ -1136,6 +1149,31 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                if io.head_dim == 512 {
+                    if io.output_gate.is_some() {
+                        return Err(DispatchError::UnsupportedVariant {
+                            family: "attention/attend",
+                            variant: "D512 Asym3 output gate is unsupported",
+                            arch: "",
+                            quant: "asym3",
+                        });
+                    }
+                    return hip!(gpu.attention_flash_asym3_hd512(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ));
+                }
                 hip!(gpu.attention_flash_asym3(
                     io.q,
                     io.k_cache,

@@ -74,6 +74,20 @@ fn run_prefill_gemm(
     batch_size: usize,
     bf16_scratch: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    // Gemma4's sparse router can amplify small projection differences into
+    // different expert choices. The HFQ4 batched kernel does not preserve the
+    // serving GEMV reduction order, so keep that format on the reference path.
+    // A one-row GEMM has no weight-reuse advantage either.
+    let parity_exact = std::env::var("HIPFIRE_GEMMA4_PARITY_EXACT").ok().as_deref() == Some("1");
+    if batch_size == 1 || parity_exact || w.gpu_dtype == DType::HFQ4G256 {
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * w.k, w.k);
+            let y_row = y.sub_offset(b * w.m, w.m);
+            weight_gemv(gpu, w, &x_row, &y_row)?;
+        }
+        return Ok(());
+    }
+
     // MQ4G256 weights are FWHT-rotated at quantize time. The per-token GEMV
     // path (weight_gemv) FWHT-rotates x before running the prerotated kernel;
     // the batched GEMM kernels (scalar gemm_hfq4g256 AND its WMMA siblings)
@@ -232,6 +246,38 @@ fn run_prefill_gemm_inner(
     };
     let family = llama::gemm_family();
 
+    if w.gpu_dtype == DType::Q8_0 {
+        // Bypass the chunked auto-router, which selects a non-exact WMMA
+        // kernel on wave32 targets. The scalar batched kernel shares each
+        // weight load across rows while retaining the serving GEMV arithmetic.
+        // The source accepts up to 64 rows, but its per-lane accumulator
+        // array is only validated for the DFlash-sized B<=16 contract on
+        // gfx1100. Larger live sets produce incorrect results on that target.
+        const MAX_BATCH: usize = 16;
+        let mut offset = 0;
+        while offset < batch_size {
+            let take = (batch_size - offset).min(MAX_BATCH);
+            let x_sub = x_gemm.sub_offset(offset * w.k, take * w.k);
+            let y_sub = y.sub_offset(offset * w.m, take * w.m);
+            let chunk_params = GemmParams {
+                w: &w_ref,
+                x: &x_sub,
+                y: &y_sub,
+                batch_size: take,
+            };
+            family
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
+                    &ctx,
+                    gpu,
+                    &chunk_params,
+                )
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            offset += take;
+        }
+        return Ok(());
+    }
+
     if wmma_prefill_enabled() {
         // WMMA path: use GemmFamily::run which resolves the best kernel
         // for each dtype (WMMA where available, scalar fallback otherwise).
@@ -259,7 +305,7 @@ fn run_prefill_gemm_inner(
         DType::HFQ4G128 => hipfire_dispatch::types::KernelKey::GemmHfq4G128,
         // Same kernel as HFQ4G256 (layout-identical); input pre-rotated above.
         DType::MQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256,
-        DType::Q8_0 => hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+        DType::Q8_0 => unreachable!("Q8 handled by exact scalar batching above"),
         // No batched GEMM kernel for this dtype -- fall back to repeated GEMV
         // on the RAW input (weight_gemv applies any needed rotation itself).
         // This matches the old  fallback path.
@@ -1550,12 +1596,21 @@ pub const GEMMA4_FLASH_TILE: usize = 128;
 /// scale linearly with this.
 pub const GEMMA4_MAX_PREFILL_BATCH: usize = 128;
 
+#[inline]
+fn flash_partials_len_for_tile(
+    max_seq: usize,
+    n_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> usize {
+    n_heads * max_seq.div_ceil(tile_size) * (2 + head_dim)
+}
+
 /// Pure geometry: single-query flash partial length for `max_seq`.
 /// `n_heads * ceil(max_seq / TILE) * (2 + head_dim)` floats.
 #[inline]
 pub fn gemma4_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
-    let tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
-    n_heads * tiles * (2 + full_head_dim)
+    flash_partials_len_for_tile(max_seq, n_heads, full_head_dim, GEMMA4_FLASH_TILE)
 }
 
 /// Pure geometry: batched flash partial length for `max_seq`.
@@ -1746,8 +1801,27 @@ impl Gemma4Scratch {
             max_seq >= 128,
             "gemma4 scratch: max_seq {max_seq} too small"
         );
-        let flash_partials_sz =
+        // Sliding Q8 attention chooses an architecture-specific tile (32 on
+        // gfx1100), while full Asym3 attention uses a fixed 128-token tile.
+        // Size the shared partial buffer for both layouts. Using only the
+        // full-attention geometry under-allocated this buffer on gfx1100 and
+        // let sliding attention overwrite the following scratch allocation.
+        let sliding_tile = rdna_compute::attention::q8_flash_tile_size(
+            &gpu.arch,
+            config.n_heads,
+            config.sliding_n_kv_heads,
+            config.sliding_head_dim,
+            max_seq,
+        );
+        let sliding_flash_partials_sz = flash_partials_len_for_tile(
+            max_seq,
+            config.n_heads,
+            config.sliding_head_dim,
+            sliding_tile,
+        );
+        let full_flash_partials_sz =
             gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        let flash_partials_sz = sliding_flash_partials_sz.max(full_flash_partials_sz);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -1962,6 +2036,16 @@ impl Gemma4Scratch {
 #[cfg(test)]
 mod scratch_geometry_tests {
     use super::*;
+
+    #[test]
+    fn sliding_tile32_partials_can_exceed_full_tile128_partials() {
+        let max_seq = 1025;
+        let sliding = flash_partials_len_for_tile(max_seq, 16, 256, 32);
+        let full = flash_partials_len_for_tile(max_seq, 16, 512, 128);
+        assert!(sliding > full);
+        assert_eq!(sliding, 16 * 33 * 258);
+        assert_eq!(full, 16 * 9 * 514);
+    }
 
     fn dummy_cfg_31b() -> Gemma4Config {
         // Minimal config mirroring 31B/26B shapes: n_heads=32, full_head_dim=512
@@ -2261,7 +2345,6 @@ fn apply_moe_branch(
                 dim,
             )?;
         };
-
         // Batched gelu_tanh + mul over [k_top × mi].
         gpu.gelu_tanh_f32(
             &scratch.moe_expert_gate_batch,
@@ -2273,7 +2356,6 @@ fn apply_moe_branch(
             &scratch.moe_expert_up_batch,
             &scratch.moe_expert_hidden_batch,
         )?;
-
         // Zero accumulator (memset is sync but tiny — 11 KB for dim=2816).
         gpu.zero_f32(&scratch.moe_cur_moe)?;
 
@@ -2423,7 +2505,6 @@ fn apply_moe_branch(
         &scratch.moe_cur_moe,
         config.norm_eps,
     )?;
-
     // 10) combined = cur_mlp + cur_moe → scratch.tmp
     gpu.add_f32_graph_safe(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
 
@@ -2433,9 +2514,8 @@ fn apply_moe_branch(
     Ok(())
 }
 
-/// Batched MoE branch — processes N tokens at once. Mirrors `apply_moe_branch`
-/// but every per-token tensor becomes a `[N × *]` row-major batch and every
-/// kernel call uses the `_batched` variant.
+/// Batched-prefill MoE bridge. Processes each row through the serving
+/// single-token branch to preserve expert routing and projection arithmetic.
 ///
 /// Inputs (live in `scratch.pb_*`):
 ///   - pb_attn_out[N × dim]: post-attention output (input to pre_norm_2 and router)
@@ -2446,9 +2526,6 @@ fn apply_moe_branch(
 ///     i.e. what the per-token path writes to `scratch.tmp`. Caller adds it
 ///     to the per-token residual + applies the layer scalar.
 ///
-/// Only the indexed-fast path (MQ4G256 gate_up + HFQ4G128/Q8_0 down) is wired.
-/// Falls back to per-token calls when the quant mix doesn't match (slow but
-/// correct).
 fn apply_moe_branch_batched(
     gpu: &mut Gpu,
     config: &Gemma4Config,
@@ -2458,250 +2535,53 @@ fn apply_moe_branch_batched(
     n_batch: usize,
 ) -> HipResult<()> {
     let dim = config.dim;
-    let mi = config.moe_intermediate_size;
-    let n_exp = config.num_experts;
-    let k_top = config.top_k_experts;
-    if k_top != 8 {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!("MoE top_k_experts={k_top} unsupported (kernel hardcoded to 8)"),
-        ));
-    }
-    debug_assert!(
-        n_batch <= scratch.max_prefill_batch,
-        "n_batch={n_batch} > MAX_PREFILL_BATCH={}",
-        scratch.max_prefill_batch
-    );
-
-    let first = &moe.experts[0];
-    let _gate_dtype = first.gate_up_proj.gpu_dtype;
-    let _down_dtype = first.down_proj.gpu_dtype;
-    // TODO(Phase 4): fused batched MoE kernels not yet ported.
-    // Using per-token expert loop (correct but slow for prefill).
-
-    // 1) cur_mlp_batch = post_feedforward_layernorm_1(pb_ffn_out)
-    gpu.rmsnorm_batched(
-        &scratch.pb_ffn_out,
-        &moe.post_feedforward_layernorm_1,
-        &scratch.pb_moe_cur_mlp,
-        n_batch,
-        dim,
-        config.norm_eps,
-    )?;
-
-    // 2) pre2_batch = pre_feedforward_layernorm_2(pb_attn_out)
-    gpu.rmsnorm_batched(
-        &scratch.pb_attn_out,
-        &moe.pre_feedforward_layernorm_2,
-        &scratch.pb_moe_pre2,
-        n_batch,
-        dim,
-        config.norm_eps,
-    )?;
-
-    // 3) router_in = rmsnorm(attn_out, router_scale) / sqrt(dim)
-    gpu.rmsnorm_batched(
-        &scratch.pb_attn_out,
-        &moe.router_scale,
-        &scratch.pb_moe_router_in,
-        n_batch,
-        dim,
-        config.norm_eps,
-    )?;
-    gpu.scale_f32(&scratch.pb_moe_router_in, 1.0 / (dim as f32).sqrt())?;
-    // scale_f32 operates on the full tensor — for [N × dim] this scales
-    // every element, which is what we want (each row is divided by sqrt(dim)).
-
-    // 4) Router GEMM → logits [N × n_exp]
-    run_prefill_gemm(
-        gpu,
-        &moe.router_proj,
-        &scratch.pb_moe_router_in,
-        &scratch.pb_moe_router_logits,
-        n_batch,
-        Some(&scratch.pb_bf16),
-    )?;
-
-    // 5) Batched top-K softmax + renorm.
-    gpu.moe_softmax_topk_renorm_k8_batched(
-        &scratch.pb_moe_router_logits,
-        &scratch.pb_moe_topk_indices,
-        &scratch.pb_moe_topk_weights,
-        n_exp,
-        true,
-        n_batch,
-    )?;
-
-    // 5b) Phase B (opt-in): build per-expert buckets so the bucketed GEMV
-    // can reuse the weight tile across all tokens routed to the same expert.
-    // Measured -5.7% prefill regression on Gemma 4 26B-A4B-it / gfx1201 at
-    // N=128 batch (132 → 124 tok/s): the bucketed kernel pre-loads the
-    // weight tile into ~48 VGPRs per lane (sc/zp/pk × 16 groups) which
-    // cuts occupancy below the indexed_batched kernel that streams weights
-    // in the inner loop, and the serialized loop over bucket tokens loses
-    // more parallelism than is recovered from launch-overhead savings
-    // (180k blocks vs 1.4M). Default OFF; kept behind opt-in for future
-    // tuning (smaller MAX_GROUPS, LDS staging, fewer launch_bounds waves).
-    let use_bucketed = std::env::var("HIPFIRE_MOE_BUCKETED")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if use_bucketed {
-        gpu.moe_bucket_build(
-            &scratch.pb_moe_topk_indices,
-            &scratch.pb_moe_expert_offsets,
-            &scratch.pb_moe_expert_token_list,
-            n_batch,
-            k_top,
-            n_exp,
-        )?;
-    }
-
-    // 6-13) Per-token expert loop (Phase 4 fallback until fused kernels ported).
-    // For each token: extract per-token topk indices/weights,
-    // run 8 expert GEMVs, accumulate into pb_moe_cur_moe.
     let dim_bytes = dim * 4;
-    let topk_idx_host = gpu.download_f32(&scratch.pb_moe_topk_indices)?;
-    let topk_wt_host = gpu.download_f32(&scratch.pb_moe_topk_weights)?;
-    let topk_indices_batch: Vec<Vec<usize>> = (0..n_batch)
-        .map(|b| {
-            unsafe {
-                std::slice::from_raw_parts(
-                    topk_idx_host.as_ptr().add(b * k_top) as *const i32,
-                    k_top,
-                )
-            }
-            .iter()
-            .map(|&i| i as usize)
-            .collect()
-        })
-        .collect();
-    let topk_weights_batch: Vec<Vec<f32>> = (0..n_batch)
-        .map(|b| topk_wt_host[b * k_top..(b + 1) * k_top].to_vec())
-        .collect();
 
-    // Zero cur_moe_batch accumulator.
-    if let Some(s) = gpu.active_stream.as_ref() {
-        gpu.hip
-            .memset_async(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes, s)?;
-    } else {
-        gpu.hip
-            .memset(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes)?;
-    }
-
+    // The existing single-token path already uses the fused indexed expert
+    // kernels and is the serving correctness reference. Reuse it per row
+    // instead of reimplementing MoE with a CPU top-k download and eight
+    // separate expert GEMVs. Besides preserving the same arithmetic path,
+    // this removes the batched fallback's per-token D2H synchronization.
     for b in 0..n_batch {
-        for ki in 0..k_top {
-            let e = topk_indices_batch[b][ki];
-            let weight = topk_weights_batch[b][ki] * moe.per_expert_scale_host[e];
-            let expert = &moe.experts[e];
-
-            // Copy this token's pre2 row into scratch.moe_pre2
-            if let Some(s) = gpu.active_stream.as_ref() {
-                gpu.hip.memcpy_dtod_async_at(
-                    &scratch.moe_pre2.buf,
-                    0,
-                    &scratch.pb_moe_pre2.buf,
-                    b * dim_bytes,
-                    dim_bytes,
-                    s,
-                )?;
-            } else {
-                gpu.hip.memcpy_dtod_at(
-                    &scratch.moe_pre2.buf,
-                    0,
-                    &scratch.pb_moe_pre2.buf,
-                    b * dim_bytes,
-                    dim_bytes,
-                )?;
-            }
-
-            // gate_up = expert.gate_up_proj @ pre2
-            weight_gemv(
-                gpu,
-                &expert.gate_up_proj,
-                &scratch.moe_pre2,
-                &scratch.moe_expert_gate_up,
+        let attn_row = scratch.pb_attn_out.sub_offset(b * dim, dim);
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.memcpy_dtod_async_at(
+                &scratch.ffn_out.buf,
+                0,
+                &scratch.pb_ffn_out.buf,
+                b * dim_bytes,
+                dim_bytes,
+                stream,
             )?;
-            let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
-            let up = scratch.moe_expert_gate_up.sub_offset(mi, mi);
-            // hidden = gelu_tanh(gate) * up
-            gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
-            gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
-            // expert_out = expert.down_proj @ hidden
-            weight_gemv(
-                gpu,
-                &expert.down_proj,
-                &scratch.moe_expert_hidden,
-                &scratch.moe_expert_out,
+        } else {
+            gpu.hip.memcpy_dtod_at(
+                &scratch.ffn_out.buf,
+                0,
+                &scratch.pb_ffn_out.buf,
+                b * dim_bytes,
+                dim_bytes,
             )?;
-            // scaled_add into the correct row of pb_moe_cur_moe
-            if let Some(s) = gpu.active_stream.as_ref() {
-                gpu.hip.memcpy_dtod_async_at(
-                    &scratch.tmp.buf,
-                    0,
-                    &scratch.pb_moe_cur_moe.buf,
-                    b * dim_bytes,
-                    dim_bytes,
-                    s,
-                )?;
-            } else {
-                gpu.hip.memcpy_dtod_at(
-                    &scratch.tmp.buf,
-                    0,
-                    &scratch.pb_moe_cur_moe.buf,
-                    b * dim_bytes,
-                    dim_bytes,
-                )?;
-            }
-            gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.tmp, &scratch.moe_expert_out, weight)?;
-            if let Some(s) = gpu.active_stream.as_ref() {
-                gpu.hip.memcpy_dtod_async_at(
-                    &scratch.pb_moe_cur_moe.buf,
-                    b * dim_bytes,
-                    &scratch.tmp.buf,
-                    0,
-                    dim_bytes,
-                    s,
-                )?;
-            } else {
-                gpu.hip.memcpy_dtod_at(
-                    &scratch.pb_moe_cur_moe.buf,
-                    b * dim_bytes,
-                    &scratch.tmp.buf,
-                    0,
-                    dim_bytes,
-                )?;
-            }
+        }
+        apply_moe_branch(gpu, config, scratch, moe, post_ffn_norm, &attn_row)?;
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.memcpy_dtod_async_at(
+                &scratch.pb_moe_pre2.buf,
+                b * dim_bytes,
+                &scratch.tmp.buf,
+                0,
+                dim_bytes,
+                stream,
+            )?;
+        } else {
+            gpu.hip.memcpy_dtod_at(
+                &scratch.pb_moe_pre2.buf,
+                b * dim_bytes,
+                &scratch.tmp.buf,
+                0,
+                dim_bytes,
+            )?;
         }
     }
-
-    // 11) post_feedforward_layernorm_2(cur_moe) in-place batched.
-    gpu.rmsnorm_batched(
-        &scratch.pb_moe_cur_moe,
-        &moe.post_feedforward_layernorm_2,
-        &scratch.pb_moe_cur_moe,
-        n_batch,
-        dim,
-        config.norm_eps,
-    )?;
-
-    // 12) combined = cur_mlp + cur_moe → reuse pb_moe_pre2 as the combined buffer.
-    gpu.add_f32(
-        &scratch.pb_moe_cur_mlp,
-        &scratch.pb_moe_cur_moe,
-        &scratch.pb_moe_pre2,
-    )?;
-
-    // 13) post_feedforward_layernorm(combined) → batched, in-place.
-    gpu.rmsnorm_batched(
-        &scratch.pb_moe_pre2,
-        post_ffn_norm,
-        &scratch.pb_moe_pre2,
-        n_batch,
-        dim,
-        config.norm_eps,
-    )?;
-
     Ok(())
 }
 
@@ -3047,9 +2927,16 @@ fn sliding_layer_decode_impl(
         gpu.hip
             .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
     }
+    let dump_pos = std::env::var("HIPFIRE_GEMMA4_DUMP_ROW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let dump_layer = std::env::var("HIPFIRE_GEMMA4_DUMP_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let _dump_on = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1")
-        && (pos == 0 || pos == 1)
-        && kv_layer_idx == 0;
+        && dump_pos.map_or(pos == 0 || pos == 1, |target| pos == target)
+        && kv_layer_idx == dump_layer;
     if _dump_on {
         dbg_dump(gpu, "[v1] L0 input scratch.x", &scratch.x, dim);
     }
@@ -3115,6 +3002,14 @@ fn sliding_layer_decode_impl(
         head_dim,
         config.norm_eps,
     )?;
+    if _dump_on {
+        dbg_dump(
+            gpu,
+            "[v1] L0 before v_norm ones",
+            &scratch.v_norm_ones_full,
+            head_dim,
+        );
+    }
     gpu.rmsnorm_batched(
         &scratch.v,
         &scratch.v_norm_ones_full,
@@ -3234,6 +3129,12 @@ fn sliding_layer_decode_impl(
             "[v1] L0 after attention",
             &scratch.attn_out,
             n_heads * head_dim,
+        );
+        dbg_dump(
+            gpu,
+            "[v1] L0 ones after attention",
+            &scratch.v_norm_ones_full,
+            head_dim,
         );
         let data = gpu.download_f32(&scratch.attn_out).unwrap_or_default();
         let gqa_ratio = n_heads / n_kv;
@@ -3479,6 +3380,23 @@ fn full_layer_decode_impl(
     let ctx = DispatchCtx::new(gpu);
     let kv_bytes = n_kv * head_dim * 4;
 
+    if pos == 0 && kv_layer_idx == 0 {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.memset_async(
+                &scratch.flash_partials.buf,
+                0,
+                scratch.flash_partials.byte_size(),
+                stream,
+            )?;
+        } else {
+            gpu.hip.memset(
+                &scratch.flash_partials.buf,
+                0,
+                scratch.flash_partials.byte_size(),
+            )?;
+        }
+    }
+
     // residual = x
     if let Some(s) = gpu.active_stream.as_ref() {
         gpu.hip
@@ -3496,9 +3414,16 @@ fn full_layer_decode_impl(
         config.norm_eps,
     )?;
 
+    let dump_pos = std::env::var("HIPFIRE_GEMMA4_DUMP_ROW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let dump_kv_layer = std::env::var("HIPFIRE_GEMMA4_DUMP_KV_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let _fdump = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1")
-        && pos == 1
-        && kv_layer_idx == 0;
+        && dump_pos.map_or(pos == 1, |target| pos == target)
+        && kv_layer_idx == dump_kv_layer;
     if _fdump {
         dbg_dump(gpu, "[FL] L5 input scratch.x", &scratch.x, dim);
     }
@@ -3661,6 +3586,9 @@ fn full_layer_decode_impl(
         &scratch.tmp,
         config.norm_eps,
     )?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] post_attn_norm", &scratch.tmp, dim);
+    }
 
     // x = residual + tmp.
     if let Some(s) = gpu.active_stream.as_ref() {
@@ -3671,6 +3599,9 @@ fn full_layer_decode_impl(
             .memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
     }
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] post_attn_residual", &scratch.x, dim);
+    }
 
     // Save new residual.
     if let Some(s) = gpu.active_stream.as_ref() {
@@ -3688,13 +3619,26 @@ fn full_layer_decode_impl(
         &scratch.tmp,
         config.norm_eps,
     )?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] pre_ffn_norm", &scratch.tmp, dim);
+    }
 
     // SwiGLU with gelu_pytorch_tanh activation.
     weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
     weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] gate_proj", &scratch.gate_ffn, config.hidden_dim);
+        dbg_dump(gpu, "[FL] up_proj", &scratch.up_ffn, config.hidden_dim);
+    }
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] gelu_mul", &scratch.ffn_hidden, config.hidden_dim);
+    }
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] down_proj", &scratch.ffn_out, dim);
+    }
 
     // Batched prefill hand-off (see sliding_layer_decode_impl for rationale).
     if stop_before_moe {
@@ -3732,6 +3676,9 @@ fn full_layer_decode_impl(
 
     // Learned per-layer scalar multiplier.
     gpu.scale_f32(&scratch.x, lw.layer_scalar_host)?;
+    if _fdump {
+        dbg_dump(gpu, "[FL] layer_output", &scratch.x, dim);
+    }
 
     Ok(())
 }
@@ -4168,14 +4115,17 @@ fn forward_prefill_batch_v2(
                 let kv_dim_bytes = kv_dim * 4;
                 let q_dim_bytes = q_dim * 4;
 
-                let _dump_on = layer_idx == 0 && start_pos == 0;
+                let dump_layer = std::env::var("HIPFIRE_GEMMA4_DUMP_LAYER")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let dump_row = std::env::var("HIPFIRE_GEMMA4_DUMP_ROW")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let _dump_on = layer_idx == dump_layer && start_pos == 0;
                 if _dump_on {
-                    dbg_dump(
-                        gpu,
-                        "[v2] L0 input pb_residual[0]",
-                        &scratch.pb_residual,
-                        dim,
-                    );
+                    dbg_dump(gpu, "[v2] L0 input pb_residual", &scratch.pb_residual, dim);
                 }
                 gpu.rmsnorm_batched(
                     &scratch.pb_residual,
@@ -4286,6 +4236,14 @@ fn forward_prefill_batch_v2(
                     head_dim,
                     config.norm_eps,
                 )?;
+                if _dump_on {
+                    dbg_dump(
+                        gpu,
+                        "[v2] L0 before v_norm ones",
+                        &scratch.v_norm_ones_full,
+                        head_dim,
+                    );
+                }
                 gpu.rmsnorm_batched(
                     &scratch.pb_v,
                     &scratch.v_norm_ones_full,
@@ -4327,13 +4285,7 @@ fn forward_prefill_batch_v2(
                 let sliding_cap = config.sliding_window as u32;
                 for i in 0..n_batch {
                     let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip
-                            .stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        gpu.hip
-                            .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
-                    }
+                    let pos_view = scratch.pb_positions.sub_offset(i, 1);
                     if let Some(_s) = gpu.active_stream.as_ref() {
                         gpu.hip.memcpy_dtod_async_at(
                             &scratch.q.buf,
@@ -4390,9 +4342,9 @@ fn forward_prefill_batch_v2(
                         quant_fwht: kv_sliding.quant_fwht,
                         quant_hfq4: false,
                         quant_q4: false,
-            quant_int8: false,
-            quant_hfq8: false,
-            quant_bf16: false,
+                        quant_int8: false,
+                        quant_hfq8: false,
+                        quant_bf16: false,
                         f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                         v_mode_bits: kv_sliding.v_mode_bits(),
                         pos,
@@ -4414,7 +4366,7 @@ fn forward_prefill_batch_v2(
                         v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
                         k_scales: None,
                         v_scales: None,
-                        pos_buf: &scratch.pos_buf,
+                        pos_buf: &pos_view.buf,
                         pos,
                         positions: None,
                         n_heads,
@@ -4435,6 +4387,9 @@ fn forward_prefill_batch_v2(
                     let ctx = DispatchCtx::new(gpu);
                     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    if std::env::var("HIPFIRE_GEMMA4_PARITY_EXACT").ok().as_deref() == Some("1") {
+                        gpu.hip.device_synchronize()?;
+                    }
                     // Copy attention output back to batched buffer.
                     if let Some(_s) = gpu.active_stream.as_ref() {
                         gpu.hip.memcpy_dtod_async_at(
@@ -4458,6 +4413,12 @@ fn forward_prefill_batch_v2(
                 sliding_kv_idx += 1;
                 if _dump_on {
                     dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim);
+                    dbg_dump(
+                        gpu,
+                        "[v2] L0 ones after attention",
+                        &scratch.v_norm_ones_full,
+                        head_dim,
+                    );
                 }
 
                 run_prefill_gemm(
@@ -4505,6 +4466,32 @@ fn forward_prefill_batch_v2(
                 let kv_dim = n_kv * head_dim;
                 let kv_dim_bytes = kv_dim * 4;
                 let q_dim_bytes = q_dim * 4;
+                let dump_layer = std::env::var("HIPFIRE_GEMMA4_DUMP_LAYER")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let dump_row = std::env::var("HIPFIRE_GEMMA4_DUMP_ROW")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let _dump_on = layer_idx == dump_layer && start_pos == 0;
+
+                if start_pos == 0 && full_kv_idx == 0 {
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.memset_async(
+                            &scratch.flash_partials.buf,
+                            0,
+                            scratch.flash_partials.byte_size(),
+                            stream,
+                        )?;
+                    } else {
+                        gpu.hip.memset(
+                            &scratch.flash_partials.buf,
+                            0,
+                            scratch.flash_partials.byte_size(),
+                        )?;
+                    }
+                }
 
                 gpu.rmsnorm_batched(
                     &scratch.pb_residual,
@@ -4608,20 +4595,18 @@ fn forward_prefill_batch_v2(
                     head_dim,
                     config.norm_eps,
                 )?;
+                if _dump_on {
+                    dbg_dump(gpu, "[v2-full] after input_norm", &scratch.pb_tmp, dim);
+                    dbg_dump(gpu, "[v2-full] after q_proj", &scratch.pb_q, q_dim);
+                    dbg_dump(gpu, "[v2-full] after k_proj", &scratch.pb_k, kv_dim);
+                    dbg_dump(gpu, "[v2-full] after v_norm", &scratch.pb_v, kv_dim);
+                }
                 gpu.scale_f32(&scratch.pb_q, (head_dim as f32).sqrt())?;
                 let n_rot_pairs =
                     ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
                 // Per-token partial-halved RoPE (no batched variant yet for this shape).
                 for i in 0..n_batch {
-                    let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip
-                            .stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        let pos_i32 = pos as i32;
-                        gpu.hip
-                            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    }
+                    let pos_view = scratch.pb_positions.sub_offset(i, 1);
                     if let Some(_s) = gpu.active_stream.as_ref() {
                         gpu.hip.memcpy_dtod_async_at(
                             &scratch.q.buf,
@@ -4661,13 +4646,18 @@ fn forward_prefill_batch_v2(
                     gpu.rope_partial_halved_f32(
                         &scratch.q,
                         &scratch.k,
-                        &scratch.pos_buf,
+                        &pos_view.buf,
                         n_heads,
                         n_kv,
                         head_dim,
                         n_rot_pairs,
                         config.full_rope_theta,
                     )?;
+                    if _dump_on && i == dump_row {
+                        dbg_dump(gpu, "[v2-full] immediate rope_q", &scratch.q, q_dim);
+                        dbg_dump(gpu, "[v2-full] immediate rope_k", &scratch.k, kv_dim);
+                        dbg_dump(gpu, "[v2-full] immediate v", &scratch.v, kv_dim);
+                    }
                     if let Some(_s) = gpu.active_stream.as_ref() {
                         gpu.hip.memcpy_dtod_async_at(
                             &scratch.pb_q.buf,
@@ -4706,164 +4696,75 @@ fn forward_prefill_batch_v2(
                     }
                 }
 
-                // Batched full-layer attention (hd=512): all N tokens in ONE
-                // masked flash call instead of a per-token loop. Full layers are
-                // non-ring (cache_capacity=0) and non-windowed (window_size=0);
-                // the asym3 batched-masked kernel derives each query's causal
-                // bound from pb_positions, so this reproduces the per-token
-                // result with 1 launch/layer instead of N. (Sliding layers stay
-                // per-token until the q8 batched ring kernel lands — A.2.)
-                // Proportional RoPE was already applied to pb_q/pb_k above.
-                let _ = (q_dim_bytes, kv_dim_bytes); // (no per-token staging now)
-                let tier_inputs = KvTierInputs {
-                    quant_asym4: kv_full.quant_asym4,
-                    quant_asym3: kv_full.quant_asym3,
-                    quant_asym2: kv_full.quant_asym2,
-                    quant_q8: kv_full.quant_q8,
-                    quant_fwht: kv_full.quant_fwht,
-                    quant_hfq4: false,
-                    quant_q4: false,
-            quant_int8: false,
-            quant_hfq8: false,
-            quant_bf16: false,
-                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
-                    v_mode_bits: kv_full.v_mode_bits(),
-                    pos: start_pos + n_batch - 1,
-                    flash_mode: 2,
-                    capture_mode: gpu.graphs.capture_mode,
-                    batch_size: n_batch,
-                    is_tree: false,
-                    is_boundary: false,
-                    q8_windowed: true,
-                    window: 0,
-                };
-                let plan = KvTierPlan::derive(tier_inputs)
-                    .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
-                let io = AttnParams {
-                    q: &scratch.pb_q,
-                    k: &scratch.pb_k,
-                    v: &scratch.pb_v, // k_eq_v model: V = pre-k_norm k_proj out, v-normed (NOT k-normed/roped pb_k)
-                    k_cache: &kv_full.k_gpu[full_kv_idx],
-                    v_cache: &kv_full.v_gpu[full_kv_idx],
-                    k_scales: None,
-                    v_scales: None,
-                    pos_buf: &scratch.pos_buf,
-                    pos: start_pos + n_batch - 1,
-                    positions: Some(&scratch.pb_positions),
-                    n_heads,
-                    n_kv_heads: n_kv,
-                    head_dim,
-                    physical_cap: kv_full.max_seq,
-                    batch_size: n_batch,
-                    max_ctx_len: start_pos + n_batch,
-                    flash_partials: Some(&scratch.pb_flash_partials),
-                    givens_cos: kv_full.givens_cos.as_ref(),
-                    givens_sin: kv_full.givens_sin.as_ref(),
-                    tree_bias: None,
-                    block_start: 0,
-                    block_cols: 0,
-                    output_gate: None,
-                    output: &scratch.pb_attn_q,
-                };
-                let ctx = DispatchCtx::new(gpu);
-                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
-                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-                if std::env::var("HIPFIRE_GEMMA4_ATTN_VERIFY").ok().as_deref() == Some("1") {
-                    let batched_out = gpu.download_f32(&scratch.pb_attn_q)?;
-                    for i in 0..n_batch {
-                        let pos = start_pos + i;
-                        gpu.hip
-                            .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
-                        gpu.hip.memcpy_dtod_at(
-                            &scratch.q.buf,
-                            0,
-                            &scratch.pb_q.buf,
-                            i * q_dim_bytes,
-                            q_dim_bytes,
-                        )?;
-                        gpu.hip.memcpy_dtod_at(
-                            &scratch.k.buf,
-                            0,
-                            &scratch.pb_k.buf,
-                            i * kv_dim_bytes,
-                            kv_dim_bytes,
-                        )?;
-                        gpu.hip.memcpy_dtod_at(
-                            &scratch.v.buf,
-                            0,
-                            &scratch.pb_v.buf,
-                            i * kv_dim_bytes,
-                            kv_dim_bytes,
-                        )?;
-                        let ti = KvTierInputs {
-                            quant_asym4: kv_full.quant_asym4,
-                            quant_asym3: kv_full.quant_asym3,
-                            quant_asym2: kv_full.quant_asym2,
-                            quant_q8: kv_full.quant_q8,
-                            quant_fwht: kv_full.quant_fwht,
-                            quant_hfq4: false,
-                            quant_q4: false,
-            quant_int8: false,
-            quant_hfq8: false,
-            quant_bf16: false,
-                            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
-                            v_mode_bits: kv_full.v_mode_bits(),
-                            pos,
-                            flash_mode: 2,
-                            capture_mode: gpu.graphs.capture_mode,
-                            batch_size: 1,
-                            is_tree: false,
-                            is_boundary: false,
-                            q8_windowed: false,
-                            window: 0,
-                        };
-                        let p1 = KvTierPlan::derive(ti)
-                            .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
-                        let io1 = AttnParams {
-                            q: &scratch.q,
-                            k: &scratch.k,
-                            v: &scratch.v,
-                            k_cache: &kv_full.k_gpu[full_kv_idx],
-                            v_cache: &kv_full.v_gpu[full_kv_idx],
-                            k_scales: None,
-                            v_scales: None,
-                            pos_buf: &scratch.pos_buf,
-                            pos,
-                            positions: None,
-                            n_heads,
-                            n_kv_heads: n_kv,
-                            head_dim,
-                            physical_cap: kv_full.max_seq,
-                            batch_size: 1,
-                            max_ctx_len: 0,
-                            flash_partials: Some(&scratch.flash_partials),
-                            givens_cos: kv_full.givens_cos.as_ref(),
-                            givens_sin: kv_full.givens_sin.as_ref(),
-                            tree_bias: None,
-                            block_start: 0,
-                            block_cols: 0,
-                            output_gate: None,
-                            output: &scratch.attn_out,
-                        };
-                        let c1 = DispatchCtx::new(gpu);
-                        execute_steps(gpu, &c1, &[Step::Attend { plan: p1, io: io1 }])
-                            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-                        let single = gpu.download_f32(&scratch.attn_out)?;
-                        let row = &batched_out[i * q_dim..(i + 1) * q_dim];
-                        let mut worst = 0f32;
-                        let mut wi = 0usize;
-                        for j in 0..q_dim {
-                            let d = (single[j] - row[j]).abs();
-                            if d > worst {
-                                worst = d;
-                                wi = j;
-                            }
-                        }
-                        eprintln!("[attn-verify] L{layer_idx} start={start_pos} tok={i} pos={pos} worst={worst:.5} at {wi} single={:.4} batched={:.4}",
-                            single[wi], row[wi]);
-                    }
+                // The HD512 batched Asym3 writer is not byte-equivalent to the
+                // serving path yet. Stage projected rows through the production
+                // single-query attention contract; the public entry point caps
+                // each v2 batch at the validated 32-row boundary.
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    let pos_view = scratch.pb_positions.sub_offset(i, 1);
+                    let q_row = scratch.pb_q.sub_offset(i * q_dim, q_dim);
+                    let k_row = scratch.pb_k.sub_offset(i * kv_dim, kv_dim);
+                    let v_row = scratch.pb_v.sub_offset(i * kv_dim, kv_dim);
+                    let out_row = scratch.pb_attn_q.sub_offset(i * q_dim, q_dim);
+                    let tier_inputs = KvTierInputs {
+                        quant_asym4: kv_full.quant_asym4,
+                        quant_asym3: kv_full.quant_asym3,
+                        quant_asym2: kv_full.quant_asym2,
+                        quant_q8: kv_full.quant_q8,
+                        quant_fwht: kv_full.quant_fwht,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        quant_int8: false,
+                        quant_hfq8: false,
+                        quant_bf16: false,
+                        f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+                        v_mode_bits: kv_full.v_mode_bits(),
+                        pos,
+                        flash_mode: 2,
+                        capture_mode: gpu.graphs.capture_mode,
+                        batch_size: 1,
+                        is_tree: false,
+                        is_boundary: false,
+                        q8_windowed: false,
+                        window: 0,
+                    };
+                    let plan = KvTierPlan::derive(tier_inputs)
+                        .map_err(|e| hip_bridge::HipError::new(0, &format!("{e:?}")))?;
+                    let io = AttnParams {
+                        q: &q_row,
+                        k: &k_row,
+                        v: &v_row,
+                        k_cache: &kv_full.k_gpu[full_kv_idx],
+                        v_cache: &kv_full.v_gpu[full_kv_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &pos_view.buf,
+                        pos,
+                        positions: None,
+                        n_heads,
+                        n_kv_heads: n_kv,
+                        head_dim,
+                        physical_cap: kv_full.max_seq,
+                        batch_size: 1,
+                        max_ctx_len: 0,
+                        flash_partials: Some(&scratch.flash_partials),
+                        givens_cos: kv_full.givens_cos.as_ref(),
+                        givens_sin: kv_full.givens_sin.as_ref(),
+                        tree_bias: None,
+                        block_start: 0,
+                        block_cols: 0,
+                        output_gate: None,
+                        output: &out_row,
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 }
                 full_kv_idx += 1;
+                if _dump_on {
+                    dbg_dump(gpu, "[v2-full] after attention", &scratch.pb_attn_q, q_dim);
+                }
 
                 run_prefill_gemm(
                     gpu,
@@ -4907,7 +4808,11 @@ fn forward_prefill_batch_v2(
         }
 
         // Batched pre-FFN rmsnorm + dense FFN.
-        let _dump_ffn = layer_idx == 0 && start_pos == 0;
+        let dump_layer = std::env::var("HIPFIRE_GEMMA4_DUMP_LAYER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let _dump_ffn = layer_idx == dump_layer && start_pos == 0;
         match (layer_type, &weights.layers[layer_idx]) {
             (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
                 gpu.rmsnorm_batched(
@@ -5026,6 +4931,9 @@ fn forward_prefill_batch_v2(
                     dim,
                     config.norm_eps,
                 )?;
+                if _dump_ffn {
+                    dbg_dump(gpu, "[v2-full] pre_ffn_norm", &scratch.pb_tmp, dim);
+                }
                 // BF16 hoist for shared pb_tmp -> gate+up (full). Capture shared
                 // F32 pb_tmp once per weight before staging.
                 if lw.gate_proj.gpu_dtype == DType::BF16 {
@@ -5078,6 +4986,15 @@ fn forward_prefill_batch_v2(
                         Some(&scratch.pb_bf16),
                     )?;
                 }
+                if _dump_ffn {
+                    dbg_dump(
+                        gpu,
+                        "[v2-full] gate_proj",
+                        &scratch.pb_gate,
+                        config.hidden_dim,
+                    );
+                    dbg_dump(gpu, "[v2-full] up_proj", &scratch.pb_up, config.hidden_dim);
+                }
                 gpu.gelu_tanh_f32(
                     &scratch.pb_gate,
                     &scratch.pb_ffn_hidden,
@@ -5088,6 +5005,14 @@ fn forward_prefill_batch_v2(
                     &scratch.pb_up,
                     &scratch.pb_ffn_hidden,
                 )?;
+                if _dump_ffn {
+                    dbg_dump(
+                        gpu,
+                        "[v2-full] gelu_mul",
+                        &scratch.pb_ffn_hidden,
+                        config.hidden_dim,
+                    );
+                }
                 run_prefill_gemm(
                     gpu,
                     &lw.down_proj,
@@ -5096,6 +5021,9 @@ fn forward_prefill_batch_v2(
                     n_batch,
                     Some(&scratch.pb_bf16),
                 )?;
+                if _dump_ffn {
+                    dbg_dump(gpu, "[v2-full] down_proj", &scratch.pb_ffn_out, dim);
+                }
             }
             _ => unreachable!(),
         }
@@ -5122,6 +5050,9 @@ fn forward_prefill_batch_v2(
                 gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_ffn_out)?;
                 gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
             }
+        }
+        if _dump_ffn {
+            dbg_dump(gpu, "[v2] layer_output", &scratch.pb_residual, dim);
         }
         if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
             let data = gpu.download_f32(&scratch.pb_residual).unwrap_or_default();
@@ -5740,9 +5671,9 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_fwht: kv.quant_fwht,
                     quant_hfq4: false,
                     quant_q4: false,
-            quant_int8: false,
-            quant_hfq8: false,
-            quant_bf16: false,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    quant_bf16: false,
                     f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,
@@ -5849,9 +5780,9 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_fwht: kv.quant_fwht,
                     quant_hfq4: false,
                     quant_q4: false,
-            quant_int8: false,
-            quant_hfq8: false,
-            quant_bf16: false,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    quant_bf16: false,
                     f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,

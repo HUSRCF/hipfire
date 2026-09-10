@@ -49,13 +49,15 @@ extern "C" __global__ void gemm_q8_0_batched(
         const unsigned char* block = row_data + bi * 34;
         float d = (float)*((const _Float16*)block);
         signed char qval = (signed char)block[2 + tid];
-        float dq = d * (float)qval;
         const int x_off = bi * 32 + tid;
 
         #pragma unroll
         for (int b = 0; b < MAX_BATCH; b++) {
             if (b < batch_size) {
-                sums[b] += dq * X[(size_t)b * K + x_off];
+                // Keep the expression identical to gemv_q8_0. Materializing
+                // d*qval first changes FP contraction/rounding and violates
+                // the greedy-parity contract documented above.
+                sums[b] += d * (float)qval * X[(size_t)b * K + x_off];
             }
         }
     }
