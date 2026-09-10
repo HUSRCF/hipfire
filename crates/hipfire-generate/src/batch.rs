@@ -86,8 +86,8 @@ fn emit_batch_admission_error(
     batch_clear_terminal_at_generation(id, attempt_id, admission);
 }
 /// Emit the assignment-time LFM capacity failure. The caller must hold the
-/// exact `BatchAttemptScope`; the scheduler owns generation-aware lane abort
-/// and registry cleanup immediately after this returns.
+/// exact `BatchAttemptScope`; the route adapter claims the terminal and releases
+/// the matching LFM-AR start latch before the scheduler retires the lane.
 fn emit_lfm_assignment_capacity_error(
     stdout: &mut impl Write,
     key: &AttemptKey,
@@ -95,7 +95,8 @@ fn emit_lfm_assignment_capacity_error(
     max_tokens: usize,
     capacity: usize,
 ) {
-    emit_active_attempt_error(
+    crate::ar::emit_generation_error(
+        crate::ar::GenerationRoute::LfmAr,
         stdout,
         Some(&key.id),
         &format!(
@@ -3834,7 +3835,7 @@ mod tests {
     }
 
     #[test]
-    fn lfm_assignment_capacity_error_is_correlated_and_cleans_generation() {
+    fn lfm_assignment_capacity_error_releases_route_latch_for_reuse() {
         let _guard = lock();
         batch_clear_all_terminals();
         clear_terminal_control();
@@ -3872,19 +3873,78 @@ mod tests {
         assert_eq!(assigned_key, key);
 
         let mut output = Vec::new();
-        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
-        emit_lfm_assignment_capacity_error(&mut output, &key, 7, 4, 8);
-        let lines: Vec<&str> = std::str::from_utf8(&output)
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            crate::ar::emit_generation_start(
+                crate::ar::GenerationRoute::LfmAr,
+                &mut output,
+                id,
+                false,
+            );
+        }
+        assert_eq!(
+            crate::ar::active_generation_route(),
+            Some(crate::ar::GenerationRoute::LfmAr)
+        );
+
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            emit_lfm_assignment_capacity_error(&mut output, &key, 7, 4, 8);
+        }
+        assert_eq!(crate::ar::active_generation_route(), None);
+
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
             .expect("UTF-8 error envelope")
             .lines()
             .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
             .collect();
-        assert_eq!(lines.len(), 1, "assignment emits exactly one error");
-        let event: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON error envelope");
-        assert_eq!(event["id"].as_str(), Some(id));
-        assert_eq!(event["attempt_id"].as_u64(), Some(attempt_id));
-        assert_eq!(event["class"].as_str(), Some("context_length"));
+        assert_eq!(events.len(), 2, "assignment emits one start and one error");
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[0]["attempt_id"].as_u64(), Some(attempt_id));
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["id"].as_str(), Some(id));
+        assert_eq!(events[1]["attempt_id"].as_u64(), Some(attempt_id));
+        assert_eq!(events[1]["class"].as_str(), Some("context_length"));
         assert!(sched.abort_lane(ticket.lane, &key, admission));
         assert_eq!(batch_terminal_generation(id, attempt_id), None);
+
+        // Reusing the exact wire key must claim a fresh route start rather
+        let reuse_admission = batch_announce_terminal(id, attempt_id).expect("reused batch admission");
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, reuse_admission);
+            crate::ar::emit_generation_start(
+                crate::ar::GenerationRoute::LfmAr,
+                &mut output,
+                id,
+                false,
+            );
+            assert_eq!(
+                crate::ar::active_generation_route(),
+                Some(crate::ar::GenerationRoute::LfmAr)
+            );
+        }
+        let reused_events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("UTF-8 events")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(reused_events.len(), 3);
+        assert_eq!(reused_events[2]["type"], "gen_start");
+        assert_eq!(reused_events[2]["attempt_id"].as_u64(), Some(attempt_id));
+
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, reuse_admission);
+            crate::ar::emit_active_route_cancel(&mut output, id, 0);
+        }
+        assert_eq!(crate::ar::active_generation_route(), None);
+        assert!(batch_clear_terminal_at_generation(
+            id,
+            attempt_id,
+            reuse_admission
+        ));
+        set_active_attempt_id(0);
+        clear_terminal_control();
     }
 }
