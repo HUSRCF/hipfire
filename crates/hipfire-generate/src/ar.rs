@@ -914,17 +914,27 @@ fn clear_generation_route() {
     ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
 }
 
-struct GenerationRouteScope {
+/// Request-owned route/latch guard.
+///
+/// The route is thread-local because producer helpers do not all receive the
+/// selected route explicitly. Keep the previous value so nested producers and
+/// standalone entry points cannot erase an outer request's route when they
+/// return. The start latch is still keyed to the exact attempt captured on
+/// entry; dropping one guard never clears another request's latch.
+pub(crate) struct GenerationRouteScope {
     id: String,
     attempt: u64,
+    previous_route: Option<GenerationRoute>,
 }
 
 impl GenerationRouteScope {
-    fn enter(route: GenerationRoute, id: &str) -> Self {
+    pub(crate) fn enter(route: GenerationRoute, id: &str) -> Self {
+        let previous_route = active_generation_route();
         set_generation_route(route);
         Self {
             id: id.to_owned(),
             attempt: active_attempt_id(),
+            previous_route,
         }
     }
 }
@@ -932,7 +942,7 @@ impl GenerationRouteScope {
 impl Drop for GenerationRouteScope {
     fn drop(&mut self) {
         release_route_start(&self.id, self.attempt);
-        ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
+        ACTIVE_GENERATION_ROUTE.with(|active| active.set(self.previous_route));
     }
 }
 
@@ -5249,5 +5259,82 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         13 => "gemma4",
         14 => "muse_glimmer",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod route_scope_tests {
+    use super::*;
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, set_active_attempt_id,
+    };
+
+    #[test]
+    fn vision_route_scope_restores_route_and_releases_same_key_start() {
+        let id = "vision-route-scope";
+        let attempt = 91_001;
+        let mut sink = Vec::new();
+        set_active_attempt_id(attempt);
+
+        // A route owned by an outer producer must survive an inner vision
+        // request that fails after its start event.
+        set_generation_route(GenerationRoute::LfmAr);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+            emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "vision failed after start",
+                "gpu",
+                true,
+                false,
+            );
+        }
+        assert_eq!(active_generation_route(), Some(GenerationRoute::LfmAr));
+
+        // Reusing the same wire key for a different vision route must emit a
+        // fresh start and advertise that route's own (legacy) contract.
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+        }
+        assert_eq!(active_generation_route(), Some(GenerationRoute::LfmAr));
+
+        // A second same-key scope must also be able to claim a fresh start;
+        // the first scope's Drop released only its exact (id, attempt) latch.
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+            emit_generation_cancel(GenerationRoute::DotsOcr, &mut sink, id, 0);
+        }
+
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "gen_start")
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0]["contract_version"], 2);
+        assert!(starts[1].get("contract_version").is_none());
+        assert!(starts[2].get("contract_version").is_none());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
     }
 }

@@ -411,6 +411,8 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    let route = crate::ar::GenerationRoute::QwenAr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
     // Stream-contract opener. MUST be the first event on this request's
     // stream: the HTTP CLI's StreamContractGate rejects any later event that
     // arrives without a preceding gen_start for this id — which stranded
@@ -429,12 +431,7 @@ pub fn generate_vl(
         .tokenizer
         .as_ref()
         .is_some_and(|t| t.special_token_id("<think>").is_some());
-    crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
-        stdout,
-        params.id,
-        started_in_think,
-    );
+    crate::ar::emit_generation_start(route, stdout, params.id, started_in_think);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -1670,13 +1667,10 @@ pub fn generate_vl_dots_ocr(
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
+    let route = crate::ar::GenerationRoute::DotsOcr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
     // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
-    crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::DotsOcr),
-        stdout,
-        params.id,
-        false,
-    );
+    crate::ar::emit_generation_start(route, stdout, params.id, false);
     let t0 = Instant::now();
     let GenerateVLParams {
         id,
@@ -2796,6 +2790,8 @@ pub fn generate_lfm2_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    let route = crate::ar::GenerationRoute::LfmAr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
     let GenerateVLParams {
         id,
         prompt,
@@ -2836,12 +2832,7 @@ pub fn generate_lfm2_vl(
 
     // Stream contract opener BEFORE any GPU work or event emission — the
     // HTTP gate rejects a `token` that arrives without gen_start first.
-    crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::LfmAr),
-        stdout,
-        id,
-        false,
-    );
+    crate::ar::emit_generation_start(route, stdout, id, false);
 
     // Full-turn clock: preprocess + tower encode + prefill + decode. The
     // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
