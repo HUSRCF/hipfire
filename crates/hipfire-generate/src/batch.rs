@@ -501,6 +501,17 @@ pub fn drive_qwen_continuous_batch(
                     let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if t == "generate" {
                         let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(0) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate attempt_id must be nonzero",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
                             Some(v) => v,
                             None => {
                                 emit_uncorrelated_error(
@@ -1459,6 +1470,17 @@ pub fn drive_lfm_continuous_batch(
                     let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if t == "generate" {
                         let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(0) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate attempt_id must be nonzero",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
                             Some(v) => v,
                             None => {
                                 emit_uncorrelated_error(
@@ -2827,6 +2849,17 @@ pub fn drive_qwen35_ep_continuous_batch(
                     let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if t == "generate" {
                         let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(0) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate attempt_id must be nonzero",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
                             Some(v) => v,
                             None => {
                                 emit_uncorrelated_error(
