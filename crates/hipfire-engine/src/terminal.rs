@@ -886,6 +886,14 @@ impl BatchAttemptScope {
         Self::enter_with_generation(attempt_id, batch_generation_for(Some(id), attempt_id))
     }
 
+    /// Bind a sequential singleton without consulting the keyed batch registry.
+    ///
+    /// A handoff can race with a fresh same-key batch admission; looking up
+    /// the key here would bind the old singleton producer to the new owner.
+    pub fn enter_singleton(attempt_id: u64) -> Self {
+        Self::enter_with_generation(attempt_id, None)
+    }
+
     pub fn enter_for_generation(
         id: &str,
         attempt_id: u64,

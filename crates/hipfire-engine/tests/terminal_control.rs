@@ -10,14 +10,15 @@
 
 use hipfire_engine::emit::emit_active_attempt_error;
 use hipfire_engine::terminal::{
-    activate_terminal_control, active_batch_generation, apply_terminal_control,
-    await_client_terminal_commit, batch_bind_active, batch_clear_all_terminals,
-    batch_clear_terminal, batch_clear_terminal_at_generation, batch_mark_ready_with_pending,
-    batch_terminal_control, batch_terminal_generation, check_abort, claim_terminal,
-    claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
-    emit_staged_terminal_done, mark_terminal_control_ready, set_active_attempt_id,
-    terminal_control, terminal_generation, wait_terminal_control_decision,
-    BatchAttemptScope, ClientTerminalDecision, LaneTicket, TerminalControlDecision,
+    activate_terminal_control, active_batch_generation, adopt_singleton_transfer,
+    apply_terminal_control, await_client_terminal_commit, batch_bind_active,
+    batch_clear_all_terminals, batch_clear_terminal, batch_clear_terminal_at_generation,
+    batch_handoff_to_singleton_and_clear, batch_mark_ready_with_pending, batch_terminal_control,
+    batch_terminal_generation, check_abort, claim_terminal, claim_terminal_at_generation,
+    claim_wire_terminal, clear_terminal_control, emit_staged_terminal_done,
+    mark_terminal_control_ready, set_active_attempt_id, terminal_control, terminal_generation,
+    wait_terminal_control_decision, BatchAttemptScope, ClientTerminalDecision, LaneTicket,
+    TerminalControlDecision,
 };
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -545,6 +546,61 @@ fn batch_rebind_clears_tls_without_binding_reused_generation() {
     drop(scope_b);
     drop(scope_a);
     reset();
+}
+
+#[test]
+fn singleton_handoff_scope_cannot_bind_reannounced_batch_owner() {
+    let _lock = begin_test();
+    batch_clear_all_terminals();
+    let id = "singleton-handoff-reuse";
+    let attempt_id = 77;
+    activate_terminal_control(id, attempt_id);
+    let singleton_generation = terminal_generation(id, attempt_id).expect("singleton generation A");
+    let generation_a = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+        .expect("batch generation A");
+    let transfer =
+        batch_handoff_to_singleton_and_clear(id, attempt_id, generation_a).expect("handoff A");
+
+    // A fresh batch admission for the same wire key can arrive before main
+    // consumes A's internal handoff message.
+    clear_terminal_control();
+    let generation_b = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+        .expect("batch generation B");
+    assert_ne!(generation_a, generation_b);
+
+    assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+    assert_eq!(
+        terminal_generation(id, attempt_id),
+        Some(singleton_generation)
+    );
+    let scope_a = BatchAttemptScope::enter_singleton(attempt_id);
+    assert_eq!(scope_a.admission_generation(), None);
+    assert_eq!(active_batch_generation(), None);
+    assert!(
+        !claim_wire_terminal(id, attempt_id),
+        "singleton A must not claim batch B"
+    );
+    assert_eq!(
+        batch_terminal_generation(id, attempt_id),
+        Some(generation_b)
+    );
+    assert!(
+        !batch_clear_terminal_at_generation(id, attempt_id, generation_a),
+        "singleton A must not clear batch B"
+    );
+    assert_eq!(
+        batch_terminal_generation(id, attempt_id),
+        Some(generation_b)
+    );
+    drop(scope_a);
+
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_b
+    ));
+    clear_terminal_control();
+    set_active_attempt_id(0);
 }
 
 #[test]

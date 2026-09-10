@@ -2419,7 +2419,7 @@ fn main() {
                 }
                 let _terminal_control_guard = TerminalControlGuard;
                 let mut batch_scope = if singleton_handoff {
-                    BatchAttemptScope::enter_for(id, gen_attempt_id)
+                    BatchAttemptScope::enter_singleton(gen_attempt_id)
                 } else {
                     BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission)
                 };
