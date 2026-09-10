@@ -33,14 +33,18 @@ const K_TOP: usize = 8; // MQ4 launcher bakes grid-y 8; topk buffer holds 8 ids
 const TOL: f32 = 1e-4;
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod u8");
     t
 }
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc f32");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod f32");
     t
 }
@@ -115,8 +119,11 @@ fn deq_row(packed: &[u8], row: usize, groups: usize) -> Vec<f32> {
         let sc = f32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
         let zp = f32::from_le_bytes(packed[off + 4..off + 8].try_into().unwrap());
         for t in 0..32 {
-            let pk =
-                u32::from_le_bytes(packed[off + 8 + 4 * t..off + 12 + 4 * t].try_into().unwrap());
+            let pk = u32::from_le_bytes(
+                packed[off + 8 + 4 * t..off + 12 + 4 * t]
+                    .try_into()
+                    .unwrap(),
+            );
             for n in 0..8 {
                 w[g * 256 + t * 8 + n] = sc * (((pk >> (4 * n)) & 0xF) as f32) + zp;
             }

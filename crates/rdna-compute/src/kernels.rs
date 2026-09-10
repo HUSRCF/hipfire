@@ -3482,7 +3482,6 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage.hip");
 
-
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_SRC: &str =
