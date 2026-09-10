@@ -2201,7 +2201,12 @@ fn moe_token_indexed(
 /// Re-point a non-owning F32 row view's `buf` at `owner[offset_elems .. +len]`.
 /// Shape stays as constructed (no `Vec` alloc). View must not outlive owner.
 #[inline]
-fn moe_repoint_f32_row(view: &mut GpuTensor, owner: &GpuTensor, offset_elems: usize, len_elems: usize) {
+fn moe_repoint_f32_row(
+    view: &mut GpuTensor,
+    owner: &GpuTensor,
+    offset_elems: usize,
+    len_elems: usize,
+) {
     let byte_off = offset_elems
         .checked_mul(4)
         .expect("moe row view offset overflow");
@@ -2541,7 +2546,6 @@ fn apply_moe_branch_batched(
 
     let first = &moe.experts[0];
 
-
     // 1) cur_mlp_batch = post_feedforward_layernorm_1(pb_ffn_out)
     gpu.rmsnorm_batched(
         &scratch.pb_ffn_out,
@@ -2659,8 +2663,18 @@ fn apply_moe_branch_batched(
             moe_repoint_f32_row(&mut v_pre2_rot, &scratch.pb_moe_pre2_rot, b * dim, dim);
             moe_repoint_f32_row(&mut v_idx, &scratch.pb_moe_topk_indices, b * k_top, k_top);
             moe_repoint_f32_row(&mut v_wt, &scratch.pb_moe_topk_weights, b * k_top, k_top);
-            moe_repoint_f32_row(&mut v_gate, &scratch.pb_moe_gate_batch, b * hid_elems, hid_elems);
-            moe_repoint_f32_row(&mut v_up, &scratch.pb_moe_up_batch, b * hid_elems, hid_elems);
+            moe_repoint_f32_row(
+                &mut v_gate,
+                &scratch.pb_moe_gate_batch,
+                b * hid_elems,
+                hid_elems,
+            );
+            moe_repoint_f32_row(
+                &mut v_up,
+                &scratch.pb_moe_up_batch,
+                b * hid_elems,
+                hid_elems,
+            );
             moe_repoint_f32_row(
                 &mut v_hidden,
                 &scratch.pb_moe_hidden_batch,
@@ -2800,7 +2814,6 @@ fn apply_moe_branch_batched(
             }
         }
     }
-
 
     // 11) post_feedforward_layernorm_2(cur_moe) in-place batched.
     gpu.rmsnorm_batched(

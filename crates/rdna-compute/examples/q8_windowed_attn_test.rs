@@ -194,13 +194,12 @@ fn main() {
         const NKV5: usize = 2;
         const HD5: usize = 512;
         const BLK5: usize = 34; // Q8_0 block: fp16 scale + 32 i8 codes
-        // Derive — never guess: the batched launcher tiles by
-        // `Gpu::attn_tile_size`; the single-query path tiles by
-        // `attention::q8_flash_tile_size`.
+                                // Derive — never guess: the batched launcher tiles by
+                                // `Gpu::attn_tile_size`; the single-query path tiles by
+                                // `attention::q8_flash_tile_size`.
         let tile_b = gpu.attn_tile_size();
         let s5: usize = (tile_b + 64).max(160);
-        let tile_s =
-            rdna_compute::attention::q8_flash_tile_size(&gpu.arch, NH5, NKV5, HD5, s5);
+        let tile_s = rdna_compute::attention::q8_flash_tile_size(&gpu.arch, NH5, NKV5, HD5, s5);
         // BOS, two-token prefix, 124-token reproducer length, tile-boundary
         // pair, tail.
         let pos5: [i32; 7] = [
@@ -242,9 +241,8 @@ fn main() {
 
         // Candidate: one multirow full-causal batch.
         let q5 = gpu.upload_f32(&q5_data, &[b5 * NH5 * HD5]).expect("q5");
-        let pos5_bytes = unsafe {
-            std::slice::from_raw_parts(pos5.as_ptr() as *const u8, pos5.len() * 4)
-        };
+        let pos5_bytes =
+            unsafe { std::slice::from_raw_parts(pos5.as_ptr() as *const u8, pos5.len() * 4) };
         let positions5 = gpu.upload_raw(pos5_bytes, &[b5]).expect("pos5");
         let k5 = gpu.upload_raw(&kv5, &[kv5.len()]).expect("k5");
         let v5 = gpu.upload_raw(&kv5, &[kv5.len()]).expect("v5");
@@ -254,7 +252,21 @@ fn main() {
             .expect("partials5");
         let out5 = gpu.zeros(&[b5 * NH5 * HD5], DType::F32).expect("out5");
         gpu.attention_flash_q8_0_batched_masked(
-            &q5, &k5, &v5, &out5, &positions5, NH5, NKV5, HD5, s5, s5, b5, &partials5, None, 0, 0,
+            &q5,
+            &k5,
+            &v5,
+            &out5,
+            &positions5,
+            NH5,
+            NKV5,
+            HD5,
+            s5,
+            s5,
+            b5,
+            &partials5,
+            None,
+            0,
+            0,
         )
         .expect("hd512 batched attn launch");
         let got5 = gpu.download_f32(&out5).expect("download5");
@@ -273,7 +285,17 @@ fn main() {
                 .zeros(&[NH5 * max_tiles_s * (2 + HD5)], DType::F32)
                 .expect("partials row");
             gpu.attention_flash_q8_0(
-                &qr, &k5, &v5, &outr, &post.buf, (p + 1) as usize, NH5, NKV5, HD5, s5, &partr,
+                &qr,
+                &k5,
+                &v5,
+                &outr,
+                &post.buf,
+                (p + 1) as usize,
+                NH5,
+                NKV5,
+                HD5,
+                s5,
+                &partr,
             )
             .expect("hd512 single attn launch");
             let want = gpu.download_f32(&outr).expect("download row");

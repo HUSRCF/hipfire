@@ -165,7 +165,10 @@ fn main() {
             t0.elapsed().as_secs_f64()
         );
         let logits = gpu.download_f32(&scratch.logits).expect("logits dl");
-        assert!(logits.iter().all(|v| v.is_finite()), "non-finite {label} logits");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "non-finite {label} logits"
+        );
         let (am, av) = argmax(&logits);
         let lh = fnv(unsafe {
             std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
