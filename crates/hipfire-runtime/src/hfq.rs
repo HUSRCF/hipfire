@@ -2493,8 +2493,8 @@ pub(crate) mod hfq_test_fixture {
 
 #[cfg(test)]
 mod overlay_tests {
-    use super::*;
     use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
     use crate::model_source::ModelSource; // for `tensor_names`
 
     #[test]

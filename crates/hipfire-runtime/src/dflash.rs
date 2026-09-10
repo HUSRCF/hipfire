@@ -4075,7 +4075,10 @@ mod construction_tests {
                 panic!("injected raw copy failure must surface");
             }
         };
-        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
 
         let err = match upload_f32_weight_with_copy(&mut gpu, &[1.5f32; 16], &[16], failing_copy) {
             Err(error) => error,
@@ -4084,7 +4087,10 @@ mod construction_tests {
                 panic!("injected F32 copy failure must surface");
             }
         };
-        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
 
         // Immediate retry reuses the returned allocations instead of growing
         // the pool: both freed owners are back on the free list.
@@ -4142,8 +4148,8 @@ mod construction_tests {
         // Success baseline: the sidecar attaches, then everything is freed
         // back to the pool.
         let staged = trunk(&mut gpu, &weight_bytes);
-        let attached = attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8)
-            .expect("baseline attach");
+        let attached =
+            attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8).expect("baseline attach");
         assert!(attached.awq_scale.is_some(), "sidecar must attach");
         attached.free_all(&mut gpu);
         let fresh_allocations = gpu.pool_stats().0;
@@ -4151,21 +4157,22 @@ mod construction_tests {
         // Injected sidecar copy failure: the error surfaces and the trunk
         // owner is freed with it — no silent scale drop, no stranded owner.
         let staged = trunk(&mut gpu, &weight_bytes);
-        let err = match attach_awq_scale_with_copy(
-            &hfq, &mut gpu, staged, "w.weight", 8, failing_copy,
-        ) {
-            Err(error) => error,
-            Ok(wt) => {
-                wt.free_all(&mut gpu);
-                panic!("injected sidecar copy failure must surface");
-            }
-        };
-        assert!(err.to_string().contains("injected"), "unexpected error: {err}");
+        let err =
+            match attach_awq_scale_with_copy(&hfq, &mut gpu, staged, "w.weight", 8, failing_copy) {
+                Err(error) => error,
+                Ok(wt) => {
+                    wt.free_all(&mut gpu);
+                    panic!("injected sidecar copy failure must surface");
+                }
+            };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
 
         // Immediate retry reuses the trunk + sidecar buffers.
         let staged = trunk(&mut gpu, &weight_bytes);
-        let retry = attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8)
-            .expect("sidecar retry");
+        let retry = attach_awq_scale(&hfq, &mut gpu, staged, "w.weight", 8).expect("sidecar retry");
         assert!(retry.awq_scale.is_some(), "retry must attach the scale");
         retry.free_all(&mut gpu);
         assert_eq!(
