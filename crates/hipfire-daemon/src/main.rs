@@ -1754,6 +1754,7 @@ fn main() {
                     gpu.arch.as_str(),
                     vision_path.as_deref(),
                     head_path.as_deref(),
+                    max_seq,
                 ) {
                     Ok(a) => a,
                     Err(e) => {

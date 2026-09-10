@@ -496,6 +496,14 @@ Two checks exist; only one is gated:
 | `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
 | `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
 
+Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
+**verbatim generated token span** (whole envelope: full body tokens, plus
+producer reasoning text when the turn thought). On the next turn, Jinja history
+replay splices that span through the model's trained template framing so the
+LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
+hits; edited or mismatched history falls back to a plain retokenized render
+(cold or checkpoint path) instead of replaying stale tokens.
+
 Multi-turn DFlash and the prefix cache: when a DFlash turn ends on EOS (or the
 think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
 state and replays only the consumed prefix so the prompt/prefix cache stays

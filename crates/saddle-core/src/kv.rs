@@ -7,7 +7,7 @@
 //! types. `hipfire-runtime::llama` re-exports these for backward
 //! compatibility; new code should import from `saddle_core::kv`.
 
-use hip_bridge::{HipError, HipResult};
+use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// The resolved, validated KV-cache mode (plus one resolver-internal sentinel).
@@ -1102,10 +1102,18 @@ impl KvCache {
         let ms = dims.max_seq;
         match (mode, &dims.layers, dims.physical_cap) {
             // Mask + Some(cap): _capped_filtered (only q8/asym3/fwht2/fwht3 have it).
-            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Q8, Mask(m), Some(cap)) => {
+                Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Asym3, Mask(m), Some(cap)) => {
+                Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht2, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht3, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
             // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
             (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
             (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
@@ -1117,8 +1125,12 @@ impl KvCache {
             (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
             // Flat + Some(cap): _capped (only q8/asym3/asym4).
             (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
-            (KvMode::Asym3, Flat(n), Some(cap)) => Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap),
-            (KvMode::Asym4, Flat(n), Some(cap)) => Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym3, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Asym4, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap)
+            }
             // Flat + None: plain (only q8/asym3/asym4).
             (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
             (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
@@ -1269,6 +1281,30 @@ impl KvCache {
         max_seq_len: usize,
         physical_cap: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+        )
+    }
+
+    /// [`new_gpu_q8_capped`] with an injectable K/V allocator: the production
+    /// door passes [`Gpu::zeros`]; rollback tests fail the Nth call to prove a
+    /// mid-loop failure frees every already-owned buffer before the original
+    /// error propagates.
+    fn new_gpu_q8_capped_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
@@ -1280,9 +1316,23 @@ impl KvCache {
         let cache_elems = (cache_bytes + 3) / 4;
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed so a partial build never
+        // leaks device memory (GpuTensor has no freeing Drop). The K push
+        // precedes its V, so a V failure leaves the current K unmatched but
+        // still owned in `k_gpu` — the drain below covers it.
+        let result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
         }
         Ok(Self {
             k_gpu,
@@ -3678,6 +3728,38 @@ impl KvCache {
         max_seq_len: usize,
         physical_cap: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_inner_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+            Gpu::alloc_tensor,
+            |gpu: &mut Gpu, tensor: &GpuTensor, bytes: &[u8]| {
+                gpu.hip.memcpy_htod(&tensor.buf, bytes)
+            },
+        )
+    }
+
+    /// [`new_gpu_asym3_capped_inner`] with injectable allocation/copy seams:
+    /// the production door passes [`Gpu::zeros`], [`Gpu::alloc_tensor`], and
+    /// a host-to-device copy; rollback tests fail the Nth seam call to prove
+    /// a mid-build failure frees every already-owned buffer — the current
+    /// unmatched K, all prior K/V layers, and any owned givens table — before
+    /// the original error propagates.
+    fn new_gpu_asym3_capped_inner_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut alloc: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut copy_htod: impl FnMut(&mut Gpu, &GpuTensor, &[u8]) -> HipResult<()>,
+    ) -> HipResult<Self> {
         assert!(head_dim % 32 == 0);
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
@@ -3692,21 +3774,67 @@ impl KvCache {
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed (GpuTensor has no freeing
+        // Drop). The K push precedes its V, so a V failure leaves the current
+        // K unmatched but still owned in `k_gpu` — the drain below covers it.
+        let kv_result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[k_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[v_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = kv_result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
         }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        // Givens tables follow the filtered-VMM rotation-table pattern: a
+        // partial pair never escapes — a second-alloc or copy failure frees
+        // the already-owned table — and a table failure rolls back every K/V
+        // owner above so the caller can retry on the same `gpu`.
+        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+            let ct = alloc(gpu, &[n_blocks], DType::F32)?;
+            let st = match alloc(gpu, &[n_blocks], DType::F32) {
+                Ok(st) => st,
+                Err(err) => {
+                    let _ = gpu.free_tensor(ct);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = copy_htod(gpu, &ct, &cb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            if let Err(err) = copy_htod(gpu, &st, &sb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            Ok((ct, st))
+        })();
+        let (ct, st) = match tables {
+            Ok(pair) => pair,
+            Err(err) => {
+                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(err);
+            }
+        };
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
-            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
+        eprintln!(
+            "KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
         Ok(Self {
             k_gpu,
             v_gpu,
@@ -4652,5 +4780,174 @@ mod bf16_tier_projection_tests {
         assert!(!f32_cache.quant_q4_residual());
         assert!(!f32_cache.is_hfq8_kv());
         assert_eq!(tier_count(&f32_cache), 0, "F32 must classify as zero tiers");
+    }
+}
+
+/// Partial-construction rollback for the two flat Gemma doors.
+///
+/// No mock-GPU seam exists in this crate (`Gpu` needs real HIP), so these
+/// tests follow the workspace's `*_with_alloc` convention (qwen35 batch
+/// scratch, dflash weights): the private `..._with_alloc` helpers take over
+/// each allocation/copy seam, the test fails the Nth seam call, and a
+/// successful retry on the same `gpu` must reuse the rolled-back pool blocks
+/// — any retained (leaked) owner would force fresh `hipMalloc`s and move
+/// `pool_stats().0`. GPU-gated like the qwen35/dflash rollback tests.
+#[cfg(test)]
+mod kv_capped_rollback_tests {
+    use super::*;
+    use hip_bridge::HipError;
+    use std::cell::Cell;
+
+    const ROLLBACK_LAYERS: usize = 4;
+    const ROLLBACK_HEADS: usize = 2;
+    const ROLLBACK_SEQ: usize = 16;
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises Q8 partial-construction rollback and retry"]
+    fn q8_capped_partial_alloc_failure_frees_owners_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_q8_capped(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            128,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm q8 cache");
+        warm.free_gpu(&mut gpu).expect("release warm q8 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Fail at every K/V seam call. Odd calls fail a K (all prior layers
+        // owned); even calls fail a V, leaving the current K unmatched but
+        // already pushed — the drain must cover it too.
+        for fail_at in 1..=ROLLBACK_LAYERS * 2 {
+            let calls = Cell::new(0usize);
+            let err = KvCache::new_gpu_q8_capped_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == fail_at {
+                        Err(HipError::new(2, "injected q8 K/V allocation failure"))
+                    } else {
+                        gpu.zeros(shape, dtype)
+                    }
+                },
+            )
+            .err()
+            .expect(&format!(
+                "q8 allocation fault at call {fail_at} did not trigger"
+            ));
+            assert!(
+                err.to_string()
+                    .contains("injected q8 K/V allocation failure"),
+                "q8 fault at call {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry on the same gpu must reuse the rolled-back pool
+            // blocks: a leak would force fresh hipMallocs and move `total_new`.
+            let retry = KvCache::new_gpu_q8_capped(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after q8 allocation failure");
+            retry.free_gpu(&mut gpu).expect("release retried q8 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed q8 construction at call {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises asym3 partial-construction rollback and retry"]
+    fn asym3_capped_partial_failure_frees_layers_givens_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_asym3_capped_gemma4(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            256,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm asym3 cache");
+        warm.free_gpu(&mut gpu).expect("release warm asym3 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Seam order per attempt: 2 K/V calls per layer, then cos alloc, sin
+        // alloc, cos copy, sin copy. Failing at each index covers partial
+        // layers (incl. the unmatched-K case), each partial-givens shape, and
+        // both copy failures.
+        let total_seams = ROLLBACK_LAYERS * 2 + 4;
+        for fail_at in 1..=total_seams {
+            let calls = Cell::new(0usize);
+            let fault = |calls: &Cell<usize>, label: &str| -> HipResult<()> {
+                calls.set(calls.get() + 1);
+                if calls.get() == fail_at {
+                    Err(HipError::new(2, &format!("injected asym3 {label} failure")))
+                } else {
+                    Ok(())
+                }
+            };
+            let err = KvCache::new_gpu_asym3_capped_inner_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    fault(&calls, "K/V allocation")?;
+                    gpu.zeros(shape, dtype)
+                },
+                |gpu, shape, dtype| {
+                    fault(&calls, "givens allocation")?;
+                    gpu.alloc_tensor(shape, dtype)
+                },
+                |gpu, tensor, bytes| {
+                    fault(&calls, "givens copy")?;
+                    gpu.hip.memcpy_htod(&tensor.buf, bytes)
+                },
+            )
+            .err()
+            .expect(&format!("asym3 fault at seam {fail_at} did not trigger"));
+            assert!(
+                err.to_string().contains("injected asym3"),
+                "asym3 fault at seam {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry through the Gemma door on the same gpu must
+            // reuse the rolled-back pool blocks.
+            let retry = KvCache::new_gpu_asym3_capped_gemma4(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after asym3 failure");
+            retry
+                .free_gpu(&mut gpu)
+                .expect("release retried asym3 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed asym3 construction at seam {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
     }
 }

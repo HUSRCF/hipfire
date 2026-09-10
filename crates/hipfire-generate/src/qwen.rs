@@ -1878,6 +1878,17 @@ pub fn plan_from_rendered(
                 rendered.len(),
                 lcp
             );
+            // Bounded token evidence around the first divergence: at most 24 ids
+            // per side, enough to pin an envelope/span off-by-one without
+            // dumping whole conversations.
+            let lo = lcp.saturating_sub(8);
+            let prior_hi = (lcp + 16).min(prior_len);
+            let rend_hi = (lcp + 16).min(rendered.len());
+            eprintln!(
+                "[qwen-cache ids {trace_tag}] prior[{lo}..{prior_hi}]={:?} rendered[{lo}..{rend_hi}]={:?}",
+                &conversation_tokens[lo..prior_hi],
+                &rendered[lo..rend_hi],
+            );
         }
         if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
             return PromptCachePlan {
@@ -1923,6 +1934,43 @@ pub fn plan_from_rendered(
         resume_from: None,
         rendered,
     }
+}
+
+/// Qwen jinja cache-lookup turn synthesis: fingerprint the message's normalized
+/// content (+ tool identity) and forward the stored producer reasoning so rich
+/// `reasoning_content` history satisfies the splice text check. Primer rule: a
+/// whole-envelope turn (reasoning present) replays verbatim — the template
+/// re-emits every marker around its slots, so prepending would duplicate the
+/// think opener. A primer-less full body (no reasoning) gets the generation
+/// primer prepended so the spliced stream byte-matches the end-of-turn bake on
+/// bare-history templates. Returns `None` on fingerprint miss or a content-less
+/// entry. Tool slots stay empty — Qwen history tool turns keep the existing
+/// safe miss via the count check.
+pub fn qwen_jinja_lookup_turn(
+    cache: &mut AsstTurnCache,
+    msg: &hipfire_runtime::prompt_frame::Message,
+    primer: &[u32],
+) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+    cache.get(&fp).and_then(|turn| {
+        turn.content.as_ref().map(|c| {
+            let mut v = if turn.reasoning.is_some() {
+                Vec::new()
+            } else {
+                primer.to_vec()
+            };
+            v.extend_from_slice(&c.token_ids);
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: turn.reasoning.clone(),
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: v,
+                    text: msg.content.clone(),
+                }),
+            }
+        })
+    })
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -2333,28 +2381,10 @@ pub fn generate_dflash(
                 hist,
                 tools,
                 |msg| {
-                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // The qwen family has no Harmony reasoning/tool channels: its whole
-                    // assistant turn is one content slot. `text` must be the message's own
-                    // content so the splice's `content.text == m.content` guard
-                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
-                    // the pre-per-channel implementation.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
                     if trace_cache {
+                        let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+                        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         eprintln!(
                             "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
                             fp,
@@ -2757,23 +2787,40 @@ pub fn generate_dflash(
                             action.fingerprint_text.chars().take(60).collect::<String>(),
                         );
                     }
+                    // Whole-envelope store: FULL generated body verbatim plus
+                    // producer reasoning text when the turn thought. Splice
+                    // replays R...A as one span; primer stays lookup-side.
+                    let tok = m.tokenizer.as_ref().unwrap();
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, seq| {
+                            let reasoning =
+                                hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                                    tok,
+                                    &seq,
+                                    started_in_think,
+                                )
+                                .map(|text| {
+                                    hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                        token_ids: Vec::new(),
+                                        text,
+                                    }
+                                });
                             if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
                                 .ok()
                                 .as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
-                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
+                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} span={}",
                                     fp,
-                                    seq.len()
+                                    seq.len(),
+                                    reasoning.is_some(),
                                 );
                             }
                             m.asst_turn_cache.insert(
                                 fp,
                                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning: None,
+                                    reasoning,
                                     tools: Vec::new(),
                                     content: Some(
                                         hipfire_runtime::prompt_frame::CachedAssistantBody {
@@ -2930,6 +2977,8 @@ pub fn generate_dflash(
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
+            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
+            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
             m.asst_turn_cache.insert(
                 fp,
                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
@@ -6705,5 +6754,92 @@ mod ep_serve_target_tests {
         assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
         assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
         assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    }
+}
+
+#[cfg(test)]
+mod qwen_lookup_primer_tests {
+    use super::qwen_jinja_lookup_turn;
+    use crate::common::{asst_turn_fingerprint, normalize_asst_turn_for_fingerprint};
+    use hipfire_loader::AsstTurnCache;
+
+    fn assistant_msg(content: &str) -> hipfire_runtime::prompt_frame::Message {
+        hipfire_runtime::prompt_frame::Message {
+            role: hipfire_runtime::prompt_frame::Role::Assistant,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    fn insert(
+        cache: &mut AsstTurnCache,
+        content: &str,
+        turn: hipfire_runtime::prompt_frame::CachedAssistantTurn,
+    ) {
+        let fp = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(content), &[]);
+        cache.insert(fp, turn);
+    }
+
+    fn body(ids: &[u32]) -> hipfire_runtime::prompt_frame::CachedAssistantBody {
+        hipfire_runtime::prompt_frame::CachedAssistantBody {
+            token_ids: ids.to_vec(),
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn span_turn_replays_verbatim_while_full_body_gets_primer() {
+        let mut cache = AsstTurnCache::new_from_env();
+        // Whole-envelope turn: text-only reasoning marker + verbatim full body;
+        // the template re-emits every marker, so no primer allowed.
+        insert(
+            &mut cache,
+            "answer B ",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text: "plan A\n".to_string(),
+                }),
+                tools: Vec::new(),
+                content: Some(body(&[1, 2, 3])),
+            },
+        );
+        // Full turn (no reasoning): primer prepended for bare-history replay.
+        insert(
+            &mut cache,
+            "plain answer",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: None,
+                tools: Vec::new(),
+                content: Some(body(&[7, 8])),
+            },
+        );
+        let span = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("answer B "), &[90, 91])
+            .expect("span hit");
+        assert_eq!(
+            span.content.expect("content").token_ids,
+            vec![1, 2, 3],
+            "envelope bodies must not gain the primer (duplicates the think opener)"
+        );
+        let rb = span.reasoning.expect("reasoning marker");
+        assert!(
+            rb.token_ids.is_empty(),
+            "reasoning marker carries text only"
+        );
+        assert_eq!(rb.text, "plan A\n");
+        let full = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("plain answer"), &[90, 91])
+            .expect("full hit");
+        assert_eq!(
+            full.content.expect("content").token_ids,
+            vec![90, 91, 7, 8],
+            "primer-less full bodies must regain the primer"
+        );
+        assert!(full.reasoning.is_none());
+        assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
     }
 }

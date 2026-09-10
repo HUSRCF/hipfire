@@ -676,13 +676,16 @@ fn target_error(mesh: &DeviceMesh) -> Option<FulfillError> {
 /// upload paired with a pooled free retains one model's worth of VRAM in the
 /// pool's free-lists per load/unload cycle without ever reusing it — driver
 /// free VRAM declines every cycle while the pool counters look flat.
-fn upload_pooled_bytes(
+pub fn upload_pooled_bytes(
     gpu: &mut Gpu,
     bytes: &[u8],
     logical_shape: &[usize],
 ) -> hip_bridge::HipResult<GpuTensor> {
     let mut tensor = gpu.alloc_tensor(&[bytes.len()], DType::Raw)?;
-    gpu.hip.memcpy_htod(&tensor.buf, bytes)?;
+    if let Err(error) = gpu.hip.memcpy_htod(&tensor.buf, bytes) {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
     tensor.shape = logical_shape.to_vec();
     Ok(tensor)
 }
