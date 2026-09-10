@@ -142,6 +142,18 @@ fn wmma_fa_min_batch() -> usize {
         .unwrap_or(16)
 }
 
+/// Query rows one multi-row flash block owns. 8 is the register budget of the
+/// kernel (ROWS x (Q, accumulator) per lane at head_dim 256). Measured on
+/// gfx1100 at 33k context against the batched tile: 1.91x at 8 rows, 1.66x
+/// at 4, 0.85x at 2 — so a block never takes fewer than 4 rows and the caller
+/// keeps batches under 4 on the batched kernel.
+fn flash_rows_per_block(batch_size: usize) -> usize {
+    [8usize, 4]
+        .into_iter()
+        .find(|&r| r <= batch_size)
+        .unwrap_or(0)
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -3866,6 +3878,172 @@ impl Gpu {
             None,
             None,
         )
+    }
+
+    /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_rows_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.arch_caps.is_gfx1100() {
+            return Ok(false);
+        }
+        let dpt = head_dim / 32;
+        if head_dim % 32 != 0 || !(dpt == 4 || dpt == 8) {
+            return Ok(false);
+        }
+        let rows = flash_rows_per_block(batch_size);
+        if rows < 4 {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let tile_size = self.attn_tile_size();
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        let stride = 2 + head_dim;
+        let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
+        if partials_bytes_per_row == 0 {
+            return Ok(false);
+        }
+        let sub_batch = (partials.numel() * 4 / partials_bytes_per_row)
+            .max(1)
+            .min(batch_size);
+        let func: &'static str = match (rows, dpt) {
+            (8, 8) => "attention_flash_q8_0_rows8_d8",
+            (4, 8) => "attention_flash_q8_0_rows4_d8",
+            (8, 4) => "attention_flash_q8_0_rows8_d4",
+            (4, 4) => "attention_flash_q8_0_rows4_d4",
+            _ => return Ok(false),
+        };
+        self.ensure_kernel(func, kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC, func)?;
+        self.ensure_kernel(
+            "attention_flash_asym_reduce_batched",
+            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+            "attention_flash_asym_reduce_batched",
+        )?;
+
+        let q_dim = n_heads * head_dim;
+        // Scores are carried in log2 space so the kernel's softmax is one
+        // v_exp_f32 per row-token; partials convert back on write.
+        let scale = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+            {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let k_ptr = k_cache.buf.as_ptr();
+                let v_ptr = v_cache.buf.as_ptr();
+                let p_ptr = partials.buf.as_ptr();
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32;
+                let nkv = n_kv_heads as i32;
+                let hd = head_dim as i32;
+                let sc = scale;
+                let ts = tile_size as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let rv = chunk as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &q_ptr as *const _ as *mut c_void,
+                    &k_ptr as *const _ as *mut c_void,
+                    &v_ptr as *const _ as *mut c_void,
+                    &p_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &nkv as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &sc as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &rv as *const _ as *mut c_void,
+                ];
+                let groups = chunk.div_ceil(rows);
+                self.launch_maybe_blob(
+                    func,
+                    [n_heads as u32, max_tiles as u32, groups as u32],
+                    [32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(q_ptr);
+                        b.push_ptr(k_ptr);
+                        b.push_ptr(v_ptr);
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(nkv);
+                        b.push_i32(hd);
+                        b.push_f32(sc);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_i32(rv);
+                        b
+                    },
+                )?;
+            }
+            {
+                let p_ptr = partials.buf.as_ptr();
+                let o_ptr =
+                    unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32;
+                let hd = head_dim as i32;
+                let ts = tile_size as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let bs = 0i32;
+                let bc = 0i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                    &bc as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_flash_asym_reduce_batched",
+                    [n_heads as u32, chunk as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(hd);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_i32(bs);
+                        b.push_i32(bc);
+                        b
+                    },
+                )?;
+            }
+            offset += chunk;
+        }
+        Ok(true)
     }
 
     /// Multi-slot Q8_0 tiled flash attention. `slot_descs` is `[n_slots]`

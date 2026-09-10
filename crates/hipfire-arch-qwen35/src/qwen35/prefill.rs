@@ -5611,6 +5611,7 @@ fn batch_chunk_full_attn_input_projection(
 /// Same statements, same order, same launches as the inlined block.
 fn batch_chunk_full_attn_prepare(
     gpu: &mut Gpu,
+    fa_attn_multirow: bool,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
@@ -5766,70 +5767,21 @@ fn batch_chunk_full_attn_prepare(
     }
 
     // 6–7. Batched KV write + flash attention (via dispatch).
-    let is_tree = tree_verify.is_some();
-    let (block_start, block_cols) = match tree_verify.as_ref() {
-        Some(_) => (start_pos, n),
-        None => (0, 0),
-    };
-    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-    let plan = KvTierPlan::derive(KvTierInputs {
-        pos: start_pos,
-        flash_mode: s.flash_mode as usize,
-        capture_mode: gpu.graphs.capture_mode,
-        batch_size: n,
-        is_tree,
-        ..kv_cache.tier_inputs()
-    })
-    .map_err(|e| HipError::new(0, &e.to_string()))?;
-    let io = AttnParams {
-        q: &pbs.fa_q_batch,
-        k: &pbs.fa_k_batch,
-        v: &pbs.fa_v_batch,
-        k_cache: &kv_cache.k_gpu[layer_idx],
-        v_cache: &kv_cache.v_gpu[layer_idx],
-        k_scales: None,
-        v_scales: None,
-        pos_buf: &s.pos_buf,
-        pos: start_pos,
-        positions: Some(&pbs.positions),
-        n_heads: config.n_heads,
-        n_kv_heads: config.n_kv_heads,
-        head_dim: config.head_dim,
-        physical_cap: kv_cache.physical_cap,
-        batch_size: n,
+    batch_chunk_fa_attend(
+        gpu,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        start_pos,
         max_ctx_len,
-        flash_partials: Some(&s.flash_partials),
-        givens_cos: kv_cache.givens_cos.as_ref(),
-        givens_sin: kv_cache.givens_sin.as_ref(),
-        tree_bias,
-        block_start,
-        block_cols,
-        output_gate: None,
-        output: &pbs.fa_attn_out_batch,
-    };
-    if let BatchSemantics::Independent {
-        lane_capacity,
-        active_mask,
-        ..
-    } = batch_semantics
-    {
-        run_independent_q8_attention(
-            gpu,
-            pbs,
-            kv_cache,
-            config,
-            layer_idx,
-            n,
-            lane_capacity,
-            max_ctx_len,
-            active_mask,
-        )?;
-    } else if batch_semantics.is_independent() {
-        unreachable!("independent variant must carry active_mask");
-    } else {
-        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
-            .map_err(|e| HipError::new(0, &e.to_string()))?;
-    }
+        ctx,
+        batch_semantics,
+        tree_verify,
+        layer_idx,
+        fa_attn_multirow,
+    )?;
     Ok(())
 }
 
@@ -5937,8 +5889,172 @@ fn batch_chunk_full_attn_output_projection(
     Ok(())
 }
 
+/// Context length past which an admitted gfx1100/Q8 small-batch attend step
+/// leaves the batched masked FA kernel for the multi-row tile. Measured with
+/// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128): the batched
+/// kernel still wins at 2k and loses from 4k on.
+/// `HIPFIRE_FA_PERTOKEN_MIN_CTX` overrides; `0` disables the route.
+pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
+    use std::sync::OnceLock;
+    static MIN_CTX: OnceLock<Option<usize>> = OnceLock::new();
+    *MIN_CTX.get_or_init(|| {
+        let v = hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4_096);
+        (v > 0).then_some(v)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q8_multirow_attn_admitted(
+    is_gfx1100: bool,
+    quant_q8: bool,
+    head_dim: usize,
+    n: usize,
+    logical_ctx: usize,
+    min_ctx: Option<usize>,
+    is_tree: bool,
+    is_independent: bool,
+    capture_mode: bool,
+) -> bool {
+    is_gfx1100
+        && quant_q8
+        && matches!(head_dim, 128 | 256)
+        && (4..=32).contains(&n)
+        && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
+        && !is_tree
+        && !is_independent
+        && !capture_mode
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    layer_idx: usize,
+    multirow: bool,
+) -> HipResult<()> {
+    if let BatchSemantics::Independent {
+        lane_capacity,
+        active_mask,
+        ..
+    } = batch_semantics
+    {
+        return run_independent_q8_attention(
+            gpu,
+            pbs,
+            kv_cache,
+            config,
+            layer_idx,
+            n,
+            lane_capacity,
+            max_ctx_len,
+            active_mask,
+        );
+    }
+    if batch_semantics.is_independent() {
+        unreachable!("independent variant must carry active_mask");
+    }
+
+    if multirow {
+        debug_assert!(gpu.arch_caps.is_gfx1100());
+        debug_assert!(kv_cache.quant_q8);
+        debug_assert!(matches!(config.head_dim, 128 | 256));
+        gpu.kv_cache_write_q8_0_batched(
+            &kv_cache.k_gpu[layer_idx],
+            &pbs.fa_k_batch,
+            &pbs.positions,
+            config.n_kv_heads,
+            config.head_dim,
+            n,
+        )?;
+        gpu.kv_cache_write_q8_0_batched(
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_v_batch,
+            &pbs.positions,
+            config.n_kv_heads,
+            config.head_dim,
+            n,
+        )?;
+        if gpu.attention_flash_q8_0_rows_masked(
+            &pbs.fa_q_batch,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_attn_out_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            n,
+            &s.flash_partials,
+        )? {
+            return Ok(());
+        }
+        // Admission and launcher support intentionally duplicate the shape
+        // checks. If they ever drift, retain the established batched route
+        // below rather than silently exploding the verify block into n
+        // independent attention launches.
+    }
+
+    let is_tree = tree_verify.is_some();
+    let (block_start, block_cols) = match tree_verify.as_ref() {
+        Some(_) => (start_pos, n),
+        None => (0, 0),
+    };
+    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n,
+        is_tree,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let io = AttnParams {
+        q: &pbs.fa_q_batch,
+        k: &pbs.fa_k_batch,
+        v: &pbs.fa_v_batch,
+        k_cache: &kv_cache.k_gpu[layer_idx],
+        v_cache: &kv_cache.v_gpu[layer_idx],
+        k_scales: None,
+        v_scales: None,
+        pos_buf: &s.pos_buf,
+        pos: start_pos,
+        positions: Some(&pbs.positions),
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        physical_cap: kv_cache.physical_cap,
+        batch_size: n,
+        max_ctx_len,
+        flash_partials: Some(&s.flash_partials),
+        givens_cos: kv_cache.givens_cos.as_ref(),
+        givens_sin: kv_cache.givens_sin.as_ref(),
+        tree_bias,
+        block_start,
+        block_cols,
+        output_gate: None,
+        output: &pbs.fa_attn_out_batch,
+    };
+    execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
+        .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 pub(crate) fn batch_chunk_full_attn_attn(
     gpu: &mut Gpu,
+    fa_attn_multirow: bool,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
@@ -5967,6 +6083,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
 
     batch_chunk_full_attn_prepare(
         gpu,
+        fa_attn_multirow,
         layer,
         config,
         pbs,
@@ -7143,6 +7260,7 @@ fn batch_chunk_delta_net_moe(
 #[allow(clippy::too_many_arguments)]
 fn batch_chunk_full_attn_moe(
     gpu: &mut Gpu,
+    fa_attn_multirow: bool,
     layer: &FullAttnMoeLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
@@ -7498,70 +7616,21 @@ fn batch_chunk_full_attn_moe(
         kv_cache.compact_offset as i32,
     )?;
     // Batched KV write + flash attention (via dispatch).
-    let is_tree = tree_verify.is_some();
-    let (block_start, block_cols) = match tree_verify.as_ref() {
-        Some(_) => (start_pos, n),
-        None => (0, 0),
-    };
-    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-    let plan = KvTierPlan::derive(KvTierInputs {
-        pos: start_pos,
-        flash_mode: s.flash_mode as usize,
-        capture_mode: gpu.graphs.capture_mode,
-        batch_size: n,
-        is_tree,
-        ..kv_cache.tier_inputs()
-    })
-    .map_err(|e| HipError::new(0, &e.to_string()))?;
-    let io = AttnParams {
-        q: &pbs.fa_q_batch,
-        k: &pbs.fa_k_batch,
-        v: &pbs.fa_v_batch,
-        k_cache: &kv_cache.k_gpu[layer_idx],
-        v_cache: &kv_cache.v_gpu[layer_idx],
-        k_scales: None,
-        v_scales: None,
-        pos_buf: &s.pos_buf,
-        pos: start_pos,
-        positions: Some(&pbs.positions),
-        n_heads: config.n_heads,
-        n_kv_heads: config.n_kv_heads,
-        head_dim: config.head_dim,
-        physical_cap: kv_cache.physical_cap,
-        batch_size: n,
+    batch_chunk_fa_attend(
+        gpu,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        start_pos,
         max_ctx_len,
-        flash_partials: Some(&s.flash_partials),
-        givens_cos: kv_cache.givens_cos.as_ref(),
-        givens_sin: kv_cache.givens_sin.as_ref(),
-        tree_bias,
-        block_start,
-        block_cols,
-        output_gate: None,
-        output: &pbs.fa_attn_out_batch,
-    };
-    if let BatchSemantics::Independent {
-        lane_capacity,
-        active_mask,
-        ..
-    } = batch_semantics
-    {
-        run_independent_q8_attention(
-            gpu,
-            pbs,
-            kv_cache,
-            config,
-            layer_idx,
-            n,
-            lane_capacity,
-            max_ctx_len,
-            active_mask,
-        )?;
-    } else if batch_semantics.is_independent() {
-        unreachable!("independent variant must carry active_mask");
-    } else {
-        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
-            .map_err(|e| HipError::new(0, &e.to_string()))?;
-    }
+        ctx,
+        batch_semantics,
+        tree_verify,
+        layer_idx,
+        fa_attn_multirow,
+    )?;
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
     // wo + residual. Mirrors the dense FA wo dispatch at
     // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
@@ -7900,6 +7969,23 @@ pub(crate) fn forward_batch_chunk_impl(
                 }
                 _ => true,
             });
+    // Attention only: the batched masked FA kernel grids [n_heads, tiles, ROW]
+    // and re-scans the whole KV once per row, so a small verify block over a
+    // long context pays the scan n times (202 vs 103 ms at 33k). The layer's
+    // GEMMs stay batched either way — only the attend step switches to the
+    // multi-row tile. Its tile grid is sized from the live logical context on
+    // the host, so a captured replay would keep the first cycle's tile count.
+    let fa_attn_multirow = q8_multirow_attn_admitted(
+        gpu.arch_caps.is_gfx1100(),
+        kv_cache.quant_q8,
+        config.head_dim,
+        n,
+        start_pos + n,
+        fa_pertoken_min_ctx(),
+        tree_verify.is_some(),
+        batch_semantics.is_independent(),
+        gpu.graphs.capture_mode,
+    );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
         BatchSemantics::Independent { positions, .. } => {
@@ -7971,6 +8057,7 @@ pub(crate) fn forward_batch_chunk_impl(
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) if fa_batched_ok => {
                 batch_chunk_full_attn_attn(
                     gpu,
+                    fa_attn_multirow,
                     layer,
                     config,
                     pbs,
@@ -8070,6 +8157,7 @@ pub(crate) fn forward_batch_chunk_impl(
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) if fa_batched_ok => {
                 batch_chunk_full_attn_moe(
                     gpu,
+                    fa_attn_multirow,
                     layer,
                     config,
                     pbs,
@@ -8717,6 +8805,145 @@ mod tests {
     use super::*;
     use hipfire_dispatch::context::DispatchWorkload;
     use rdna_compute::DType;
+
+    #[test]
+    fn q8_multirow_attn_admits_only_measured_gfx1100_shapes() {
+        for head_dim in [128, 256] {
+            for n in [4, 8, 32] {
+                assert!(q8_multirow_attn_admitted(
+                    true,
+                    true,
+                    head_dim,
+                    n,
+                    4097,
+                    Some(4096),
+                    false,
+                    false,
+                    false,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn q8_multirow_attn_rejects_unmeasured_or_unsupported_routes() {
+        let admitted = |is_gfx1100,
+                        quant_q8,
+                        head_dim,
+                        n,
+                        logical_ctx,
+                        min_ctx,
+                        is_tree,
+                        is_independent,
+                        capture_mode| {
+            q8_multirow_attn_admitted(
+                is_gfx1100,
+                quant_q8,
+                head_dim,
+                n,
+                logical_ctx,
+                min_ctx,
+                is_tree,
+                is_independent,
+                capture_mode,
+            )
+        };
+        assert!(!admitted(
+            false,
+            true,
+            256,
+            8,
+            8192,
+            Some(4096),
+            false,
+            false,
+            false,
+        ));
+        assert!(!admitted(
+            true,
+            false,
+            256,
+            8,
+            8192,
+            Some(4096),
+            false,
+            false,
+            false,
+        ));
+        for head_dim in [64, 320] {
+            assert!(!admitted(
+                true,
+                true,
+                head_dim,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+            ));
+        }
+        for n in [1, 3, 33] {
+            assert!(!admitted(
+                true,
+                true,
+                256,
+                n,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+            ));
+        }
+        assert!(!admitted(
+            true,
+            true,
+            256,
+            8,
+            4096,
+            Some(4096),
+            false,
+            false,
+            false,
+        ));
+        assert!(!admitted(
+            true, true, 256, 8, 8192, None, false, false, false,
+        ));
+        assert!(!admitted(
+            true,
+            true,
+            256,
+            8,
+            8192,
+            Some(4096),
+            true,
+            false,
+            false,
+        ));
+        assert!(!admitted(
+            true,
+            true,
+            256,
+            8,
+            8192,
+            Some(4096),
+            false,
+            true,
+            false,
+        ));
+        assert!(!admitted(
+            true,
+            true,
+            256,
+            8,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+        ));
+    }
 
     #[test]
     fn paro_batched_admit_defaults_off_and_allows_opt_in() {
