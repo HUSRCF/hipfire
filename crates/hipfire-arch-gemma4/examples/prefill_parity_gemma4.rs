@@ -122,6 +122,7 @@ fn main() {
             cfg.full_n_kv_heads,
             cfg.full_head_dim,
             max_seq,
+            max_seq,
         )
         .expect("kv full");
         let t0 = std::time::Instant::now();
