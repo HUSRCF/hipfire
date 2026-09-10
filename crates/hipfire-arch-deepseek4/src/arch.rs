@@ -61,7 +61,6 @@ pub enum DeepseekV4DsparkFault {
     AfterGlobal,
 }
 
-
 /// Load-scoped owner for partially populated DS4 weights. `GpuTensor` is an
 /// explicit resource handle rather than a `Drop` type, so every early `?`
 /// during the 34k-record upload must walk the tensors already installed.
@@ -2864,9 +2863,7 @@ impl DeepseekV4 {
                 // Admit the empty layer before its first upload. If any dense
                 // or routed helper fails, the partially populated layer is
                 // still owned by the transaction and gets `free_gpu` cleanup.
-                staging
-                    .stages
-                    .push(DeepseekV4LayerWeights::new_empty(0));
+                staging.stages.push(DeepseekV4LayerWeights::new_empty(0));
                 let stage_idx = staging.stages.len() - 1;
                 let prefix = format!("mtp.{s}");
                 {
@@ -3885,5 +3882,94 @@ mod tests {
         assert_eq!(dense_hfq_dtype(35), Some(DType::MFP4G32E8SOA));
         assert_eq!(dense_hfq_dtype(3), Some(DType::Q8_0));
         assert_eq!(dense_hfq_dtype(19), None);
+    }
+
+    fn stage_dspark_fault_owners(
+        fault: DeepseekV4DsparkFault,
+        staging: &mut DsparkLoadStaging,
+        gpu: &mut Gpu,
+    ) {
+        let mut tiny = || gpu.zeros(&[1], DType::F32).expect("tiny owner allocation");
+        match fault {
+            DeepseekV4DsparkFault::AfterLayer(_) => {
+                let mut layer = DeepseekV4LayerWeights::new_empty(0);
+                layer.attn_norm = Some(tiny());
+                staging.stages.push(layer);
+            }
+            DeepseekV4DsparkFault::AfterHeadHelper => {
+                let mut layer = DeepseekV4LayerWeights::new_empty(0);
+                layer.mtp_hc_head_fn = Some(tiny());
+                layer.mtp_hc_head_base = Some(tiny());
+                layer.mtp_final_norm = Some(tiny());
+                staging.stages.push(layer);
+            }
+            DeepseekV4DsparkFault::AfterMainProj => {
+                staging.main_proj = Some(tiny());
+            }
+            DeepseekV4DsparkFault::AfterGlobal => {
+                staging.main_proj = Some(tiny());
+                staging.main_norm = Some(tiny());
+                staging.markov_w1 = Some(tiny());
+                staging.markov_w2 = Some(tiny());
+                staging.confidence_proj = Some(tiny());
+                staging.draft_head = Some(tiny());
+            }
+        }
+    }
+
+    fn exercise_dspark_fault(fault: DeepseekV4DsparkFault) {
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = DsparkConfig {
+            block_size: 5,
+            target_layer_ids: vec![0],
+            markov_rank: 1,
+            noise_token_id: 0,
+        };
+        let (new_before, reused_before, _) = gpu.pool_stats();
+        let mut staging = DsparkLoadStaging::new(cfg.clone(), 1);
+        stage_dspark_fault_owners(fault, &mut staging, &mut gpu);
+        let (new_after_alloc, _, _) = gpu.pool_stats();
+        assert!(new_after_alloc >= new_before);
+        staging.rollback(&mut gpu);
+        let (new_after_rollback, reused_after_rollback, _) = gpu.pool_stats();
+        assert_eq!(new_after_rollback, new_after_alloc);
+
+        let mut retry = DsparkLoadStaging::new(cfg, 1);
+        stage_dspark_fault_owners(fault, &mut retry, &mut gpu);
+        retry.rollback(&mut gpu);
+        let (new_after_retry, reused_after_retry, _) = gpu.pool_stats();
+        assert_eq!(new_after_retry, new_after_alloc);
+        assert!(
+            reused_after_retry > reused_after_rollback.max(reused_before),
+            "{fault:?} did not reuse a released owner"
+        );
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    fn dspark_after_layer_fault_rolls_back_and_retries() {
+        exercise_dspark_fault(DeepseekV4DsparkFault::AfterLayer(0));
+    }
+
+    #[test]
+    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    fn dspark_after_head_helper_fault_rolls_back_and_retries() {
+        exercise_dspark_fault(DeepseekV4DsparkFault::AfterHeadHelper);
+    }
+
+    #[test]
+    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    fn dspark_after_main_proj_fault_rolls_back_and_retries() {
+        exercise_dspark_fault(DeepseekV4DsparkFault::AfterMainProj);
+    }
+
+    #[test]
+    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    fn dspark_after_global_fault_rolls_back_and_retries() {
+        exercise_dspark_fault(DeepseekV4DsparkFault::AfterGlobal);
     }
 }

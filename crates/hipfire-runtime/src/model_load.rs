@@ -191,10 +191,7 @@ fn run_staged_load<O: StagedLoadOps>(
     ops: &mut O,
     n_devices: usize,
     can_alias: bool,
-) -> Result<
-    StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>,
-    O::Error,
-> {
+) -> Result<StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>, O::Error> {
     ops.prepare(n_devices)?;
     let mut staged_embedding = None;
     let mut staged_norm = None;
@@ -418,41 +415,54 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestAllocator {
         next_id: usize,
+        allocations: usize,
+        reuses: usize,
         live: BTreeSet<usize>,
-        frees: Vec<String>,
+        free_ids: BTreeSet<usize>,
+        frees: usize,
     }
 
     impl TestAllocator {
         fn alloc(&mut self, kind: &'static str) -> Allocation {
-            let id = self.next_id;
-            self.next_id += 1;
-            assert!(self.live.insert(id), "test allocator id reused: {id}");
+            let id = if let Some(id) = self.free_ids.pop_first() {
+                self.reuses += 1;
+                id
+            } else {
+                let id = self.next_id;
+                self.next_id += 1;
+                id
+            };
+            self.allocations += 1;
+            assert!(
+                self.live.insert(id),
+                "test allocator id reused while live: {id}"
+            );
             Allocation { id, kind }
         }
 
         fn free(&mut self, allocation: Allocation) {
-            self.free_named(allocation, None);
-        }
-
-        fn free_named(&mut self, allocation: Allocation, label: Option<String>) {
             assert!(
                 self.live.remove(&allocation.id),
                 "double free of {}#{}",
                 allocation.kind,
                 allocation.id
             );
-            self.frees
-                .push(label.unwrap_or_else(|| format!("free {}", allocation.kind)));
+            assert!(
+                self.free_ids.insert(allocation.id),
+                "allocator released {}#{} twice",
+                allocation.kind,
+                allocation.id
+            );
+            self.frees += 1;
         }
     }
 
     /// CPU-only WeightSource seam: every resource is a tracked token, so a
-    /// failure test can prove ownership transfer and exact reverse cleanup
-    /// without constructing `Gpu` or relying on a global `Drop` implementation.
+    /// failure test can prove ownership transfer and exact cleanup without
+    /// constructing `Gpu` or relying on a global `Drop` implementation.
     struct TestWeightSource {
         allocator: TestAllocator,
         n_layers: usize,
-        layer_devices: Vec<usize>,
         fail_at: Option<FailAt>,
         alias_output: bool,
     }
@@ -462,7 +472,6 @@ mod tests {
             Self {
                 allocator: TestAllocator::default(),
                 n_layers,
-                layer_devices: (0..n_layers).map(|i| i % 2).collect(),
                 fail_at,
                 alias_output: false,
             }
@@ -481,6 +490,10 @@ mod tests {
                 self.allocator.live.is_empty(),
                 "staged resources leaked: {:?}",
                 self.allocator.live
+            );
+            assert_eq!(
+                self.allocator.frees, self.allocator.allocations,
+                "every allocation must be released exactly once"
             );
         }
     }
@@ -520,10 +533,7 @@ mod tests {
             let aliases_embedding = can_alias && self.alias_output;
             let primary = (!aliases_embedding).then(|| self.allocator.alloc("output"));
             let metadata = self.allocator.alloc("output-metadata");
-            Ok((
-                OutputAllocation { primary, metadata },
-                aliases_embedding,
-            ))
+            Ok((OutputAllocation { primary, metadata }, aliases_embedding))
         }
 
         fn read_layer(&mut self, layer_idx: usize) -> Result<Self::Layer, Self::Error> {
@@ -531,11 +541,8 @@ mod tests {
             Ok(self.allocator.alloc("layer"))
         }
 
-        fn free_layer(&mut self, layer_idx: usize, layer: Self::Layer) {
-            self.allocator.free_named(
-                layer,
-                Some(format!("free layer@{}", self.layer_devices[layer_idx])),
-            );
+        fn free_layer(&mut self, _layer_idx: usize, layer: Self::Layer) {
+            self.allocator.free(layer);
         }
 
         fn free_output(&mut self, mut output: Self::Output, aliases_embedding: bool) {
@@ -561,58 +568,62 @@ mod tests {
     }
 
     #[test]
-    fn cpu_staged_load_sweep_rolls_back_every_failure_stage() {
-        let cases = [
-            (FailAt::Prepare, &[][..]),
-            (FailAt::Embed, &[][..]),
-            (FailAt::FinalNorm, &["free embedding"][..]),
-            (
-                FailAt::Output,
-                &["free final-norm", "free embedding"][..],
-            ),
-            (
-                FailAt::Layer(0),
-                &[
-                    "free output-metadata",
-                    "free output",
-                    "free final-norm",
-                    "free embedding",
-                ][..],
-            ),
-            (
-                FailAt::Layer(2),
-                &[
-                    "free layer@1",
-                    "free layer@0",
-                    "free output-metadata",
-                    "free output",
-                    "free final-norm",
-                    "free embedding",
-                ][..],
-            ),
+    fn cpu_staged_load_sweep_rolls_back_at_every_boundary() {
+        let failures = [
+            FailAt::Prepare,
+            FailAt::Embed,
+            FailAt::FinalNorm,
+            FailAt::Output,
+            FailAt::Layer(0),
+            FailAt::Layer(2),
         ];
 
-        for (failure, expected_frees) in cases {
+        for failure in failures {
             let mut source = TestWeightSource::new(4, Some(failure));
-            let result = run_staged_load(&mut source, 2, false);
-            assert!(result.is_err(), "{failure:?} must fail");
-            assert_eq!(
-                source.allocator.frees, expected_frees,
-                "{failure:?} cleanup order changed"
+            assert!(
+                run_staged_load(&mut source, 2, false).is_err(),
+                "{failure:?} must fail"
             );
             source.assert_clean();
         }
     }
 
     #[test]
-    fn cpu_failed_load_can_retry_without_retained_allocations() {
+    fn cpu_failed_load_retry_reuses_released_allocations() {
         let mut source = TestWeightSource::new(3, Some(FailAt::Layer(2)));
         assert!(run_staged_load(&mut source, 1, true).is_err());
         source.assert_clean();
+        assert_eq!(source.allocator.allocations, 6);
+        assert_eq!(source.allocator.reuses, 0);
+        assert_eq!(source.allocator.next_id, 6);
 
         source.fail_at = None;
         let loaded = run_staged_load(&mut source, 1, true).expect("immediate retry");
         assert_eq!(source.allocator.live.len(), 7);
+        assert_eq!(source.allocator.allocations, 13);
+        assert_eq!(source.allocator.reuses, 6);
+        assert_eq!(source.allocator.next_id, 7);
+        let StagedWeights {
+            token_embd,
+            output_norm,
+            output,
+            layers,
+            lm_head_aliases_embd,
+            ..
+        } = loaded;
+        for (layer_idx, layer) in layers.into_iter().enumerate().rev() {
+            source.free_layer(layer_idx, layer);
+        }
+        source.free_output(output, lm_head_aliases_embd);
+        source.free_final_norm(output_norm);
+        source.free_embed(token_embd);
+        source.assert_clean();
+
+        let loaded = run_staged_load(&mut source, 1, true).expect("reload after retry");
+        assert_eq!(source.allocator.live.len(), 7);
+        assert_eq!(source.allocator.allocations, 20);
+        assert_eq!(source.allocator.reuses, 13);
+        assert_eq!(source.allocator.next_id, 7);
         let StagedWeights {
             token_embd,
             output_norm,
@@ -631,12 +642,13 @@ mod tests {
     }
 
     #[test]
-    fn cpu_staged_load_success_preserves_alias_and_frees_each_owner_once() {
+    fn cpu_staged_load_alias_has_one_embedding_owner() {
         let mut source = TestWeightSource::new(2, None);
         source.alias_output = true;
         let loaded = run_staged_load(&mut source, 1, true).expect("staged load");
         assert!(loaded.lm_head_aliases_embd);
         assert_eq!(source.allocator.live.len(), 5);
+        assert_eq!(source.allocator.allocations, 5);
 
         let StagedWeights {
             token_embd,
@@ -652,17 +664,7 @@ mod tests {
         source.free_output(output, lm_head_aliases_embd);
         source.free_final_norm(output_norm);
         source.free_embed(token_embd);
-
-        assert_eq!(
-            source.allocator.frees,
-            vec![
-                "free layer@1",
-                "free layer@0",
-                "free output-metadata",
-                "free final-norm",
-                "free embedding",
-            ]
-        );
         source.assert_clean();
+        assert_eq!(source.allocator.frees, source.allocator.allocations);
     }
 }
