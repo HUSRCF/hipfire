@@ -5,6 +5,7 @@
 - Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
 - DFlash weight and scratch constructors now roll back late failures for immediate retry, including pool-aware F32 leaf uploads and AWQ sidecar attachment.
 - Preserve all eleven weight groups in K=2816 HFQ4/MQ4 MoE gate/up kernels while retaining the K=2048 path; this kernel prerequisite does not enable Gemma serving.
+- Maple head overlays and BF16 KV tier (#670, nwoolmer): `hipfire run maple-preview --head q4k|bf16` loads single-tensor head overlays that validate and attach during source admission before teardown (non-Maple, EP, and REAP combinations are refused there); truncated payloads refuse at open and short reads refuse instead of zero-filling. Flat BF16 KV tier with windowed attention kernels, selectable via `--kv-mode`; the batch-router GEMM selects a gfx12 WMMA sister kernel on RDNA4. No quality or performance claims are made here.
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
