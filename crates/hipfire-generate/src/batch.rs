@@ -4072,6 +4072,47 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl FailingWriter {
+        fn events(&self) -> Vec<serde_json::Value> {
+            std::str::from_utf8(&self.bytes)
+                .expect("writer bytes are UTF-8")
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).expect("writer event is JSON"))
+                .collect()
+        }
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn route_terminals_flush_visible_done_error_and_cancel() {
         let _guard = lock();
@@ -4252,6 +4293,135 @@ mod tests {
         set_active_attempt_id(0);
     }
 
+    #[derive(Clone, Copy)]
+    enum WriterFailure {
+        Write,
+        Flush,
+    }
+
+    fn assert_route_terminal_failure_releases_latch(failure: WriterFailure) {
+        let (id, attempt_id) = match failure {
+            WriterFailure::Write => ("route-write-failure", 705_u64),
+            WriterFailure::Flush => ("route-flush-failure", 706_u64),
+        };
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+
+        let admission = batch_announce_terminal(id, attempt_id).expect("failure admission");
+        let mut output = FailingWriter::default();
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            crate::ar::emit_generation_start(GenerationRoute::QwenAr, &mut output, id, false);
+        }
+        assert_eq!(
+            output
+                .events()
+                .iter()
+                .filter(|event| event["type"] == "gen_start" && event["id"] == id)
+                .count(),
+            1,
+            "{id} initial route start",
+        );
+
+        match failure {
+            WriterFailure::Write => output.fail_write = true,
+            WriterFailure::Flush => output.fail_flush = true,
+        }
+        let pending = serde_json::json!({
+            "type": "done",
+            "id": id,
+            "attempt_id": attempt_id,
+            "finish_reason": "stop",
+        });
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+            assert!(
+                !crate::ar::emit_generation_done_value(
+                    GenerationRoute::QwenAr,
+                    &mut output,
+                    &pending,
+                ),
+                "{id} injected terminal failure must report undelivered",
+            );
+        }
+        assert_eq!(
+            crate::ar::active_generation_route(),
+            None,
+            "{id} failed terminal must clear the active route",
+        );
+        let after_failure = output.bytes.len();
+
+        // Once the exact claim is consumed, a duplicate remains suppressed
+        // even after the writer recovers.
+        output.fail_write = false;
+        output.fail_flush = false;
+        {
+            let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+            assert!(
+                !crate::ar::emit_generation_done_value(
+                    GenerationRoute::QwenAr,
+                    &mut output,
+                    &pending,
+                ),
+                "{id} duplicate terminal must stay suppressed",
+            );
+        }
+        assert_eq!(
+            output.bytes.len(),
+            after_failure,
+            "{id} duplicate terminal must not write",
+        );
+        assert!(batch_clear_terminal_at_generation(
+            id, attempt_id, admission
+        ));
+
+        // Reusing the exact wire key must claim a fresh start after the
+        // failed terminal consumed the previous lifecycle claim.
+        let fresh_admission =
+            batch_announce_terminal(id, attempt_id).expect("fresh failure admission");
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, fresh_admission);
+            crate::ar::emit_generation_start(GenerationRoute::QwenAr, &mut output, id, false);
+        }
+        assert_eq!(
+            output
+                .events()
+                .iter()
+                .filter(|event| event["type"] == "gen_start" && event["id"] == id)
+                .count(),
+            2,
+            "{id} same-key reuse must emit a fresh route start",
+        );
+        {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, fresh_admission);
+            assert!(crate::ar::emit_generation_done_value(
+                GenerationRoute::QwenAr,
+                &mut output,
+                &pending,
+            ));
+        }
+        assert!(batch_clear_terminal_at_generation(
+            id,
+            attempt_id,
+            fresh_admission,
+        ));
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn route_terminal_write_failure_consumes_claim_and_releases_latch() {
+        let _guard = lock();
+        assert_route_terminal_failure_releases_latch(WriterFailure::Write);
+    }
+
+    #[test]
+    fn route_terminal_flush_failure_consumes_claim_and_releases_latch() {
+        let _guard = lock();
+        assert_route_terminal_failure_releases_latch(WriterFailure::Flush);
+    }
 
     #[test]
     fn direct_driver_admission_errors_are_correlated_once_and_cleared() {

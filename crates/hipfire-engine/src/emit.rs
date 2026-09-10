@@ -8,6 +8,39 @@
 
 use crate::terminal::{active_attempt_id, claim_wire_terminal};
 
+/// Result of a terminal emission attempt.
+///
+/// `claimed` records ownership of the lifecycle terminal slot independently
+/// from `delivered`: a writer can consume the slot and still fail to make the
+/// bytes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalEmitOutcome {
+    claimed: bool,
+    delivered: bool,
+}
+
+impl TerminalEmitOutcome {
+    pub const fn claimed(self) -> bool {
+        self.claimed
+    }
+
+    pub const fn delivered(self) -> bool {
+        self.delivered
+    }
+
+    pub(crate) const fn new(claimed: bool, delivered: bool) -> Self {
+        Self { claimed, delivered }
+    }
+
+    /// Preserve claim ownership while replacing the delivery result.
+    pub const fn with_delivery(self, delivered: bool) -> Self {
+        Self {
+            claimed: self.claimed,
+            delivered,
+        }
+    }
+}
+
 /// Whether the authoritative Jinja generation suffix opens a reasoning span.
 /// This is deliberately tail-only: a literal `<think>` in user content must
 /// not reclassify the assistant's visible answer as reasoning.
@@ -193,25 +226,45 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) -> bool {
+    emit_active_attempt_error_outcome(stdout, id, message, class, retryable, rolled_back)
+        .delivered()
+}
+
+/// Emit an active-attempt error while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_active_attempt_error_outcome(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) -> TerminalEmitOutcome {
     let attempt_id = active_attempt_id();
     // Attempt zero is the uncorrelated pre-admission channel. It must never
     // be emitted by an active terminal writer.
     if attempt_id == 0 {
-        return false;
+        return TerminalEmitOutcome::new(false, false);
     }
-    if let Some(id) = id {
+    let claimed = if let Some(id) = id {
         if !claim_wire_terminal(id, attempt_id) {
-            return false;
+            return TerminalEmitOutcome::new(false, false);
         }
-    }
-    write_error_envelope(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-        attempt_id,
+        true
+    } else {
+        false
+    };
+    TerminalEmitOutcome::new(
+        claimed,
+        write_error_envelope(
+            stdout,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+            attempt_id,
+        ),
     )
 }
 
@@ -285,17 +338,27 @@ pub fn emit_qwen_ar_cancelled(
     id: &str,
     completion_tokens: usize,
 ) -> bool {
-    if !claim_wire_terminal(id, active_attempt_id()) {
-        return false;
-    }
+    emit_qwen_ar_cancelled_outcome(stdout, id, completion_tokens).delivered()
+}
+
+/// Emit a cancellation while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_qwen_ar_cancelled_outcome(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> TerminalEmitOutcome {
     let attempt_id = active_attempt_id();
+    if !claim_wire_terminal(id, attempt_id) {
+        return TerminalEmitOutcome::new(false, false);
+    }
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
     if writeln!(stdout, "{}", aborted).is_err() {
-        return false;
+        return TerminalEmitOutcome::new(true, false);
     }
     let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
     if writeln!(stdout, "{}", done).is_err() {
-        return false;
+        return TerminalEmitOutcome::new(true, false);
     }
-    stdout.flush().is_ok()
+    TerminalEmitOutcome::new(true, stdout.flush().is_ok())
 }

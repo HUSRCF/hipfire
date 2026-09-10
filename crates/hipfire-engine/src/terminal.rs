@@ -8,6 +8,7 @@
 //! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3)
 //! to break the `daemon -> loader -> daemon` cycle. No behaviour change.
 
+use crate::emit::TerminalEmitOutcome;
 use std::cell::Cell;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1324,6 +1325,16 @@ pub fn emit_staged_terminal_done(
     stdout: &mut impl std::io::Write,
     pending_done: &serde_json::Value,
 ) -> bool {
+    emit_staged_terminal_done_outcome(stdout, pending_done).delivered()
+}
+
+/// Emit a staged `done` while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_staged_terminal_done_outcome(
+    stdout: &mut impl std::io::Write,
+    pending_done: &serde_json::Value,
+) -> TerminalEmitOutcome {
+    let mut claimed = false;
     if let Some(obj) = pending_done.as_object() {
         if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
             let attempt_id = obj
@@ -1331,14 +1342,13 @@ pub fn emit_staged_terminal_done(
                 .and_then(|value| value.as_u64())
                 .unwrap_or_else(active_attempt_id);
             if !claim_wire_terminal(id, attempt_id) {
-                return false;
+                return TerminalEmitOutcome::new(false, false);
             }
+            claimed = true;
         }
     }
-    if writeln!(stdout, "{}", pending_done).is_err() {
-        return false;
-    }
-    stdout.flush().is_ok()
+    let delivered = writeln!(stdout, "{}", pending_done).is_ok() && stdout.flush().is_ok();
+    TerminalEmitOutcome::new(claimed, delivered)
 }
 
 /// Force-answer target request ID, set by the stdin-reader thread on

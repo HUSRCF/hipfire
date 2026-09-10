@@ -882,7 +882,7 @@ pub enum RouteTerminalEvent<'a> {
 
 pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
 pub type RouteTerminalAdapter =
-    for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>) -> bool;
+    for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>) -> TerminalEmitOutcome;
 
 thread_local! {
     /// A route can fall through from speculative capacity checks into AR.
@@ -1060,11 +1060,11 @@ impl GenerationRouteAdapter {
         attempt: u64,
         event: RouteTerminalEvent<'_>,
     ) -> bool {
-        let delivered = (self.terminal)(output, id, attempt, event);
-        if delivered {
+        let outcome = (self.terminal)(output, id, attempt, event);
+        if outcome.claimed() {
             release_route_start(id, attempt);
         }
-        delivered
+        outcome.delivered()
     }
 }
 
@@ -1074,12 +1074,12 @@ fn emit_route_terminal(
     _attempt: u64,
     event: RouteTerminalEvent<'_>,
     route_name: &'static str,
-) -> bool {
+) -> TerminalEmitOutcome {
     let mut buffer = Vec::new();
     let staged = match event {
         RouteTerminalEvent::Done {
             pending: Some(pending),
-        } => emit_staged_terminal_done(&mut buffer, pending),
+        } => emit_staged_terminal_done_outcome(&mut buffer, pending),
         RouteTerminalEvent::Done { pending: None } => {
             let pending = serde_json::json!({
                 "type": "done",
@@ -1087,7 +1087,7 @@ fn emit_route_terminal(
                 "attempt_id": active_attempt_id(),
                 "finish_reason": "stop",
             });
-            emit_staged_terminal_done(&mut buffer, &pending)
+            emit_staged_terminal_done_outcome(&mut buffer, &pending)
         }
         RouteTerminalEvent::Error {
             id: event_id,
@@ -1104,7 +1104,7 @@ fn emit_route_terminal(
                     &fallback
                 }
             };
-            emit_active_attempt_error(
+            emit_active_attempt_error_outcome(
                 &mut buffer,
                 event_id,
                 message,
@@ -1114,13 +1114,16 @@ fn emit_route_terminal(
             )
         }
         RouteTerminalEvent::Cancel { completion_tokens } => {
-            emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens)
+            emit_qwen_ar_cancelled_outcome(&mut buffer, id, completion_tokens)
         }
     };
-    if !staged || output.write_all(&buffer).is_err() {
-        return false;
+    if !staged.delivered() {
+        return staged;
     }
-    output.flush().is_ok()
+    if output.write_all(&buffer).is_err() {
+        return staged.with_delivery(false);
+    }
+    staged.with_delivery(output.flush().is_ok())
 }
 
 macro_rules! define_route_start {
@@ -1145,7 +1148,7 @@ macro_rules! define_route_terminal {
             id: &str,
             attempt: u64,
             event: RouteTerminalEvent<'_>,
-        ) -> bool {
+        ) -> TerminalEmitOutcome {
             emit_route_terminal(output, id, attempt, event, $route.name())
         }
     };
