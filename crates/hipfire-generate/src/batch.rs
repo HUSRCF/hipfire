@@ -85,6 +85,29 @@ fn emit_batch_admission_error(
     }
     batch_clear_terminal_at_generation(id, attempt_id, admission);
 }
+/// Emit the assignment-time LFM capacity failure. The caller must hold the
+/// exact `BatchAttemptScope`; the scheduler owns generation-aware lane abort
+/// and registry cleanup immediately after this returns.
+fn emit_lfm_assignment_capacity_error(
+    stdout: &mut impl Write,
+    key: &AttemptKey,
+    prompt_len: usize,
+    max_tokens: usize,
+    capacity: usize,
+) {
+    emit_active_attempt_error(
+        stdout,
+        Some(&key.id),
+        &format!(
+            "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={}",
+            prompt_len, max_tokens, capacity
+        ),
+        "context_length",
+        false,
+        false,
+    );
+    let _ = stdout.flush();
+}
 
 /// Cancellable LFM prefill helper. Attempts to use the arch's
 /// `prefill_lane_cancellable` when present; otherwise falls back to the
@@ -1994,18 +2017,12 @@ pub fn drive_lfm_continuous_batch(
                 }
                 let _scope =
                     BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
-                emit_uncorrelated_error(
+                emit_lfm_assignment_capacity_error(
                     stdout,
-                    Some(&key.id),
-                    &format!(
-                        "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={}",
-                        prompt_tokens.len(),
-                        max_tokens_req,
-                        sched.lane_capacity
-                    ),
-                    "context_length",
-                    false,
-                    false,
+                    &key,
+                    prompt_tokens.len(),
+                    max_tokens_req,
+                    sched.lane_capacity,
                 );
                 let _ = sched.abort_lane(lane_idx, &key, admission);
                 continue;
@@ -3814,5 +3831,62 @@ mod tests {
                 "{driver} admission cleanup"
             );
         }
+    }
+
+    #[test]
+    fn lfm_assignment_capacity_error_is_correlated_and_cleans_generation() {
+        let _guard = lock();
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+
+        let id = "lfm-assignment";
+        let attempt_id = 404_u64;
+        let admission = batch_announce_terminal(id, attempt_id).expect("batch admission");
+        let key = AttemptKey::new(id, attempt_id);
+        let sampling = BatchSampling {
+            temp: 0.3,
+            top_p: 1.0,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        };
+        let mut sched = ContinuousBatchScheduler::new(1, 8);
+        assert!(sched.enqueue(BatchPendingRequest {
+            key: key.clone(),
+            admission,
+            prompt: "oversized".to_string(),
+            prompt_tokens: vec![1; 7],
+            started_in_think: false,
+            system: None,
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            max_think_tokens: 0,
+            max_tokens: 4,
+            client_seed: None,
+            sampling,
+        }));
+        let (assigned_key, ticket) = sched.try_assign_one().expect("assigned lane");
+        assert_eq!(assigned_key, key);
+
+        let mut output = Vec::new();
+        let _scope =
+            BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
+        emit_lfm_assignment_capacity_error(&mut output, &key, 7, 4, 8);
+        let lines: Vec<&str> = std::str::from_utf8(&output)
+            .expect("UTF-8 error envelope")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 1, "assignment emits exactly one error");
+        let event: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("JSON error envelope");
+        assert_eq!(event["id"].as_str(), Some(id));
+        assert_eq!(event["attempt_id"].as_u64(), Some(attempt_id));
+        assert_eq!(event["class"].as_str(), Some("context_length"));
+        assert!(sched.abort_lane(ticket.lane, &key, admission));
+        assert_eq!(batch_terminal_generation(id, attempt_id), None);
     }
 }
