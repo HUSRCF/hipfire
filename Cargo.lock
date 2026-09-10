@@ -1241,6 +1241,7 @@ dependencies = [
  "hipfire-runtime",
  "md5",
  "rdna-compute",
+ "tempfile",
 ]
 
 [[package]]

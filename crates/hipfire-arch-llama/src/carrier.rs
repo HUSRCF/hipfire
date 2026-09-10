@@ -878,8 +878,7 @@ mod tests {
     use hipfire_runtime::weight_store::{
         WeightLoadTransaction, WeightOrigin, WeightProjection, WeightProjectionKind, WeightStore,
     };
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::Path;
 
     fn hfq_tensor(name: &str, shape: &[u32], quant_type: u8, bytes: usize) -> HfqMemTensor {
         HfqMemTensor {
@@ -924,12 +923,28 @@ mod tests {
         }
     }
 
+    /// Owned synthetic HFQ fixture writer: each call owns a
+    /// `tempfile::NamedTempFile` (unique path per call, file removed on drop —
+    /// the same ownership pattern as the `tempfile::tempdir` fixtures in
+    /// `hipfire-runtime`), so concurrent tests can never share or delete each
+    /// other's fixture. Hold the returned owner across every open/read —
+    /// including the legacy reopen — and never unlink its path by hand.
+    fn fixture_file(
+        metadata: &str,
+        tensors: &[HfqMemTensor],
+    ) -> (tempfile::NamedTempFile, HfqFile) {
+        let fixture = tempfile::NamedTempFile::new().expect("unique HFQ fixture file");
+        write_hfqm_package_mem(fixture.path(), 0, metadata, tensors).expect("write HFQ fixture");
+        let hfq = HfqFile::open(fixture.path()).expect("open HFQ fixture");
+        (fixture, hfq)
+    }
+
     fn fixture_hfq(
         with_awq_sidecar: bool,
         with_q_proj_bias: bool,
         malformed_output_norm: bool,
         separate_lm_head: bool,
-    ) -> (PathBuf, HfqFile) {
+    ) -> (tempfile::NamedTempFile, HfqFile) {
         fixture_hfq_with_lm_head(
             with_awq_sidecar,
             with_q_proj_bias,
@@ -943,7 +958,7 @@ mod tests {
         with_q_proj_bias: bool,
         malformed_output_norm: bool,
         lm_head_name: Option<&str>,
-    ) -> (PathBuf, HfqFile) {
+    ) -> (tempfile::NamedTempFile, HfqFile) {
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 32], false),
             f32_hfq_tensor("model.norm.weight", &[32], false),
@@ -998,15 +1013,7 @@ mod tests {
                 "rope_theta": 10000.0
             }
         }"#;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before epoch")
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("hipfire-g3-{}-{nonce}.hfq", std::process::id()));
-        write_hfqm_package_mem(&path, 0, metadata, &tensors).expect("write HFQ fixture");
-        let hfq = HfqFile::open(&path).expect("open HFQ fixture");
-        (path, hfq)
+        fixture_file(metadata, &tensors)
     }
 
     /// Constant-valued MQ4G256 trunk (quant_type 13) for AWQ math tests.
@@ -1064,7 +1071,7 @@ mod tests {
     fn fixture_awq_mq4_hfq(
         o_sidecar: Option<u16>,
         lm_scales: Option<Vec<u16>>,
-    ) -> (PathBuf, HfqFile) {
+    ) -> (tempfile::NamedTempFile, HfqFile) {
         const K: usize = 256;
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 256], false),
@@ -1135,15 +1142,7 @@ mod tests {
                 "rope_theta": 10000.0
             }
         }"#;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before epoch")
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("hipfire-g3-awq-{}-{nonce}.hfq", std::process::id()));
-        write_hfqm_package_mem(&path, 0, metadata, &tensors).expect("write AWQ fixture");
-        let hfq = HfqFile::open(&path).expect("open AWQ fixture");
-        (path, hfq)
+        fixture_file(metadata, &tensors)
     }
 
     fn load_ctx<'a>(
@@ -1321,9 +1320,9 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(false, false, false, false);
+        let (fixture, hfq) = fixture_hfq(false, false, false, false);
         let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
         drop(ctx);
         assert!(bundle.weights.lm_head_aliases_embd);
@@ -1346,14 +1345,12 @@ mod tests {
             bundle.scratch.logits.shape
         );
         Box::new(bundle).free_gpu(&mut gpu);
-        std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
     fn production_awq_sidecar_selects_legacy_loader() {
-        let (path, hfq) = fixture_hfq(true, false, false, false);
+        let (_fixture, hfq) = fixture_hfq(true, false, false, false);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
-        std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
@@ -1362,16 +1359,15 @@ mod tests {
             return;
         };
         for name in &HFQ_LM_HEAD_NAMES[1..] {
-            let (path, hfq) = fixture_hfq_with_lm_head(false, false, false, Some(name));
+            let (fixture, hfq) = fixture_hfq_with_lm_head(false, false, false, Some(name));
             assert!(hfq_has_separate_lm_head(&hfq));
             let cask = CaskConfig::default();
-            let mut ctx = load_ctx(&path, &mut gpu, &cask);
+            let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
             let bundle =
                 load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load explicit lm_head");
             drop(ctx);
             assert!(!bundle.weights.lm_head_aliases_embd);
             Box::new(bundle).free_gpu(&mut gpu);
-            std::fs::remove_file(path).expect("remove HFQ fixture");
         }
     }
 
@@ -1380,9 +1376,9 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(false, true, false, false);
+        let (fixture, hfq) = fixture_hfq(false, true, false, false);
         let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
             Ok(_) => panic!("biased HFQ unexpectedly loaded"),
             Err(error) => error,
@@ -1390,7 +1386,6 @@ mod tests {
         drop(ctx);
         assert!(error.contains("q_proj.bias"));
         assert!(error.contains("refusing to load Qwen2"));
-        std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
@@ -1398,11 +1393,11 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(false, false, false, false);
+        let (fixture, hfq) = fixture_hfq(false, false, false, false);
         test_support::reset();
         test_support::arm_fail_after_upload(1);
         let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
             Ok(_) => panic!("post-upload fault unexpectedly succeeded"),
             Err(error) => error,
@@ -1417,7 +1412,6 @@ mod tests {
             test_support::resident_releases(),
             "every resident allocation must be reclaimed on load failure"
         );
-        std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
@@ -1425,9 +1419,9 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_hfq(false, false, false, false);
+        let (fixture, hfq) = fixture_hfq(false, false, false, false);
         let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let mut bundle =
             load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
         drop(ctx);
@@ -1456,7 +1450,7 @@ mod tests {
         };
         Box::new(bundle).free_gpu(&mut gpu);
 
-        let hfq = HfqFile::open(&path).expect("reopen HFQ fixture");
+        let hfq = HfqFile::open(fixture.path()).expect("reopen HFQ fixture");
         let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("fixture config");
         let legacy = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
             .expect("load legacy HFQ fixture");
@@ -1484,7 +1478,6 @@ mod tests {
                 "logit mismatch at index {index}: manifest={manifest} legacy={legacy}"
             );
         }
-        std::fs::remove_file(path).expect("remove HFQ fixture");
     }
 
     #[test]
@@ -1946,11 +1939,11 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_awq_mq4_hfq(Some(0x4000), None);
+        let (fixture, hfq) = fixture_awq_mq4_hfq(Some(0x4000), None);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
         assert!(hfq.has_awq_sidecars());
         let cask = CaskConfig::default();
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy GPU load");
         drop(ctx);
         assert!(
@@ -2001,9 +1994,9 @@ mod tests {
             bundle
         }
         const LM_K: usize = 256;
-        let (lm2_path, lm2_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4000; LM_K]));
+        let (lm2_fixture, lm2_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4000; LM_K]));
         assert_eq!(classify_hfq_route(&lm2_hfq), HfqLoadRoute::LegacyAwq);
-        let mut pair2 = load_lm_head_pair(&lm2_path, lm2_hfq, &mut gpu, &cask);
+        let mut pair2 = load_lm_head_pair(lm2_fixture.path(), lm2_hfq, &mut gpu, &cask);
         assert_eq!(
             pair2.weights.output.gpu_dtype,
             DType::MQ4G256,
@@ -2024,8 +2017,8 @@ mod tests {
             "lm_head AWQ forward must compute nonzero output, got {logits2:?}"
         );
         Box::new(pair2).free_gpu(&mut gpu);
-        let (lm4_path, lm4_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4400; LM_K]));
-        let mut pair4 = load_lm_head_pair(&lm4_path, lm4_hfq, &mut gpu, &cask);
+        let (lm4_fixture, lm4_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4400; LM_K]));
+        let mut pair4 = load_lm_head_pair(lm4_fixture.path(), lm4_hfq, &mut gpu, &cask);
         assert!(pair4.weights.output.awq_scale.is_some());
         let logits4 = forward_logits(&mut gpu, &mut pair4);
         assert!(logits4.iter().all(|value| value.is_finite()));
@@ -2043,8 +2036,8 @@ mod tests {
         for (index, slot) in mixed.iter_mut().enumerate() {
             *slot = if index % 2 == 0 { 0x4000 } else { 0x4400 };
         }
-        let (mix_path, mix_hfq) = fixture_awq_mq4_hfq(None, Some(mixed));
-        let mut pair_mix = load_lm_head_pair(&mix_path, mix_hfq, &mut gpu, &cask);
+        let (mix_fixture, mix_hfq) = fixture_awq_mq4_hfq(None, Some(mixed));
+        let mut pair_mix = load_lm_head_pair(mix_fixture.path(), mix_hfq, &mut gpu, &cask);
         let logits_mix = forward_logits(&mut gpu, &mut pair_mix);
         assert!(logits_mix.iter().all(|value| value.is_finite()));
         Box::new(pair_mix).free_gpu(&mut gpu);
@@ -2065,8 +2058,8 @@ mod tests {
         // Sidecar-free trunk through the manifest route: proves the same MQ4
         // trunk loads and forwards on the G3 production path. No numeric
         // comparison across routes is drawn (different kernels per route).
-        let (plain_path, plain_hfq) = fixture_awq_mq4_hfq(None, None);
-        let mut ctx = load_ctx(&plain_path, &mut gpu, &cask);
+        let (plain_fixture, plain_hfq) = fixture_awq_mq4_hfq(None, None);
+        let mut ctx = load_ctx(plain_fixture.path(), &mut gpu, &cask);
         let mut plain = load_bundle(ModelSource::Hfq(plain_hfq), &mut ctx).expect("plain MQ4 load");
         drop(ctx);
         let plain_logits = forward_logits(&mut gpu, &mut plain);
@@ -2075,8 +2068,8 @@ mod tests {
         // Immediate reload of the sidecar file re-attaches the scale with
         // bitwise-identical numerics: unload released the scale-carrying
         // weight exactly once with no manifest store involved.
-        let hfq = HfqFile::open(&path).expect("reopen AWQ fixture");
-        let mut ctx = load_ctx(&path, &mut gpu, &cask);
+        let hfq = HfqFile::open(fixture.path()).expect("reopen AWQ fixture");
+        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy reload");
         drop(ctx);
         assert_eq!(bundle.weights.layers[0].wo.gpu_dtype, DType::MQ4G256);
@@ -2084,11 +2077,6 @@ mod tests {
         let reload_logits = forward_logits(&mut gpu, &mut bundle);
         assert_eq!(reload_logits, awq_logits, "AWQ reload decode parity");
         Box::new(bundle).free_gpu(&mut gpu);
-        std::fs::remove_file(path).expect("remove AWQ fixture");
-        std::fs::remove_file(lm2_path).expect("remove AWQ lm2 fixture");
-        std::fs::remove_file(lm4_path).expect("remove AWQ lm4 fixture");
-        std::fs::remove_file(mix_path).expect("remove AWQ mix fixture");
-        std::fs::remove_file(plain_path).expect("remove plain MQ4 fixture");
     }
 
     /// Repeated production load/unload cycles on the pinned fixture must not

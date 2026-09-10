@@ -20,6 +20,7 @@ rdna-compute = { path = "../rdna-compute" }
 # MD5, so the lock must hash file content, not just compare size. Same direct
 # version pin as hipfire-cli / hipfire-detect (`md5 = "0.8"`).
 md5 = "0.8"
+tempfile = "3"
 
 # ---------------------------------------------------------------------------
 # Archived research probes.
