@@ -76,6 +76,12 @@ pub struct LoadCtx<'a> {
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
     pub kv_mode_override: Option<&'a str>,
+    // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
+    // validate and attach in `admit_source` before teardown, so the admitted
+    // source the carrier consumes is already effective — threading a second
+    // path here would reopen the file and reintroduce the pre-teardown
+    // validation gap. The offline coherence example uses
+    // `load_maple_from_hfq_with_head` directly.
     pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,

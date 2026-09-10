@@ -5352,6 +5352,13 @@ pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str =
 pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0.hip");
 
+/// Flat BF16 KV write (maple). 2 bytes per element, no blocks and no scales.
+/// Layout: [max_seq × n_kv_heads × head_dim] bf16. Holds both the decode
+/// (`kv_cache_write_bf16`) and batched-prefill (`kv_cache_write_bf16_batched`)
+/// entry points.
+pub const KV_CACHE_WRITE_BF16_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_bf16.hip");
+
 /// gfx1100-only paired K/V Q8_0 cache writer. Kept in a separate translation
 /// unit so its dormant body cannot perturb portable/gfx12 writer codegen.
 pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
@@ -5453,6 +5460,12 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
 
+/// Flat-BF16 sibling of the Q8_0 flash tile. Same partials layout and same
+/// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
+/// unmodified — that reduce only ever touches f32 partials.
+pub const ATTENTION_FLASH_BF16_TILE_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_bf16_tile.hip");
+
 /// gfx1151-only ISA experiment: preserve the flash tile's reduction tree but
 /// lower cross-lane exchanges to ds_swizzle + DPP8/quad-perm operations.
 pub const ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC: &str = concat!(
@@ -5530,6 +5543,8 @@ pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
+pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_bf16_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
@@ -7103,6 +7118,16 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 /// stay F16 on device. Targets gfx1100+ wave32 WMMA.
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
+
+/// gfx12/RDNA4 sister of `GEMM_F16_X_F16_WMMA_SRC` — same math, same
+/// `(A, X, Y, M, K, B)` signature and `[B, M]` F32 output layout, but half8
+/// operands with `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and the
+/// contiguous-per-half C mapping. The gfx11 `_w32` builtin needs
+/// `wmma-256b-insts,wavefrontsize32` and does not compile for gfx1201.
+/// Selected by `Gpu::gemm_f16_x_f16_wmma` on `has_wmma_w32_gfx12()`; the gfx11
+/// path is unchanged.
+pub const GEMM_F16_X_F16_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.gfx12.hip");
 
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from

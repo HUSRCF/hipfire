@@ -2276,6 +2276,10 @@ pub fn load_model(
 }
 
 /// Load a model with an optional per-load KV storage backend override.
+///
+/// Head overlays (`--head`) are admission-only: they validate and attach in
+/// `admit_source` before teardown, so this pre-admission entry point cannot
+/// carry one — use the `admit_source` → `load_admitted_*` route instead.
 #[allow(clippy::too_many_arguments)]
 pub fn load_model_with_kv_backend(
     path: &str,
@@ -2460,6 +2464,7 @@ pub fn load_model_with_gemma4_drafter(
     deepseek4_experts_per_token: Option<usize>,
     deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
     draft_path: Option<&str>,
+    head_path: Option<&str>,
     gemma4_drafter_path: Option<&str>,
     gemma4_draft_len: usize,
     kv_mode_override: Option<&str>,
@@ -2483,6 +2488,7 @@ pub fn load_model_with_gemma4_drafter(
         draft_path,
         gpu.arch.as_str(),
         None,
+        head_path,
     )?;
     load_admitted_with_gemma4_drafter(
         admission,
@@ -3052,7 +3058,7 @@ pub fn load_model_ep_with_kv_mode(
     // Classify once and admit before any side effect. EP is HFQ-only and
     // dispatches on arch_id, so the admission retains the arch_id decision and
     // the per-rank file re-open happens inside the EP load (unchanged).
-    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None)?;
+    let admission = crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None, None)?;
     load_model_ep_admitted(
         admission,
         path,

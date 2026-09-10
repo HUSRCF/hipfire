@@ -1158,6 +1158,8 @@ impl ServeRuntime {
                 self.kv_backend_override.as_deref(),
                 tag.as_deref(),
                 false,
+                // serve has no --head yet; models load their own head.
+                None,
             )?;
             if let Some(vision) = self.vision_override.as_ref() {
                 // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
