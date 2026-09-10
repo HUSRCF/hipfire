@@ -1047,7 +1047,15 @@ mod tests {
     /// constant 1.0 (as a pre-scaled `(W·s)` stand-in) and the sidecar holds
     /// caller-chosen non-unit F16. A unit sidecar would only prove loader
     /// neutrality, not that the divide shapes numerics.
-    fn fixture_awq_mq4_hfq(sidecar_f16: Option<u16>) -> (PathBuf, HfqFile) {
+    ///
+    /// `o_sidecar`: uniform F16 scale replicated across the o_proj sidecar
+    /// (attachment coverage on a mid-block projection). `lm_scales`: when
+    /// `Some`, the separate lm_head is itself a constant-1.0 MQ4 trunk with
+    /// exactly these K per-channel F16 scales — the post-`output_norm` divide
+    /// oracle (`lm_head` has no normalization downstream, so a uniform
+    /// 2.0-vs-4.0 pair must forward at an exact 2:1 logit ratio). When
+    /// `None`, the head stays F16 (distinct-head loader coverage).
+    fn fixture_awq_mq4_hfq(o_sidecar: Option<u16>, lm_scales: Option<Vec<u16>>) -> (PathBuf, HfqFile) {
         const K: usize = 256;
         let mut tensors = vec![
             f32_hfq_tensor("model.embed_tokens.weight", &[2, 256], false),
@@ -1070,23 +1078,39 @@ mod tests {
                 false,
             ),
         ];
-        if let Some(bits) = sidecar_f16 {
+        if let Some(bits) = o_sidecar {
             tensors.push(HfqMemTensor {
                 name: "model.layers.0.self_attn.o_proj.awq_scale.weight".into(),
                 quant_type: 1,
                 shape: vec![K as u32],
                 group_size: 0,
-                // Caller-chosen F16 scale replicated across K: the trunk is
-                // constant, so any live divide shows up as an exact scale
-                // ratio between two same-route forwards.
+                // Caller-chosen F16 scale replicated across K.
                 data: (0..K).flat_map(|_| bits.to_le_bytes()).collect(),
             });
         }
-        // F16, not F32: a separate lm_head loads through
-        // `hfq::load_weight_tensor`, which host-decodes qt1 and passes raw
-        // codecs through but has no qt2 arm. The supported F16 separate head
-        // keeps distinct-head coverage on a loader-supported dtype.
-        tensors.push(f16_hfq_tensor("lm_head.weight", &[2, 256]));
+        match lm_scales {
+            // Quantized post-norm head: the same constant-1.0 MQ4 trunk as
+            // o_proj, so the per-channel sidecar divide is the only
+            // difference between same-route forwards. Loads through
+            // `hfq::load_weight_tensor` (raw codec passthrough) with the
+            // centralized sidecar attach, exactly like o_proj.
+            Some(scales) => {
+                assert_eq!(scales.len(), K, "lm_head sidecar must cover K channels");
+                tensors.push(mq4g256_const_tensor("lm_head.weight", 2, 256, 0.5, 2));
+                tensors.push(HfqMemTensor {
+                    name: "lm_head.awq_scale.weight".into(),
+                    quant_type: 1,
+                    shape: vec![K as u32],
+                    group_size: 0,
+                    data: scales.iter().flat_map(|bits| bits.to_le_bytes()).collect(),
+                });
+            }
+            // F16, not F32: a separate lm_head loads through
+            // `hfq::load_weight_tensor`, which host-decodes qt1 and passes raw
+            // codecs through but has no qt2 arm. The supported F16 separate head
+            // keeps distinct-head coverage on a loader-supported dtype.
+            None => tensors.push(f16_hfq_tensor("lm_head.weight", &[2, 256])),
+        }
         let metadata = r#"{
             "config": {
                 "model_type": "llama",
@@ -1878,8 +1902,13 @@ mod tests {
     /// manifest store is attached, the MQ4G256 o_proj keeps its quantized
     /// dtype (not widened), and its AWQ scale sidecar is attached through the
     /// `DType::supports_awq_sidecar` gate. Forward runs finite nonzero
-    /// logits; a same-route 2.0-vs-4.0 scale pair records whether the
-    /// dispatch path honors the divide (ratio 2) or bypasses it (identical).
+    /// logits. The numerical proof is a post-`output_norm` oracle: a
+    /// quantized lm_head with a uniform 2.0-vs-4.0 sidecar pair must forward
+    /// at an exact 2:1 logit ratio (the divide-then-linear chain is exactly
+    /// linear and no normalization sits downstream of lm_head), plus a
+    /// nonuniform sidecar that must differ from both uniform runs. A global
+    /// sidecar on a pre-norm projection cannot serve as the oracle —
+    /// RMSNorm erases it — so the o_proj pair only records attachment.
     /// Unload via the sole consuming owner followed by an immediate reload
     /// re-attaches the sidecar with bitwise-identical numerics.
     #[test]
@@ -1908,7 +1937,7 @@ mod tests {
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
-        let (path, hfq) = fixture_awq_mq4_hfq(Some(0x4000));
+        let (path, hfq) = fixture_awq_mq4_hfq(Some(0x4000), None);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
         assert!(hfq.has_awq_sidecars());
         let cask = CaskConfig::default();
@@ -1939,32 +1968,95 @@ mod tests {
             "AWQ forward must compute nonzero output, got {awq_logits:?}"
         );
         Box::new(bundle).free_gpu(&mut gpu);
-        // Same-route scale experiment: an identical trunk with 4.0 scales
-        // through the same legacy route and kernels. The verdict is recorded,
-        // not asserted: identical outputs would mean the dispatch path
-        // bypasses the attached scale (suspect: `weight_gemv`-family
-        // `WeightRef`/`RotationParams` hardcode `awq_scale: None` on decode);
-        // differing outputs prove the scale is consumed. No clean divide
-        // ratio is expected even when live: output_norm (RMSNorm) is
-        // scale-invariant, so a global divide factor is normalized away
-        // downstream, leaving fp-level residuals.
-        let (path4, hfq4) = fixture_awq_mq4_hfq(Some(0x4400));
-        let mut ctx = load_ctx(&path4, &mut gpu, &cask);
-        let mut bundle4 = load_bundle(ModelSource::Hfq(hfq4), &mut ctx).expect("AWQ s4 load");
-        drop(ctx);
-        assert!(bundle4.weights.layers[0].wo.awq_scale.is_some());
-        let logits4 = forward_logits(&mut gpu, &mut bundle4);
-        assert!(logits4.iter().all(|value| value.is_finite()));
-        eprintln!(
-            "awq-numerics: s2={awq_logits:?} s4={logits4:?} identical={}",
-            logits4 == awq_logits
+        // Post-norm divide oracle: a quantized lm_head (constant-1.0 MQ4
+        // trunk) with a uniform 2.0 sidecar vs a uniform 4.0 sidecar through
+        // the same legacy route and kernels. The chain after `output_norm`
+        // is divide-by-scale, FWHT, GEMV — exactly linear in 1/s with no
+        // normalization downstream of lm_head — so the 4.0 logits must equal
+        // the 2.0 logits halved, to fp tolerance. A bypassed sidecar would
+        // forward bit-identically (deviation 1.0); the 1e-4 relative bound
+        // discriminates a live divide from a bypass by four orders of
+        // magnitude. A third alternating 2.0/4.0 sidecar must differ from
+        // the uniform run beyond fp noise, proving per-channel application
+        // rather than a global fudge factor.
+        fn load_lm_head_pair(
+            path: &Path,
+            hfq: HfqFile,
+            gpu: &mut rdna_compute::Gpu,
+            cask: &CaskConfig,
+        ) -> LlamaBundle {
+            let mut ctx = load_ctx(path, gpu, cask);
+            let bundle =
+                load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ lm_head legacy load");
+            drop(ctx);
+            bundle
+        }
+        const LM_K: usize = 256;
+        let (lm2_path, lm2_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4000; LM_K]));
+        assert_eq!(classify_hfq_route(&lm2_hfq), HfqLoadRoute::LegacyAwq);
+        let mut pair2 = load_lm_head_pair(&lm2_path, lm2_hfq, &mut gpu, &cask);
+        assert_eq!(
+            pair2.weights.output.gpu_dtype,
+            DType::MQ4G256,
+            "quantized lm_head must keep its MQ4 dtype, not widen"
         );
-        Box::new(bundle4).free_gpu(&mut gpu);
+        assert!(
+            pair2.weights.output.awq_scale.is_some(),
+            "lm_head AWQ scale sidecar must attach on the supported dtype path"
+        );
+        let logits2 = forward_logits(&mut gpu, &mut pair2);
+        assert_eq!(logits2.len(), 2, "fixture vocab width");
+        assert!(
+            logits2.iter().all(|value| value.is_finite()),
+            "lm_head AWQ forward must produce finite logits, got {logits2:?}"
+        );
+        assert!(
+            logits2.iter().any(|value| value.abs() > 1e-3),
+            "lm_head AWQ forward must compute nonzero output, got {logits2:?}"
+        );
+        Box::new(pair2).free_gpu(&mut gpu);
+        let (lm4_path, lm4_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4400; LM_K]));
+        let mut pair4 = load_lm_head_pair(&lm4_path, lm4_hfq, &mut gpu, &cask);
+        assert!(pair4.weights.output.awq_scale.is_some());
+        let logits4 = forward_logits(&mut gpu, &mut pair4);
+        assert!(logits4.iter().all(|value| value.is_finite()));
+        Box::new(pair4).free_gpu(&mut gpu);
+        assert_eq!(logits2.len(), logits4.len(), "same trunk, same vocab width");
+        for (index, (reference, halved)) in logits2.iter().zip(logits4.iter()).enumerate() {
+            let deviation = (halved * 2.0 - reference).abs() / reference.abs().max(1e-6);
+            assert!(
+                deviation < 1e-4,
+                "lm_head AWQ divide ratio broken at logit {index}: s2={reference} s4={halved} (expected {halved}*2 == {reference}); a bypassed sidecar gives deviation 1.0"
+            );
+        }
+        eprintln!("awq-numerics: lm2={logits2:?} lm4={logits4:?} divide-ratio-2-holds");
+        let mut mixed = vec![0u16; LM_K];
+        for (index, slot) in mixed.iter_mut().enumerate() {
+            *slot = if index % 2 == 0 { 0x4000 } else { 0x4400 };
+        }
+        let (mix_path, mix_hfq) = fixture_awq_mq4_hfq(None, Some(mixed));
+        let mut pair_mix = load_lm_head_pair(&mix_path, mix_hfq, &mut gpu, &cask);
+        let logits_mix = forward_logits(&mut gpu, &mut pair_mix);
+        assert!(logits_mix.iter().all(|value| value.is_finite()));
+        Box::new(pair_mix).free_gpu(&mut gpu);
+        let peak = logits2
+            .iter()
+            .fold(0.0f32, |best, value| best.max(value.abs()));
+        let shift = logits2
+            .iter()
+            .zip(logits_mix.iter())
+            .fold(0.0f32, |best, (plain, varied)| {
+                best.max((varied - plain).abs())
+            });
+        assert!(
+            shift / peak.max(1e-6) > 1e-6,
+            "nonuniform lm_head sidecar must reshape numerics per channel, got shift {shift} at peak {peak}"
+        );
+        eprintln!("awq-numerics: lm_mix={logits_mix:?} per-channel-shift {shift}");
         // Sidecar-free trunk through the manifest route: proves the same MQ4
         // trunk loads and forwards on the G3 production path. No numeric
         // comparison across routes is drawn (different kernels per route).
-        let (plain_path, plain_hfq) = fixture_awq_mq4_hfq(None);
-        assert_eq!(classify_hfq_route(&plain_hfq), HfqLoadRoute::ManifestPlainLlama);
+        let (plain_path, plain_hfq) = fixture_awq_mq4_hfq(None, None);
         let mut ctx = load_ctx(&plain_path, &mut gpu, &cask);
         let mut plain = load_bundle(ModelSource::Hfq(plain_hfq), &mut ctx).expect("plain MQ4 load");
         drop(ctx);
@@ -1984,19 +2076,18 @@ mod tests {
         assert_eq!(reload_logits, awq_logits, "AWQ reload decode parity");
         Box::new(bundle).free_gpu(&mut gpu);
         std::fs::remove_file(path).expect("remove AWQ fixture");
-        std::fs::remove_file(path4).expect("remove AWQ s4 fixture");
+        std::fs::remove_file(lm2_path).expect("remove AWQ lm2 fixture");
+        std::fs::remove_file(lm4_path).expect("remove AWQ lm4 fixture");
+        std::fs::remove_file(mix_path).expect("remove AWQ mix fixture");
         std::fs::remove_file(plain_path).expect("remove plain MQ4 fixture");
     }
 
     /// Repeated production load/unload cycles on the pinned fixture must not
-    /// leak: every cycle publishes exactly the warm baseline (no growth in the
-    /// store's resident accounting), decodes identically, and returns free
-    /// VRAM to within a bounded floor of the stabilized level after unload, so
-    /// a manifest-specific retention cannot accumulate across reloads on one
-    /// context. The floor is deliberately generous (1 GiB/cycle beyond a
-    /// one-time 256 MiB context allowance) because gfx1151 UMA pooling means
-    /// hipMemGetInfo does not credit driver-pooled frees in-cycle — the
-    /// legacy-route cycle test documents that identical behaviour.
+    /// leak: every cycle records the same journal provenance upload count,
+    /// decodes identically, and holds post-teardown free VRAM at the
+    /// post-warmup plateau within 256 MiB slack. Manifest uploads are
+    /// pool-backed and teardown returns every buffer to the pool, so the
+    /// pool-hit counters and driver free VRAM both stabilize after warmup.
     #[test]
     fn pinned_fixture_repeated_load_unload_cycles_leak_nothing() {
         let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
@@ -2020,10 +2111,11 @@ mod tests {
         let cask = CaskConfig::default();
         test_support::reset();
         let mut baseline_tokens: Option<Vec<u32>> = None;
-        let mut published = 0usize;
+        let mut provenance_baseline = 0usize;
         let mut stabilized_free: usize = 0;
         for cycle in 0..4 {
             let (free_before, _) = gpu.hip.get_vram_info().expect("vram before cycle");
+            let (pool_new_before, pool_reused_before, _) = gpu.pool_stats();
             let alloc_before = test_support::resident_allocations();
             let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
             ctx.max_seq = max_seq;
@@ -2031,14 +2123,20 @@ mod tests {
             let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
                 .unwrap_or_else(|e| panic!("cycle {cycle} production load: {e}"));
             drop(ctx);
-            let delta = test_support::resident_allocations() - alloc_before;
+            // Journal provenance count: the immutable per-cycle upload tally
+            // (one record per fulfilled manifest entry). It is not an
+            // ownership claim — ownership lives with the typed weights owner.
+            let provenance = test_support::resident_allocations() - alloc_before;
             if cycle == 0 {
-                published = delta;
-                assert!(published > 0, "cycle must publish resident allocations");
+                provenance_baseline = provenance;
+                assert!(
+                    provenance_baseline > 0,
+                    "cycle must record fulfilled manifest uploads"
+                );
             } else {
                 assert_eq!(
-                    delta, published,
-                    "cycle {cycle} must publish exactly the warm baseline ({published})"
+                    provenance, provenance_baseline,
+                    "cycle {cycle} journal provenance must match the warm baseline upload count ({provenance_baseline})"
                 );
             }
             let tokens = greedy_decode(
@@ -2056,18 +2154,18 @@ mod tests {
             }
             Box::new(bundle).free_gpu(&mut gpu);
             let (free_after, _) = gpu.hip.get_vram_info().expect("vram after unload");
+            let (pool_new_after, pool_reused_after, pool_bytes) = gpu.pool_stats();
             eprintln!(
-                "g3-cycles: cycle {cycle} — published {delta} residents, free VRAM {free_before} -> {free_after}"
+                "g3-cycles: cycle {cycle} — provenance {provenance} uploads, free VRAM {free_before} -> {free_after}, pool new {pool_new_before}->{pool_new_after} reused {pool_reused_before}->{pool_reused_after} bytes_new {pool_bytes}"
             );
             // Cycle 0 pays one-time context cost (kernel modules, stream and
             // driver-side arena growth); cycle 1 sets the post-warmup
             // plateau level. Later cycles must hold that plateau within a
-            // small slack: post-teardown free VRAM that keeps declining per
-            // cycle is a leak, not pooling — pooling plateaus. (On current
-            // gfx1201 numbers this trips ~470MB/cycle; the legacy-route
-            // control receipt decides pool vs code: equal slope on the
-            // manifest-free legacy path exonerates these owners, whose
-            // teardown audit frees every buffer exactly once.)
+            // small slack. Pool-backed uploads plateau: freed weight buffers
+            // return to the pool and the next cycle reuses them, so
+            // `pool_new` stays flat and driver free VRAM holds. Steady
+            // per-cycle growth of `pool_new` with flat `pool_reused` would
+            // mean uploads bypass the pool while frees feed it.
             if cycle == 0 {
                 stabilized_free = free_after;
             } else if cycle == 1 {
@@ -2081,7 +2179,7 @@ mod tests {
         }
         assert!(baseline_tokens.is_some());
         eprintln!(
-            "g3-cycles: PASS — 4 load/unload cycles, per-cycle baseline {published} residents, decode identical, post-warmup VRAM plateau held"
+            "g3-cycles: PASS — 4 load/unload cycles, per-cycle provenance {provenance_baseline} uploads, decode identical, post-warmup VRAM plateau held"
         );
     }
 

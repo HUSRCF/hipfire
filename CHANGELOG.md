@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
+- Manifest-route weight uploads go through the GPU buffer pool (`weight_store` pooled fulfillment + pool-return rollback) instead of raw `hip.malloc` paired with pooled frees, so repeated load/unload cycles on one context hold post-warmup free VRAM flat instead of retaining ~one model's weights per cycle. Single plain-manifest transactional load only — the legacy loader path is unchanged. Provenance: per-cycle upload journal count, decode parity, and pool-hit counters in the pinned-fixture cycle test; pooled manifest vs legacy forwards bit-identical. AWQ numerics now rest on a post-`output_norm` quantized-lm_head oracle (uniform 2.0-vs-4.0 sidecars forward at an exact 2:1 logit ratio, alternating sidecar proves per-channel application); the pre-norm o_proj pair only records sidecar attachment since RMSNorm erases global scales.
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 

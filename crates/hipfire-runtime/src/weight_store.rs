@@ -381,8 +381,8 @@ impl WeightLoadTransaction {
     /// Consume this transaction and release every resident handle it owns.
     /// This is intentionally the only rollback operation exposed by the
     /// lifecycle API. Successful frees are reflected in the resident-release
-    /// accounting; any failed HIP free is returned to the caller.
-    pub fn rollback(mut self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+    /// accounting; any failed pool return is returned to the caller.
+    pub fn rollback(mut self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
         if let Some(store) = self.store.take() {
             store.rollback(gpu)
         } else {
@@ -544,7 +544,7 @@ impl WeightStore {
 
     /// Explicit rollback for a failed transaction. It consumes the partial
     /// store and frees every resident buffer on the single owning GPU.
-    fn rollback(self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+    fn rollback(self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
         self.release_unchecked(gpu)
     }
 
@@ -554,7 +554,7 @@ impl WeightStore {
     /// by assembly (or restored then re-taken) resolve to no placement and
     /// are skipped, so each resident is freed at most once; aliases own no
     /// buffer and are removed without GPU work.
-    fn release_unchecked(mut self, gpu: &Gpu) -> hip_bridge::HipResult<()> {
+    fn release_unchecked(mut self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
         let mut first_error = None;
         for key in self.journal.drain(..).rev() {
             let handle = match self.placements.remove(&key) {
@@ -562,7 +562,13 @@ impl WeightStore {
                 None => continue,
             };
             if let WeightHandle::Resident(tensor) = handle {
-                match gpu.hip.free(tensor.buf) {
+                // Pool return, not a raw HIP free: residents were uploaded
+                // through the pool (`upload_pooled_bytes`), and the
+                // steady-state teardown (`WeightTensor::free_all` →
+                // `Gpu::free_tensor`) releases to the same pool. A raw
+                // `hip.free` here would orphan pool bookkeeping; a pool
+                // return keeps the next fulfillment reusing these buffers.
+                match gpu.free_tensor(tensor) {
                     Ok(()) => {
                         RESIDENT_RELEASES.with(|count| count.set(count.get() + 1));
                     }
@@ -660,7 +666,32 @@ fn target_error(mesh: &DeviceMesh) -> Option<FulfillError> {
         ),
     })
 }
-fn rollback_fulfill_error(store: WeightStore, gpu: &Gpu, mut error: FulfillError) -> FulfillError {
+/// Upload raw weight bytes through the GPU buffer pool and retag the tensor
+/// with its logical shape.
+///
+/// This is the pool-backed twin of `Gpu::upload_raw`: the buffer comes from
+/// `Gpu::alloc_tensor` (exact byte size, `DType::Raw`) instead of a raw
+/// `hip.malloc`, so teardown (`Gpu::free_tensor` → pool return) hands the
+/// buffer back to the same pool the next fulfillment allocates from. A raw
+/// upload paired with a pooled free retains one model's worth of VRAM in the
+/// pool's free-lists per load/unload cycle without ever reusing it — driver
+/// free VRAM declines every cycle while the pool counters look flat.
+fn upload_pooled_bytes(
+    gpu: &mut Gpu,
+    bytes: &[u8],
+    logical_shape: &[usize],
+) -> hip_bridge::HipResult<GpuTensor> {
+    let mut tensor = gpu.alloc_tensor(&[bytes.len()], DType::Raw)?;
+    gpu.hip.memcpy_htod(&tensor.buf, bytes)?;
+    tensor.shape = logical_shape.to_vec();
+    Ok(tensor)
+}
+
+fn rollback_fulfill_error(
+    store: WeightStore,
+    gpu: &mut Gpu,
+    mut error: FulfillError,
+) -> FulfillError {
     if let Err(release_error) = store.rollback(gpu) {
         error
             .reason
@@ -687,7 +718,7 @@ pub fn fulfill_manifest_single<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     expected: WeightOrigin,
     source: F,
 ) -> Result<WeightLoadTransaction, FulfillError>
@@ -823,14 +854,14 @@ where
                 return Err(rollback_fulfill_error(store, gpu, error));
             }
         }
-        let mut tensor = match gpu.upload_raw(&bytes, &entry.logical_shape) {
+        let mut tensor = match upload_pooled_bytes(gpu, &bytes, &entry.logical_shape) {
             Ok(tensor) => tensor,
             Err(error) => {
                 let error = FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: 0,
-                    reason: format!("upload_raw failed: {error}"),
+                    reason: format!("pooled upload failed: {error}"),
                 };
                 return Err(rollback_fulfill_error(store, gpu, error));
             }
@@ -868,7 +899,7 @@ pub fn fulfill_manifest<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     expected: WeightOrigin,
     source: F,
 ) -> Result<WeightLoadTransaction, FulfillError>
@@ -1027,7 +1058,7 @@ mod tests {
 
     #[test]
     fn tied_projection_preserves_fulfilled_source_dtype() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
@@ -1049,7 +1080,7 @@ mod tests {
             },
         );
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &gpu, expected, |_| {
+        let transaction = fulfill_manifest_single(&[source, alias], &mesh, 1, &mut gpu, expected, |_| {
             Ok((vec![0; 4], DType::F32))
         })
         .unwrap();
@@ -1062,20 +1093,20 @@ mod tests {
             Some(WeightHandle::Alias(source)) if source == "source"
         ));
         transaction
-            .rollback(&gpu)
-            .expect("resident transaction rollback must free its HIP allocation");
+            .rollback(&mut gpu)
+            .expect("resident transaction rollback must return its buffers to the pool");
     }
 
     #[test]
     fn successful_single_fulfillment_commits_resident_projection() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let expected = WeightOrigin::for_single(&mesh, &gpu);
         let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, expected, |_| {
+            fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, expected, |_| {
                 Ok((vec![0; 4], DType::F32))
             })
             .unwrap();
@@ -1089,8 +1120,8 @@ mod tests {
             DType::F32
         );
         transaction
-            .rollback(&gpu)
-            .expect("resident transaction rollback must free its HIP allocation");
+            .rollback(&mut gpu)
+            .expect("resident transaction rollback must return its buffers to the pool");
     }
 
     #[test]
@@ -1113,7 +1144,7 @@ mod tests {
 
     #[test]
     fn full_origin_mismatch_does_not_free_a_resident_transaction() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
@@ -1121,7 +1152,7 @@ mod tests {
         let entry = WeightEntry::model("resident", vec![1], DType::F32, ShardPolicy::Replicate);
         let admitted = WeightOrigin::for_single(&mesh, &gpu);
         let transaction =
-            fulfill_manifest_single(&[entry], &mesh, 1, &gpu, admitted, |_| {
+            fulfill_manifest_single(&[entry], &mesh, 1, &mut gpu, admitted, |_| {
                 Ok((vec![0; 4], DType::F32))
             })
             .unwrap();
@@ -1135,14 +1166,14 @@ mod tests {
             "origin rejection must not free resident buffers"
         );
         transaction
-            .rollback(&gpu)
-            .expect("resident transaction rollback must free its HIP allocation");
+            .rollback(&mut gpu)
+            .expect("resident transaction rollback must return its buffers to the pool");
         assert_eq!(RESIDENT_RELEASES.with(std::cell::Cell::get), 1);
     }
 
     #[test]
     fn rollback_reports_free_failure_without_counting_release() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         test_support::reset();
@@ -1165,9 +1196,9 @@ mod tests {
             )
             .expect("insert borrowed resident test handle");
         let error = WeightLoadTransaction::new(store)
-            .rollback(&gpu)
-            .expect_err("rollback must surface a failed HIP free");
-        assert!(error.message.contains("borrowed"));
+            .rollback(&mut gpu)
+            .expect_err("rollback must surface a failed pool return");
+        assert!(error.message.contains("non-owning"));
         assert_eq!(test_support::resident_allocations(), 1);
         assert_eq!(test_support::resident_releases(), 0);
         test_support::reset();
@@ -1175,7 +1206,7 @@ mod tests {
 
     #[test]
     fn source_failure_after_resident_upload_rolls_back_everything() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
@@ -1185,7 +1216,7 @@ mod tests {
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
         ];
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &mut gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1204,7 +1235,7 @@ mod tests {
 
     #[test]
     fn dtype_failure_after_resident_upload_rolls_back_everything() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
@@ -1227,7 +1258,7 @@ mod tests {
             ),
         ];
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &mut gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1246,7 +1277,7 @@ mod tests {
 
     #[test]
     fn malformed_upload_payload_after_resident_allocation_rolls_back() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         RESIDENT_RELEASES.with(|count| count.set(0));
@@ -1256,7 +1287,7 @@ mod tests {
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
         ];
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, expected, |entry| {
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &mut gpu, expected, |entry| {
             if entry.name == "first" {
                 Ok((vec![0; 4], DType::F32))
             } else {
@@ -1271,7 +1302,7 @@ mod tests {
 
     #[test]
     fn admitted_origin_mismatch_fails_before_any_upload() {
-        let Ok(gpu) = Gpu::init() else {
+        let Ok(mut gpu) = Gpu::init() else {
             return;
         };
         test_support::reset();
@@ -1285,7 +1316,7 @@ mod tests {
             WeightEntry::model("first", vec![1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::model("second", vec![1], DType::F32, ShardPolicy::Replicate),
         ];
-        let error = fulfill_manifest_single(&entries, &mesh, 1, &gpu, stale, |_| {
+        let error = fulfill_manifest_single(&entries, &mesh, 1, &mut gpu, stale, |_| {
             panic!("source must not run after an admitted-identity mismatch")
         })
         .unwrap_err();
