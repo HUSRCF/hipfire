@@ -30,15 +30,10 @@ pub fn load_maple_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<MapleBun
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-            // A head overlay (hipfire-quantize --head-only) shadows the
-            // base's lm_head, so one body serves several head carriers.
-            crate::bundle::load_maple_from_hfq_with_head(
-                &mut hfq,
-                ctx.gpu,
-                ctx.max_seq,
-                &raw,
-                ctx.head_path.map(std::path::Path::new),
-            )
+            // A `--head` overlay, if any, was already validated and attached
+            // to this source in `admit_source` before teardown — consume it
+            // as-is, never reopen.
+            crate::bundle::load_maple_from_hfq(&mut hfq, ctx.gpu, ctx.max_seq, &raw)
         }
         ModelSource::Dir(_) => Err(
             "maple: safetensors-directory loading is unsupported — convert first with \

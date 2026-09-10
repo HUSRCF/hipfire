@@ -405,6 +405,14 @@ impl HfqFile {
     pub fn attach_head_overlay(&mut self, head_path: &Path) -> Result<(), String> {
         let ov = Self::open_at_offset(head_path, 0)
             .map_err(|e| format!("head overlay {head_path:?}: {e}"))?;
+        self.attach_opened_head(ov, head_path)
+    }
+
+    /// Attach an already-open, range-validated head overlay file. Same entry
+    /// guards as [`Self::attach_head_overlay`]; the open step lives with the
+    /// caller so admission can validate and retain the effective base+head
+    /// source before any teardown, and loading consumes it without reopening.
+    pub fn attach_opened_head(&mut self, ov: HfqFile, head_path: &Path) -> Result<(), String> {
         // A head overlay must contain ONLY head tensors. Without this, passing
         // a full model to --head "succeeds": every name exists in the base with
         // a matching shape, so attach_overlay's guards all pass and the entire
@@ -657,6 +665,28 @@ impl HfqFile {
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
 
+            // Every indexed payload range must lie within the file: a
+            // truncated container (valid header/index, short payload) must
+            // refuse here, not attach and serve corrupted logits later.
+            // Extents pack contiguously from data_offset, so each tensor's
+            // end is checked as it is indexed.
+            let end = cumulative_offset
+                .checked_add(data_size)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("HfqFile: tensor '{name}' payload size overflows usize"),
+                    )
+                })?;
+            if end > file_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "HfqFile: tensor '{name}' payload [{cumulative_offset}, {end}) \
+                         extends past the {file_len}-byte file (truncated container)"
+                    ),
+                ));
+            }
             tensor_map.insert(name.clone(), i);
             tensors.push(HfqTensorInfo {
                 name,
@@ -666,7 +696,7 @@ impl HfqFile {
                 data_offset: cumulative_offset,
                 data_size,
             });
-            cumulative_offset += data_size;
+            cumulative_offset = end;
         }
         let me = Self {
             _file: file,
@@ -1012,6 +1042,13 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
+            // A short read means the file shrank after a successful open
+            // (open validates every indexed range up front). Return None so
+            // the caller refuses — never hand back a zero-filled tail as if
+            // it were weights.
+            if total_read < info.data_size {
+                return None;
+            }
             // Evict these pages from cache — works because pread doesn't hold a
             // mapping. Skipped when the loader disabled eviction (discrete-GPU
             // loads want the page cache warm for repeat loads).
@@ -1075,6 +1112,13 @@ impl HfqFile {
                     break;
                 }
                 total_read += n as usize;
+            }
+            // A short read means the file shrank after a successful open
+            // (open validates every indexed range up front). Return None so
+            // the caller refuses — never hand back a zero-filled tail as if
+            // it were weights.
+            if total_read < info.data_size {
+                return None;
             }
             if self.evict_page_cache {
                 fadvise_dontneed(fd, info.data_offset, info.data_size);
@@ -2641,5 +2685,108 @@ mod overlay_tests {
         let mut f = HfqFile::open(&base).unwrap();
         let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
         assert!(err.contains("'Z' not present in base"), "got: {err}");
+    }
+
+    fn write_head_pair(dir: &std::path::Path, byte: u8) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = dir.join("base.hfq");
+        let head = dir.join("head.hfq");
+        write_min_hfq(
+            &base,
+            15,
+            &[
+                ("model.embed_tokens.weight", 1, &[4, 4], &vec![0u8; 32]),
+                ("lm_head.weight", 3, &[2, 4], &vec![1u8; 32]),
+            ],
+        );
+        write_min_hfq(&head, 15, &[("lm_head.weight", 13, &[2, 4], &vec![byte; 32])]);
+        (base, head)
+    }
+
+    #[test]
+    fn truncated_payload_open_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        let err = HfqFile::open_at_offset(&head, 0).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "got: {err}");
+    }
+
+    #[test]
+    fn short_read_vec_returns_none_not_zero_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let f = HfqFile::open(&head).unwrap();
+        assert!(f.tensor_data_vec("lm_head.weight").is_some());
+        // Shrink the file after a successful open: the indexed range no
+        // longer reads fully, so the call must refuse, not zero-fill.
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        assert!(
+            f.tensor_data_vec("lm_head.weight").is_none(),
+            "short pread must refuse, not return zero-filled weights"
+        );
+    }
+
+    #[test]
+    fn short_read_pread_returns_none_not_zero_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let f = HfqFile::open(&head).unwrap();
+        assert!(f.tensor_data_pread("lm_head.weight").is_some());
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        assert!(
+            f.tensor_data_pread("lm_head.weight").is_none(),
+            "short pread must refuse, not return zero-filled weights"
+        );
+    }
+
+    #[test]
+    fn opened_head_attaches_and_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, head) = write_head_pair(dir.path(), 7);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&head).unwrap();
+        f.attach_opened_head(ov, &head).expect("valid head attaches");
+        let (_, data) = f.tensor_data("lm_head.weight").expect("head served");
+        assert_eq!(data, &vec![7u8; 32], "overlay shadows the base head");
+    }
+
+    #[test]
+    fn opened_head_full_model_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = write_head_pair(dir.path(), 7);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&base).unwrap();
+        let err = f.attach_opened_head(ov, &base).unwrap_err();
+        assert!(err.contains("expected only"), "got: {err}");
+    }
+
+    #[test]
+    fn opened_head_empty_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = write_head_pair(dir.path(), 7);
+        let empty = dir.path().join("empty.hfq");
+        write_min_hfq(&empty, 15, &[]);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&empty).unwrap();
+        let err = f.attach_opened_head(ov, &empty).unwrap_err();
+        assert!(err.contains("no tensors"), "got: {err}");
     }
 }

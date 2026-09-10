@@ -1667,6 +1667,7 @@ fn main() {
                     draft_path.as_deref(),
                     gpu.arch.as_str(),
                     vision_path.as_deref(),
+                    head_path.as_deref(),
                 ) {
                     Ok(a) => a,
                     Err(e) => {
@@ -1759,7 +1760,6 @@ fn main() {
                         deepseek4_experts_per_token,
                         deepseek4_compute_placement,
                         draft_path.as_deref(),
-                        head_path.as_deref(),
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
                         kv_mode_override.as_deref(),

@@ -51,7 +51,6 @@ fn main() {
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         vision_path: None,
-        head_path: None,
     };
 
     let mut bundle = load_llama_bundle(src, &mut ctx).expect("load llama bundle");

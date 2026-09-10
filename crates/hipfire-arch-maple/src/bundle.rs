@@ -86,7 +86,9 @@ pub fn resolve_eos(tokenizer: &hipfire_runtime::tokenizer::Tokenizer) -> u32 {
 /// `kv_mode_raw` is the UNRESOLVED request string (`--kv-mode`, `""` for the
 /// default). It is resolved here rather than by the caller because this is the
 /// first point where `config.head_dim` exists, and `resolve` takes it. Modes
-/// outside `MAPLE_POLICY`'s accept set fall back to q8 with a warning.
+/// outside `MAPLE_POLICY`'s accept set fall back to the site default (bf16)
+/// with a warning — never silently serving a tier that cannot carry Maple's
+/// 3:1 sliding-window layers.
 pub fn load_maple_from_hfq(
     hfq: &mut HfqFile,
     gpu: &mut Gpu,
