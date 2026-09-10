@@ -154,12 +154,36 @@ fn parse_wire_attempt_id(value: Option<&serde_json::Value>) -> Option<u64> {
     None
 }
 
-/// Require a present numeric attempt_id on the wire.
+/// Require a present, nonzero numeric attempt_id on the wire.
+///
+/// Zero is reserved for uncorrelated control-plane envelopes. It must never
+/// enter singleton or continuous-batch generation ownership.
 fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'static str> {
     match value {
         None => Err("missing attempt_id"),
-        Some(_) => parse_wire_attempt_id(value).ok_or("malformed attempt_id"),
+        Some(_) => match parse_wire_attempt_id(value) {
+            None => Err("malformed attempt_id"),
+            Some(0) => Err("attempt_id must be nonzero"),
+            Some(id) => Ok(id),
+        },
     }
+}
+
+/// Announce a generate key only after the command has a valid nonzero attempt.
+///
+/// `None` means the request is malformed or uses reserved attempt zero and
+/// must continue to main for one uncorrelated validation error. `Some(false)`
+/// is a duplicate live key and must be dropped before dispatch.
+fn announce_generate_terminal(msg: &serde_json::Value) -> Option<(&str, u64, bool)> {
+    if msg.get("type").and_then(|v| v.as_str()) != Some("generate") {
+        return None;
+    }
+    let id = msg.get("id").and_then(|v| v.as_str())?;
+    let attempt_id = parse_wire_attempt_id(msg.get("attempt_id"))?;
+    if attempt_id == 0 {
+        return None;
+    }
+    Some((id, attempt_id, batch_announce_terminal(id, attempt_id)))
 }
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
@@ -835,20 +859,16 @@ fn main() {
                         }
                         continue;
                     }
-                    // Batch: announce every well-formed generate key before queueing.
-                    // Duplicate (id, attempt_id) must not enqueue or mutate the live registry.
-                    if msg.get("type").and_then(|v| v.as_str()) == Some("generate") {
-                        if let (Some(id), Some(attempt_id)) = (
-                            msg.get("id").and_then(|v| v.as_str()),
-                            msg.get("attempt_id").and_then(|v| v.as_u64()),
-                        ) {
-                            if !batch_announce_terminal(id, attempt_id) {
-                                eprintln!(
-                                    "[batch] duplicate generate dropped id={} attempt_id={}; preserving live registry",
-                                    id, attempt_id
-                                );
-                                continue;
-                            }
+                    // Batch: announce only well-formed, nonzero generate
+                    // keys before queueing. Reserved attempt zero continues
+                    // to main for one uncorrelated validation error.
+                    if let Some((id, attempt_id, is_new)) = announce_generate_terminal(&msg) {
+                        if !is_new {
+                            eprintln!(
+                                "[batch] duplicate generate dropped id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
+                            continue;
                         }
                     }
 
@@ -4439,13 +4459,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_vision_mode_gate, emit_batch_admission_error};
-    use hipfire_engine::emit::emit_active_attempt_error;
+    use super::{
+        announce_generate_terminal, apply_vision_mode_gate, emit_batch_admission_error,
+        require_wire_attempt_id,
+    };
+    use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
         batch_announce_terminal, batch_clear_all_terminals, batch_clear_terminal,
-        batch_terminal_control, clear_terminal_control, set_active_attempt_id, AttemptKey,
-        BatchAttemptScope,
+        batch_terminal_control, clear_terminal_control, set_active_attempt_id, terminal_generation,
+        AttemptKey, BatchAttemptScope,
     };
+
+    static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn vision_mode_off_drops_even_an_explicit_sidecar() {
@@ -4470,10 +4496,87 @@ mod tests {
     }
 
     #[test]
+    fn zero_generate_attempt_is_rejected_before_lifecycle_admission() {
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap();
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+
+        let zero = serde_json::json!({
+            "type": "generate",
+            "id": "req-zero",
+            "attempt_id": 0,
+        });
+        assert_eq!(announce_generate_terminal(&zero), None);
+        assert_eq!(
+            require_wire_attempt_id(zero.get("attempt_id")),
+            Err("attempt_id must be nonzero")
+        );
+        assert!(
+            batch_terminal_control()
+                .mu
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "reserved attempt zero must never enter the batch registry"
+        );
+        assert!(
+            terminal_generation("req-zero", 0).is_none(),
+            "reserved attempt zero must never activate singleton state"
+        );
+
+        // The rejected raw request still gets one observable, routeable
+        // validation envelope. Its id is retained while attempt zero remains
+        // the explicit uncorrelated channel.
+        let reason = require_wire_attempt_id(zero.get("attempt_id")).unwrap_err();
+        let mut output = Vec::new();
+        emit_uncorrelated_error(
+            &mut output,
+            Some("req-zero"),
+            &format!("generate {reason}"),
+            "validation",
+            false,
+            false,
+        );
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "error");
+        assert_eq!(events[0]["id"], "req-zero");
+        assert_eq!(events[0]["attempt_id"], 0);
+        assert_eq!(events[0]["class"], "validation");
+        assert_eq!(events[0]["message"], "generate attempt_id must be nonzero");
+
+        // A normal nonzero request keeps the existing admission path.
+        let valid = serde_json::json!({
+            "type": "generate",
+            "id": "req-valid",
+            "attempt_id": 7,
+        });
+        assert_eq!(require_wire_attempt_id(valid.get("attempt_id")), Ok(7));
+        assert_eq!(
+            announce_generate_terminal(&valid),
+            Some(("req-valid", 7, true))
+        );
+        assert!(batch_terminal_control()
+            .mu
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&AttemptKey::new("req-valid", 7)));
+        batch_clear_terminal("req-valid", 7);
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
     fn admitted_generate_errors_are_keyed_and_cleanup_after_emit() {
-        static TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap();
         clear_terminal_control();
         batch_clear_all_terminals();
         set_active_attempt_id(0);

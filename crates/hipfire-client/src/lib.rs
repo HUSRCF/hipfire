@@ -2033,6 +2033,23 @@ mod tests {
     }
 
     #[test]
+    fn route_lifecycle_keyed_zero_error_stays_on_exact_pending_channel() {
+        let err = serde_json::json!({
+            "type": "error",
+            "id": "req-zero",
+            "message": "generate attempt_id must be nonzero",
+            "class": error_class::VALIDATION,
+            "retryable": false,
+            "rolled_back": false,
+            "attempt_id": 0,
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &err),
+            LifecycleRoute::Pending(("req-zero".into(), 0))
+        );
+    }
+
+    #[test]
     fn route_lifecycle_malformed_token_is_dropped() {
         let missing_id = serde_json::json!({"type":"token","text":"x","attempt_id":1});
         assert_eq!(
@@ -3404,6 +3421,56 @@ done
         assert_eq!(typed.attempt_id, 5);
         // Control plane remains healthy after a keyed generation error.
         engine.ping().expect("control not poisoned by keyed error");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_zero_error_reaches_exact_waiter() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-zero-attempt-{}-{}",
+            std::process::id(),
+            "waiter"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      # A raw daemon rejection remains routeable by its exact (id,
+      # attempt_id) key; the daemon never activates generation ownership.
+      echo '{"type":"error","id":"req-zero","message":"generate attempt_id must be nonzero","class":"validation","retryable":false,"rolled_back":false,"attempt_id":0}'
+      ;;
+    *'"ping"'*) echo '{"type":"pong"}' ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let err = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-zero","attempt_id":0}),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        let typed = err
+            .typed_daemon()
+            .expect("reserved-attempt validation error");
+        assert_eq!(typed.id.as_deref(), Some("req-zero"));
+        assert_eq!(typed.attempt_id, 0);
+        assert_eq!(typed.class, error_class::VALIDATION);
+        assert_eq!(typed.message, "generate attempt_id must be nonzero");
+        assert_eq!(
+            engine.active_attempt_id(),
+            None,
+            "zero-attempt rejection must not retain active client state"
+        );
+        engine
+            .ping()
+            .expect("control plane remains healthy after zero rejection");
         drop(engine);
         let _ = fs::remove_dir_all(root);
     }
