@@ -396,11 +396,11 @@ pub fn ep_serve_qwen35_dense_tp(
     m.conversation_tokens.clear();
     // `primed_think` preserves Jinja enable_thinking semantics (render ended on
     // an open `<think>` primer). Tool requests fail closed before this route.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         primed_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
 
     let t_prefill = Instant::now();
@@ -767,7 +767,9 @@ pub fn ep_emit_done(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
     }
 }
@@ -886,10 +888,12 @@ pub fn ep_emit_abort(
         return;
     }
     let attempt_id = active_attempt_id();
+    if !claim_wire_terminal(id, attempt_id) {
+        return;
+    }
     let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
     let _ = writeln!(stdout, "{}", aborted);
     let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -1035,7 +1039,12 @@ pub fn ep_serve_ds4(
     // a bespoke decode loop, so unlike the single-device AR/spec paths it does
     // not inherit their emitter-side latch.  Open it after all early request
     // validation but before prefill/decode can produce a client event.
-    emit_ds4_ep_gen_start(stdout, id, think_mode);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ep),
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+    );
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -1393,7 +1402,7 @@ pub fn ep_serve_ds4(
         );
     }
 
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done_value(stdout, &pending_done);
     let _ = stdout.flush();
 }
 
@@ -1452,7 +1461,11 @@ pub fn ep_serve_minimax(
             lcp += 1;
         }
         let cache_hit = lcp > 0 && lcp < prompt_n;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
                 prior_len,
@@ -1701,7 +1714,9 @@ pub fn ep_serve_minimax(
 /// byte-consistent — a mismatch would break the LCP forward-extension.
 pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
     hipfire_runtime::prompt_frame::qwen35_history_render(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         model_path,
     )
 }
@@ -1787,7 +1802,11 @@ pub fn plan_from_rendered(
         while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
             lcp += 1;
         }
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
                 prior_len,
@@ -2024,7 +2043,10 @@ pub fn generate_dflash(
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
     // fail closed (see match below).
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let mut started_in_think = matches!(
         assistant_prefix,
@@ -2176,7 +2198,10 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -2184,7 +2209,9 @@ pub fn generate_dflash(
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
     // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
+    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+        .ok()
+        .as_deref()
         != Some("0")
         && m.eviction.is_none();
     let dflash_ckpt_positions: Vec<usize> = m
@@ -2232,8 +2259,10 @@ pub fn generate_dflash(
                     primer
                 };
             let cache_ref = &mut m.asst_turn_cache;
-            let trace_cache =
-                hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+            let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1");
             let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 hist,
@@ -2359,7 +2388,9 @@ pub fn generate_dflash(
     // reach SpecEmit so ToolOutputRouter parses native XML; withholding them
     // used to leak `<tool_call>` as assistant content (Hermes never executed).
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
     let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
@@ -2383,7 +2414,10 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                 && temp <= 1e-6
                 && max_think_tokens == 1,
         });
@@ -2395,11 +2429,11 @@ pub fn generate_dflash(
     // Advertise semantic-v2 only when this turn's arch has a correlated
     // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
     // use whole-output tool extraction and stay on legacy contract.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
         stdout,
         id,
         started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
     let run = match generate_spec(
         m,
@@ -2646,7 +2680,11 @@ pub fn generate_dflash(
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
                 if action.store {
-                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         eprintln!(
                             "[qwen-cache store dflash] fp_text.len={} tool_calls={} preview={:?}",
                             action.fingerprint_text.len(),
@@ -2656,7 +2694,9 @@ pub fn generate_dflash(
                     }
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, seq| {
-                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                                .ok()
+                                .as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
@@ -2683,7 +2723,7 @@ pub fn generate_dflash(
                         cached_seq,
                     );
                 }
-                emit_staged_terminal_done(stdout, &pending_done);
+                crate::ar::emit_active_route_done_value(stdout, &pending_done);
             }
         }
     } else {
@@ -2814,7 +2854,11 @@ pub fn generate_dflash(
             let emit_text =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                     "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
@@ -2833,7 +2877,7 @@ pub fn generate_dflash(
                 },
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
@@ -3019,7 +3063,11 @@ pub fn generate_spec(
         // bookkeeping remains.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
             prefill_start,
@@ -3664,7 +3712,10 @@ pub fn generate_spec(
                 }
             };
             if repaired
-                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
             {
                 eprintln!(
                     "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
@@ -4433,7 +4484,10 @@ pub fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -4720,7 +4774,9 @@ pub fn generate_multi(
     // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
@@ -4875,10 +4931,11 @@ pub fn generate_multi(
     // and runs to max_tokens. Mark the latch position and hard-EOS once
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
-    let post_latch_answer_budget: usize = hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(768);
+    let post_latch_answer_budget: usize =
+        hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
@@ -5375,7 +5432,7 @@ pub fn generate_multi(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done_value(stdout, &pending_done);
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---

@@ -34,6 +34,8 @@ use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::Instant;
 
@@ -850,6 +852,563 @@ impl GenerationRoute {
         }
     }
 }
+/// Terminal kind used by the production route adapter registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminal {
+    Done,
+    Error,
+    Cancel,
+}
+
+/// Terminal payload accepted by every production route adapter. The borrowed
+/// payload keeps the adapter seam allocation-free for normal done/error paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminalEvent<'a> {
+    Done {
+        pending: Option<&'a serde_json::Value>,
+    },
+    Error {
+        id: Option<&'a str>,
+        message: Option<&'a str>,
+        class: &'a str,
+        retryable: bool,
+        rolled_back: bool,
+    },
+    Cancel {
+        completion_tokens: usize,
+    },
+}
+
+pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
+pub type RouteTerminalAdapter = for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>);
+
+thread_local! {
+    /// A route can fall through from speculative capacity checks into AR.
+    /// Keep the start edge one-shot per `(id, attempt)` so a producer adapter
+    /// can be installed at both boundaries without duplicating `gen_start`.
+    static ROUTE_START_LATCH: RefCell<HashSet<(String, u64)>> = RefCell::new(HashSet::new());
+    static ACTIVE_GENERATION_ROUTE: Cell<Option<GenerationRoute>> =
+        const { Cell::new(None) };
+}
+
+fn claim_route_start(id: &str, attempt: u64) -> bool {
+    ROUTE_START_LATCH.with(|latch| latch.borrow_mut().insert((id.to_owned(), attempt)))
+}
+
+fn release_route_start(id: &str, attempt: u64) {
+    ROUTE_START_LATCH.with(|latch| {
+        latch.borrow_mut().remove(&(id.to_owned(), attempt));
+    });
+}
+
+/// Set the route used by route-aware production terminal wrappers for the
+/// current generation thread.
+pub fn set_generation_route(route: GenerationRoute) {
+    ACTIVE_GENERATION_ROUTE.with(|active| active.set(Some(route)));
+}
+
+struct GenerationRouteScope {
+    id: String,
+    attempt: u64,
+}
+
+impl GenerationRouteScope {
+    fn enter(route: GenerationRoute, id: &str) -> Self {
+        set_generation_route(route);
+        Self {
+            id: id.to_owned(),
+            attempt: active_attempt_id(),
+        }
+    }
+}
+
+impl Drop for GenerationRouteScope {
+    fn drop(&mut self) {
+        release_route_start(&self.id, self.attempt);
+        ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
+    }
+}
+
+pub fn active_generation_route() -> Option<GenerationRoute> {
+    ACTIVE_GENERATION_ROUTE.with(Cell::get)
+}
+
+/// Concrete start/terminal pair for one selected generation route.
+#[derive(Clone, Copy)]
+pub struct GenerationRouteAdapter {
+    pub route: GenerationRoute,
+    pub start: RouteStartAdapter,
+    pub terminal: RouteTerminalAdapter,
+}
+
+impl GenerationRouteAdapter {
+    /// Emit the default route start used by route-cardinality tests.
+    pub fn emit_start(self, output: &mut dyn Write, id: &str) {
+        self.emit_start_with(output, id, false);
+    }
+
+    /// Emit a route start from a real producer. The latch lives in the
+    /// production adapter so fallback paths cannot write a second `gen_start`.
+    pub fn emit_start_with(self, output: &mut dyn Write, id: &str, started_in_think: bool) {
+        if claim_route_start(id, active_attempt_id()) {
+            (self.start)(output, id, started_in_think);
+        }
+    }
+
+    /// Compact route-only terminal used by the exhaustive barrier test.
+    pub fn emit_terminal(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        terminal: RouteTerminal,
+    ) {
+        let event = match terminal {
+            RouteTerminal::Done => RouteTerminalEvent::Done { pending: None },
+            RouteTerminal::Error => RouteTerminalEvent::Error {
+                id: Some(id),
+                message: None,
+                class: "internal",
+                retryable: false,
+                rolled_back: true,
+            },
+            RouteTerminal::Cancel => RouteTerminalEvent::Cancel {
+                completion_tokens: 0,
+            },
+        };
+        self.emit_terminal_event(output, id, attempt, event);
+    }
+
+    pub fn emit_done(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        pending: &serde_json::Value,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Done {
+                pending: Some(pending),
+            },
+        );
+    }
+
+    pub fn emit_error(
+        self,
+        output: &mut dyn Write,
+        id: Option<&str>,
+        attempt: u64,
+        message: &str,
+        class: &str,
+        retryable: bool,
+        rolled_back: bool,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id.unwrap_or(""),
+            attempt,
+            RouteTerminalEvent::Error {
+                id,
+                message: Some(message),
+                class,
+                retryable,
+                rolled_back,
+            },
+        );
+    }
+
+    pub fn emit_cancel(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        completion_tokens: usize,
+    ) {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Cancel { completion_tokens },
+        );
+    }
+
+    fn emit_terminal_event(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        event: RouteTerminalEvent<'_>,
+    ) {
+        (self.terminal)(output, id, attempt, event);
+        release_route_start(id, attempt);
+    }
+}
+
+fn emit_route_terminal(
+    output: &mut dyn Write,
+    id: &str,
+    _attempt: u64,
+    event: RouteTerminalEvent<'_>,
+    route_name: &'static str,
+) {
+    let mut buffer = Vec::new();
+    match event {
+        RouteTerminalEvent::Done {
+            pending: Some(pending),
+        } => {
+            emit_staged_terminal_done(&mut buffer, pending);
+        }
+        RouteTerminalEvent::Done { pending: None } => {
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": active_attempt_id(),
+                "finish_reason": "stop",
+            });
+            emit_staged_terminal_done(&mut buffer, &pending);
+        }
+        RouteTerminalEvent::Error {
+            id: event_id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        } => {
+            let fallback;
+            let message = match message {
+                Some(message) => message,
+                None => {
+                    fallback = format!("{route_name} terminal error");
+                    &fallback
+                }
+            };
+            emit_active_attempt_error(
+                &mut buffer,
+                event_id,
+                message,
+                class,
+                retryable,
+                rolled_back,
+            );
+        }
+        RouteTerminalEvent::Cancel { completion_tokens } => {
+            emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        }
+    }
+    let _ = output.write_all(&buffer);
+}
+
+macro_rules! define_route_start {
+    ($name:ident, $arch:expr) => {
+        fn $name(output: &mut dyn Write, id: &str, started_in_think: bool) {
+            let mut buffer = Vec::new();
+            emit_gen_start(
+                &mut buffer,
+                id,
+                started_in_think,
+                gen_start_contract_version_for_arch($arch),
+            );
+            let _ = output.write_all(&buffer);
+        }
+    };
+}
+
+macro_rules! define_route_terminal {
+    ($name:ident, $route:expr) => {
+        fn $name(output: &mut dyn Write, id: &str, attempt: u64, event: RouteTerminalEvent<'_>) {
+            emit_route_terminal(output, id, attempt, event, $route.name());
+        }
+    };
+}
+
+define_route_start!(qwen_ar_route_start, 5);
+define_route_start!(qwen_dflash_route_start, 5);
+define_route_start!(qwen2_ar_route_start, 7);
+define_route_start!(qwen2_spec_route_start, 7);
+define_route_start!(deepseek4_ar_route_start, 9);
+fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str, started_in_think: bool) {
+    let mut buffer = Vec::new();
+    crate::qwen::emit_ds4_ep_gen_start(
+        &mut buffer,
+        id,
+        if started_in_think {
+            ThinkMode::Low
+        } else {
+            ThinkMode::NonThink
+        },
+    );
+    let _ = output.write_all(&buffer);
+}
+define_route_start!(deepseek4_spec_route_start, 9);
+define_route_start!(cohere_ar_route_start, 12);
+define_route_start!(cohere_spec_route_start, 12);
+define_route_start!(maple_ar_route_start, 15);
+define_route_start!(minimax_ar_route_start, 10);
+define_route_start!(minimax_ep_route_start, 10);
+define_route_start!(minimax_spec_route_start, 10);
+define_route_start!(lfm_ar_route_start, 11);
+define_route_start!(lfm_spec_route_start, 11);
+define_route_start!(llama_ar_route_start, 0);
+define_route_start!(llama_spec_route_start, 0);
+define_route_start!(glimmer_ar_route_start, 14);
+define_route_start!(glimmer_spec_route_start, 14);
+define_route_start!(pipeline_parallel_route_start, 5);
+define_route_start!(dots_ocr_route_start, 8);
+define_route_start!(unknown_route_start, 255);
+
+define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
+define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
+define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
+define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
+define_route_terminal!(deepseek4_ar_route_terminal, GenerationRoute::Deepseek4Ar);
+define_route_terminal!(deepseek4_ep_route_terminal, GenerationRoute::Deepseek4Ep);
+define_route_terminal!(
+    deepseek4_spec_route_terminal,
+    GenerationRoute::Deepseek4Spec
+);
+define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
+define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
+define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
+define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
+define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
+define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
+define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
+define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
+define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
+define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
+define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(
+    pipeline_parallel_route_terminal,
+    GenerationRoute::PipelineParallel
+);
+define_route_terminal!(dots_ocr_route_terminal, GenerationRoute::DotsOcr);
+define_route_terminal!(unknown_route_terminal, GenerationRoute::Unknown);
+
+/// Return the concrete lifecycle producer adapter for every route in
+/// `GenerationRoute::ALL`. `None` is reserved for future variants.
+pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRouteAdapter> {
+    let adapter = match route {
+        GenerationRoute::QwenAr => GenerationRouteAdapter {
+            route,
+            start: qwen_ar_route_start,
+            terminal: qwen_ar_route_terminal,
+        },
+        GenerationRoute::QwenDflash => GenerationRouteAdapter {
+            route,
+            start: qwen_dflash_route_start,
+            terminal: qwen_dflash_route_terminal,
+        },
+        GenerationRoute::Qwen2Ar => GenerationRouteAdapter {
+            route,
+            start: qwen2_ar_route_start,
+            terminal: qwen2_ar_route_terminal,
+        },
+        GenerationRoute::Qwen2Spec => GenerationRouteAdapter {
+            route,
+            start: qwen2_spec_route_start,
+            terminal: qwen2_spec_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ar => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ar_route_start,
+            terminal: deepseek4_ar_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ep => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ep_route_start,
+            terminal: deepseek4_ep_route_terminal,
+        },
+        GenerationRoute::Deepseek4Spec => GenerationRouteAdapter {
+            route,
+            start: deepseek4_spec_route_start,
+            terminal: deepseek4_spec_route_terminal,
+        },
+        GenerationRoute::CohereAr => GenerationRouteAdapter {
+            route,
+            start: cohere_ar_route_start,
+            terminal: cohere_ar_route_terminal,
+        },
+        GenerationRoute::CohereSpec => GenerationRouteAdapter {
+            route,
+            start: cohere_spec_route_start,
+            terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::MapleAr => GenerationRouteAdapter {
+            route,
+            start: maple_ar_route_start,
+            terminal: maple_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxAr => GenerationRouteAdapter {
+            route,
+            start: minimax_ar_route_start,
+            terminal: minimax_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxEp => GenerationRouteAdapter {
+            route,
+            start: minimax_ep_route_start,
+            terminal: minimax_ep_route_terminal,
+        },
+        GenerationRoute::MiniMaxSpec => GenerationRouteAdapter {
+            route,
+            start: minimax_spec_route_start,
+            terminal: minimax_spec_route_terminal,
+        },
+        GenerationRoute::LfmAr => GenerationRouteAdapter {
+            route,
+            start: lfm_ar_route_start,
+            terminal: lfm_ar_route_terminal,
+        },
+        GenerationRoute::LfmSpec => GenerationRouteAdapter {
+            route,
+            start: lfm_spec_route_start,
+            terminal: lfm_spec_route_terminal,
+        },
+        GenerationRoute::LlamaAr => GenerationRouteAdapter {
+            route,
+            start: llama_ar_route_start,
+            terminal: llama_ar_route_terminal,
+        },
+        GenerationRoute::LlamaSpec => GenerationRouteAdapter {
+            route,
+            start: llama_spec_route_start,
+            terminal: llama_spec_route_terminal,
+        },
+        GenerationRoute::GlimmerAr => GenerationRouteAdapter {
+            route,
+            start: glimmer_ar_route_start,
+            terminal: glimmer_ar_route_terminal,
+        },
+        GenerationRoute::GlimmerSpec => GenerationRouteAdapter {
+            route,
+            start: glimmer_spec_route_start,
+            terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::PipelineParallel => GenerationRouteAdapter {
+            route,
+            start: pipeline_parallel_route_start,
+            terminal: pipeline_parallel_route_terminal,
+        },
+        GenerationRoute::DotsOcr => GenerationRouteAdapter {
+            route,
+            start: dots_ocr_route_start,
+            terminal: dots_ocr_route_terminal,
+        },
+        GenerationRoute::Unknown => GenerationRouteAdapter {
+            route,
+            start: unknown_route_start,
+            terminal: unknown_route_terminal,
+        },
+    };
+    Some(adapter)
+}
+
+fn production_route_adapter(route: GenerationRoute) -> GenerationRouteAdapter {
+    generation_route_adapter(route)
+        .unwrap_or_else(|| unreachable!("missing production adapter for {}", route.name()))
+}
+
+pub fn emit_generation_start(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    started_in_think: bool,
+) {
+    set_generation_route(route);
+    production_route_adapter(route).emit_start_with(output, id, started_in_think);
+}
+
+pub fn emit_generation_done(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    pending: &serde_json::Value,
+) {
+    production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
+}
+
+pub fn emit_generation_error(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    production_route_adapter(route).emit_error(
+        output,
+        id,
+        active_attempt_id(),
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
+}
+
+pub fn emit_generation_cancel(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    completion_tokens: usize,
+) {
+    production_route_adapter(route).emit_cancel(output, id, active_attempt_id(), completion_tokens);
+}
+
+pub fn emit_active_route_error(
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_error(route, output, id, message, class, retryable, rolled_back);
+    } else {
+        let mut buffer = Vec::new();
+        hipfire_engine::emit::emit_active_attempt_error(
+            &mut buffer,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        );
+        let _ = output.write_all(&buffer);
+    }
+}
+
+pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_done(route, output, id, pending);
+    } else {
+        let mut buffer = Vec::new();
+        emit_staged_terminal_done(&mut buffer, pending);
+        let _ = output.write_all(&buffer);
+    }
+}
+pub fn emit_active_route_done_value(output: &mut dyn Write, pending: &serde_json::Value) {
+    let id = pending
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    emit_active_route_done(output, id, pending);
+}
+
+pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tokens: usize) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_cancel(route, output, id, completion_tokens);
+    } else {
+        let mut buffer = Vec::new();
+        emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        let _ = output.write_all(&buffer);
+    }
+}
 
 /// Pure inputs for [`select_generation_route`]. No GPU/env side effects.
 #[derive(Debug, Clone, Copy)]
@@ -1162,6 +1721,7 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
@@ -2994,10 +3554,7 @@ pub fn generate(
         _ => None,
     };
     let prefill_tokens = new_tokens.len();
-    // Pure arch→contract selection (same function tests exercise).
-    // Qwen AR (5/6) advertises v2; DS4 and others stay unset.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, started_in_think, gen_contract);
+    emit_generation_start(selected_route, stdout, id, started_in_think);
     let t0 = Instant::now();
 
     if hipfire_loader::carrier_for(m.arch_id)
@@ -4370,7 +4927,7 @@ pub fn generate(
             );
         }
 
-        emit_staged_terminal_done(stdout, &pending_done);
+        emit_active_route_done(stdout, id, &pending_done);
     } else {
         // LLaMA path -- multi-turn aware
         let has_eviction = m.eviction.is_some();
@@ -4588,7 +5145,7 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
             ClientTerminalDecision::Abort => {
                 // Bring-up AR path has no full production rollback attestation;
                 // suppress success done on cancel/disconnect (fail-closed).
@@ -4659,7 +5216,7 @@ pub fn emit_qwen_ar_done(
         cached_tokens,
         pflash_fragment_json,
     );
-    emit_staged_terminal_done(stdout, &envelope);
+    emit_active_route_done(stdout, id, &envelope);
 }
 
 pub fn model_retry_reset_eligible(arch_id: u32) -> bool {

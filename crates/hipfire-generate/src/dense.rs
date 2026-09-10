@@ -57,6 +57,15 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    if crate::ar::active_generation_route().is_some() {
+        crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+        return;
+    }
+    if let Some(id) = id {
+        if !claim_wire_terminal(id, active_attempt_id()) {
+            return;
+        }
+    }
     write_error_envelope(
         stdout,
         id,
@@ -480,11 +489,11 @@ pub fn generate_deepseek4_spec(
     // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
     // begins in visible-answer mode; High/Max render the `<think>` open-token,
     // so it begins inside the reasoning span.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Spec),
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let prompt_tokens_total = prompt_ids.len();
     let run = match crate::qwen::generate_spec(
@@ -675,7 +684,7 @@ pub fn generate_deepseek4_spec(
                     run.streamed_tokens.clone(),
                 );
             }
-            emit_staged_terminal_done(stdout, &pending_done);
+            crate::ar::emit_active_route_done_value(stdout, &pending_done);
             // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
             eprintln!(
                 "[req {id}] drafter={drafter} tau={tau:.2} tok/s={tok_s:.1} decode ({} tok, {} windows, accept={accept_pct:.0}%)",
@@ -1188,11 +1197,11 @@ pub fn generate_deepseek4(
         // stream with "stream must begin with gen_start; got token before
         // contract latch". Placed after prefill and grammar setup but before
         // the first `sample_token`, so no token can outrun it.
-        emit_gen_start(
+        crate::ar::emit_generation_start(
+            crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ar),
             stdout,
             id,
             !matches!(think_mode, ThinkMode::NonThink),
-            ds4_gen_start_contract_version(),
         );
 
         // Apply mask to the prefill-returned logits before the first
@@ -1448,7 +1457,7 @@ pub fn generate_deepseek4(
                 cached_seq,
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done_value(stdout, &pending_done);
         // Per-request debug summary: this request ran autoregressive (no drafter),
         // e.g. spec disabled or a temp path the loaded drafter can't verify. Making
         // the AR fall-through visible is the point — a "stall" is often just AR.
@@ -1466,27 +1475,22 @@ pub fn ds4_heterogeneous_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
-    let reset = model.reset_for_request_attested();
-    match reset {
-        Ok(()) => {
-            eprintln!(
-                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
-            );
-            let (aborted, done) =
-                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
-            let _ = writeln!(stdout, "{aborted}");
-            let _ = writeln!(stdout, "{done}");
-            let _ = stdout.flush();
-        }
-        Err(error) => emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("client cancelled; heterogeneous rollback failed: {error}"),
-            "runtime",
-            false,
-            false,
-        ),
+    let epilogue = match model.reset_for_request_attested() {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(error) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(format!("heterogeneous rollback failed: {error}")),
+        },
+    };
+    if epilogue.rolled_back {
+        eprintln!(
+            "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+        );
     }
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_heterogeneous(
@@ -1608,11 +1612,11 @@ pub fn generate_deepseek4_heterogeneous(
         (logits, prefill_t0.elapsed().as_millis())
     };
 
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ar),
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let top_k = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOP_K")
         .ok()
@@ -1763,7 +1767,7 @@ pub fn generate_deepseek4_heterogeneous(
     m.conversation_tokens.clear();
     m.conversation_tokens.extend_from_slice(&prompt_ids);
     m.conversation_tokens.extend_from_slice(&emitted_tokens);
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done_value(stdout, &pending_done);
     eprintln!(
         "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
     );
@@ -2033,11 +2037,11 @@ pub fn generate_gemma4_lowered(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
         stdout,
         id,
         false,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
 
     let Some(bundle_ref) = m.gemma4_lowered_mut() else {
@@ -2315,8 +2319,12 @@ pub fn generate_gemma4(
     // StreamContractGate fail-closes on any event preceding `gen_start`, so
     // without this the first `token` is rejected, the client aborts, and the
     // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
+        stdout,
+        id,
+        false,
+    );
     let Some(bundle) = m
         .state
         .as_mut()
@@ -4344,7 +4352,7 @@ pub fn glimmer_commit_terminal(
 ) -> bool {
     match await_client_terminal_commit(stdout, id, pending_done) {
         ClientTerminalDecision::Commit => {
-            emit_staged_terminal_done(stdout, pending_done);
+            crate::ar::emit_active_route_done_value(stdout, pending_done);
             true
         }
         ClientTerminalDecision::Abort => {
@@ -4820,8 +4828,12 @@ pub fn generate_muse_glimmer(
     //
     // `gen_start` then `error` with no tokens in between is a legal sequence; latching early
     // costs nothing and makes every arch-14 failure routable.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::GlimmerAr),
+        stdout,
+        id,
+        false,
+    );
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
@@ -6740,8 +6752,12 @@ pub fn generate_lfm2moe(
     // This was the root cause of the 3-minute hang on native `hipfire serve`
     // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
     // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::LfmAr),
+        stdout,
+        id,
+        false,
+    );
 
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
@@ -6904,7 +6920,9 @@ pub fn generate_lfm2moe(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
@@ -7343,7 +7361,9 @@ pub fn generate_minimax(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -8085,7 +8105,9 @@ pub fn generate_cohere2moe(
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -8316,7 +8338,9 @@ pub fn generate_qwen2(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }
@@ -8824,11 +8848,11 @@ pub fn generate_maple(
     //     answer text: observed live on the first `.mq2lloydu` run, where the
     //     model's "The user wants me to write a hello world in Zig…" reasoning
     //     was returned as `content` with `reasoning_content` empty.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::MapleAr),
         stdout,
         id,
         primed_think,
-        crate::common::gen_start_contract_version_for_arch(15),
     );
 
     // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
@@ -9018,7 +9042,9 @@ pub fn generate_maple(
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {}
     }
 }

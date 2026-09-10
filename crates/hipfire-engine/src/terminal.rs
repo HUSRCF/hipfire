@@ -31,12 +31,15 @@ pub enum TerminalControlDecision {
 /// Active generate terminal-control transaction keyed by exact
 /// `(request id, attempt_id)`. The stdin reader posts matching
 /// `abort` (any time) / `commit` (only after ready); producers wait
-/// via [`await_client_terminal_commit`].
+/// via [`await_client_terminal_commit`]. Terminal writers claim the
+/// transaction before emitting a terminal so an abort/error race cannot
+/// produce a second terminal.
 pub struct ActiveTerminalControl {
     pub id: String,
     pub attempt_id: u64,
     pub ready: bool,
     pub decision: Option<TerminalControlDecision>,
+    pub terminal_claimed: bool,
 }
 
 pub struct TerminalControlState {
@@ -76,6 +79,7 @@ pub fn activate_terminal_control(id: &str, attempt_id: u64) {
         attempt_id,
         ready: false,
         decision: None,
+        terminal_claimed: false,
     });
     cell.cv.notify_all();
 }
@@ -86,6 +90,27 @@ pub fn clear_terminal_control() {
     let mut g = cell.mu.lock().unwrap();
     g.active = None;
     cell.cv.notify_all();
+}
+
+/// Claim the sole terminal slot for a matching active attempt.
+///
+/// Unknown/inactive attempts return `true` so pre-activation validation errors
+/// retain their existing wire behavior. Once an active attempt claims a
+/// terminal, a racing error/abort/done writer becomes a no-op.
+pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
+    let cell = terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let Some(active) = g.active.as_mut() else {
+        return true;
+    };
+    if active.id != id || active.attempt_id != attempt_id {
+        return true;
+    }
+    if active.terminal_claimed {
+        return false;
+    }
+    active.terminal_claimed = true;
+    true
 }
 
 /// Key for multiplexed terminal control and inbox, as required by the
@@ -131,18 +156,23 @@ pub struct BatchRegistryEntry {
     pub state: BatchRegistryState,
     pub abort_latched: bool,
     pub commit_latched: bool,
+    pub terminal_claimed: bool,
     pub pending_done: Option<serde_json::Value>,
     pub deadline: Option<Instant>,
 }
 
 pub struct BatchTerminalState {
     pub entries: std::collections::HashMap<AttemptKey, BatchRegistryEntry>,
+    /// Retired keys reject late writers after lane teardown. A fresh announce
+    /// removes the key so deliberate request/attempt reuse starts clean.
+    pub retired: std::collections::HashSet<AttemptKey>,
 }
 
 impl BatchTerminalState {
     pub fn new() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            retired: std::collections::HashSet::new(),
         }
     }
 }
@@ -160,6 +190,46 @@ pub fn batch_terminal_control() -> &'static BatchTerminalCell {
     })
 }
 
+/// Claim exactly one wire-terminal owner for a continuous-batch attempt.
+///
+/// Unknown keys are handled by [`claim_wire_terminal`], which falls back to
+/// the sequential singleton only when no batch lane owns the request.
+pub fn batch_claim_terminal(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    let Some(entry) = g.entries.get_mut(&key) else {
+        return false;
+    };
+    if entry.terminal_claimed {
+        return false;
+    }
+    entry.terminal_claimed = true;
+    cell.cv.notify_all();
+    true
+}
+
+/// Claim the wire-terminal boundary for either a continuous-batch lane or
+/// the sequential active attempt. Batch keys are checked first so a stale or
+/// wrong-attempt writer cannot fall through to the singleton claim.
+pub fn claim_wire_terminal(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    if let Some(entry) = g.entries.get_mut(&key) {
+        if entry.terminal_claimed {
+            return false;
+        }
+        entry.terminal_claimed = true;
+        cell.cv.notify_all();
+        return true;
+    }
+    if g.retired.contains(&key) || g.entries.keys().any(|candidate| candidate.id == id) {
+        return false;
+    }
+    claim_terminal(id, attempt_id)
+}
+
 /// Announce a generate key before queueing. Closes generate-then-immediate-
 /// abort races for requests that arrive while GPU work is active. Returns
 /// true if newly announced, false if already present.
@@ -170,12 +240,14 @@ pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
     if g.entries.contains_key(&key) {
         return false;
     }
+    g.retired.remove(&key);
     g.entries.insert(
         key,
         BatchRegistryEntry {
             state: BatchRegistryState::Announced,
             abort_latched: false,
             commit_latched: false,
+            terminal_claimed: false,
             pending_done: None,
             deadline: None,
         },
@@ -226,15 +298,12 @@ pub fn batch_mark_ready_with_pending(
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
-        match e.state {
-            BatchRegistryState::Active { owner: o } if o == owner => {
-                e.state = BatchRegistryState::Ready { owner };
-                e.pending_done = Some(pending_done);
-                e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
-                cell.cv.notify_all();
-                return true;
-            }
-            _ => {}
+        if matches!(e.state, BatchRegistryState::Active { owner: o } if o == owner) {
+            e.state = BatchRegistryState::Ready { owner };
+            e.pending_done = Some(pending_done);
+            e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
+            cell.cv.notify_all();
+            return true;
         }
     }
     false
@@ -247,18 +316,15 @@ pub fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
-        match e.state {
-            BatchRegistryState::Active { owner } => {
-                e.state = BatchRegistryState::Ready { owner };
-                e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
-                if e.pending_done.is_none() {
-                    e.pending_done =
-                        Some(serde_json::json!({"type":"done","id":id,"attempt_id":attempt_id}));
-                }
-                cell.cv.notify_all();
-                return true;
+        if let BatchRegistryState::Active { owner } = e.state {
+            e.state = BatchRegistryState::Ready { owner };
+            e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
+            if e.pending_done.is_none() {
+                e.pending_done =
+                    Some(serde_json::json!({"type":"done","id":id,"attempt_id":attempt_id}));
             }
-            _ => {}
+            cell.cv.notify_all();
+            return true;
         }
     }
     false
@@ -267,7 +333,9 @@ pub fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
 pub fn batch_clear_terminal(id: &str, attempt_id: u64) {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    g.entries.remove(&AttemptKey::new(id, attempt_id));
+    let key = AttemptKey::new(id, attempt_id);
+    g.entries.remove(&key);
+    g.retired.insert(key);
     cell.cv.notify_all();
 }
 
@@ -275,6 +343,7 @@ pub fn batch_clear_all_terminals() {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     g.entries.clear();
+    g.retired.clear();
     cell.cv.notify_all();
 }
 
@@ -692,10 +761,22 @@ pub fn await_client_terminal_commit(
 
 /// Emit a previously staged `done` envelope after Commit. Payload must be the
 /// same value passed to [`await_client_terminal_commit`] as `pending_done`.
+/// A matching active attempt may claim only one terminal envelope.
 pub fn emit_staged_terminal_done(
     stdout: &mut impl std::io::Write,
     pending_done: &serde_json::Value,
 ) {
+    if let Some(obj) = pending_done.as_object() {
+        if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
+            let attempt_id = obj
+                .get("attempt_id")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(active_attempt_id);
+            if !claim_wire_terminal(id, attempt_id) {
+                return;
+            }
+        }
+    }
     let _ = writeln!(stdout, "{}", pending_done);
     let _ = stdout.flush();
 }

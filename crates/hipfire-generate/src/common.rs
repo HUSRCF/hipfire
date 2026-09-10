@@ -201,7 +201,7 @@ pub fn emit_spec_cancel_after_rollback(
     epilogue: &RollbackEpilogue,
 ) {
     if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
+        crate::ar::emit_active_route_cancel(stdout, id, completion_tokens);
         return;
     }
     emit_fail_closed_error(
@@ -680,8 +680,12 @@ pub fn emit_committed_event(
     t_ms: u64,
 ) {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if !*ENABLED {
         return;
     }

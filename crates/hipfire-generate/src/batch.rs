@@ -141,8 +141,14 @@ pub fn is_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0"),
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
@@ -402,7 +408,7 @@ pub fn drive_qwen_continuous_batch(
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    emit_staged_terminal_done(stdout, &pending_done);
+                    crate::ar::emit_active_route_done_value(stdout, &pending_done);
                     producers[idx] = None;
                 }
             }
@@ -489,11 +495,11 @@ pub fn drive_qwen_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 false,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                             emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
@@ -660,11 +666,11 @@ pub fn drive_qwen_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 started_in_think,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                         }
                     } else if t == "abort" || t == "commit" {
@@ -1333,7 +1339,7 @@ pub fn drive_lfm_continuous_batch(
                     let _ = sched.abort_lane(idx, &key);
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    emit_staged_terminal_done(stdout, &pending_done);
+                    crate::ar::emit_active_route_done_value(stdout, &pending_done);
                 }
             }
         }
@@ -1446,7 +1452,12 @@ pub fn drive_lfm_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(stdout, &id, false, None);
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::LfmAr,
+                                stdout,
+                                &id,
+                                false,
+                            );
                             emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
@@ -1621,7 +1632,12 @@ pub fn drive_lfm_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(stdout, &id, started_in_think, None);
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::LfmAr,
+                                stdout,
+                                &id,
+                                started_in_think,
+                            );
                         }
                     } else if t == "abort" || t == "commit" {
                         if let (Some(id), Some(aid), Some(kind)) = (
@@ -2501,8 +2517,14 @@ pub fn is_qwen_ep_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0"),
         supports_temp_swor: m
             .speculator
             .as_ref()
@@ -2709,7 +2731,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
-                    emit_staged_terminal_done(stdout, &pending_done);
+                    crate::ar::emit_active_route_done_value(stdout, &pending_done);
                     producers[idx] = None;
                 }
             }
@@ -2796,11 +2818,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 false,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                             emit_qwen_ar_cancelled(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
@@ -2960,11 +2982,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                         }
                         {
                             let _scope = BatchAttemptScope::enter(attempt_id);
-                            emit_gen_start(
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 false,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
                         }
                     } else if t == "abort" || t == "commit" {
