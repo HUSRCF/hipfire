@@ -8,6 +8,7 @@
 //! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3)
 //! to break the `daemon -> loader -> daemon` cycle. No behaviour change.
 
+use std::cell::Cell;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,18 +38,37 @@ pub enum TerminalControlDecision {
 pub struct ActiveTerminalControl {
     pub id: String,
     pub attempt_id: u64,
+    /// Monotonic lifecycle generation. A writer that captured an earlier
+    /// generation can never claim a reused `(id, attempt_id)`.
+    pub generation: u64,
     pub ready: bool,
     pub decision: Option<TerminalControlDecision>,
     pub terminal_claimed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetiredTerminalControl {
+    pub id: String,
+    pub attempt_id: u64,
+    pub generation: u64,
+}
+
 pub struct TerminalControlState {
     pub active: Option<ActiveTerminalControl>,
+    /// The singleton has one active request, so one bounded tombstone is
+    /// enough to reject every late writer for the just-cleared generation.
+    /// A new activation supersedes it without retaining request history.
+    pub retired: Option<RetiredTerminalControl>,
+    pub next_generation: u64,
 }
 
 impl TerminalControlState {
     pub const fn new() -> Self {
-        Self { active: None }
+        Self {
+            active: None,
+            retired: None,
+            next_generation: 0,
+        }
     }
 }
 
@@ -70,13 +90,15 @@ pub fn terminal_control() -> &'static TerminalControlCell {
 pub const CLIENT_TERMINAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Activate a fresh terminal-control transaction for this generate.
-/// Clears any prior latch so a new request starts clean.
 pub fn activate_terminal_control(id: &str, attempt_id: u64) {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
+    g.next_generation = g.next_generation.checked_add(1).unwrap_or(1);
+    let generation = g.next_generation;
     g.active = Some(ActiveTerminalControl {
         id: id.to_string(),
         attempt_id,
+        generation,
         ready: false,
         decision: None,
         terminal_claimed: false,
@@ -85,31 +107,85 @@ pub fn activate_terminal_control(id: &str, attempt_id: u64) {
 }
 
 /// Clear the active terminal-control transaction (request end / guard drop).
+/// The one-entry tombstone rejects late writers until the next lifecycle
+/// activation. A redundant clear is treated as a test/process reset.
 pub fn clear_terminal_control() {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    g.active = None;
+    if let Some(active) = g.active.take() {
+        g.retired = Some(RetiredTerminalControl {
+            id: active.id,
+            attempt_id: active.attempt_id,
+            generation: active.generation,
+        });
+    } else {
+        g.retired = None;
+    }
     cell.cv.notify_all();
 }
 
-/// Claim the sole terminal slot for a matching active attempt.
+/// Return the active singleton generation for an exact request key.
+pub fn terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
+    let cell = terminal_control();
+    let g = cell.mu.lock().unwrap();
+    g.active.as_ref().and_then(|active| {
+        (active.id == id && active.attempt_id == attempt_id).then_some(active.generation)
+    })
+}
+
+/// Claim a terminal only for a captured singleton lifecycle generation.
 ///
-/// Unknown/inactive attempts return `true` so pre-activation validation errors
-/// retain their existing wire behavior. Once an active attempt claims a
-/// terminal, a racing error/abort/done writer becomes a no-op.
-pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
+/// This is the strict form used by race/reuse tests and any caller that holds
+/// a request-owned generation token. It is intentionally not inferred from
+/// the current active state: inferring it would let an old writer claim a
+/// freshly reactivated request with the same wire key.
+pub fn claim_terminal_at_generation(id: &str, attempt_id: u64, generation: u64) -> bool {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
     let Some(active) = g.active.as_mut() else {
-        return true;
+        return false;
     };
-    if active.id != id || active.attempt_id != attempt_id {
-        return true;
+    if active.id != id || active.attempt_id != attempt_id || active.generation != generation {
+        return false;
     }
     if active.terminal_claimed {
         return false;
     }
     active.terminal_claimed = true;
+    true
+}
+
+/// Claim the sole terminal slot for the current request key.
+///
+/// Unknown/mismatched active attempts and all attempt-zero writers fail
+/// closed. Before the first lifecycle activation, a nonzero attempt may still
+/// be emitted by unit-level producer helpers; once a request has been cleared,
+/// the bounded tombstone rejects late writers until a fresh activation.
+pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
+    if attempt_id == 0 {
+        return false;
+    }
+    let cell = terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(active) = g.active.as_mut() {
+        if active.id != id || active.attempt_id != attempt_id {
+            return false;
+        }
+        if active.terminal_claimed {
+            return false;
+        }
+        active.terminal_claimed = true;
+        return true;
+    }
+    if g.retired
+        .as_ref()
+        .is_some_and(|retired| retired.id == id && retired.attempt_id == attempt_id)
+    {
+        return false;
+    }
+    // The daemon's first pre-admission producer helpers can run before the
+    // singleton is activated. They are still correlated by a nonzero attempt;
+    // attempt zero is reserved for emit_uncorrelated_error.
     true
 }
 
@@ -157,22 +233,26 @@ pub struct BatchRegistryEntry {
     pub abort_latched: bool,
     pub commit_latched: bool,
     pub terminal_claimed: bool,
+    /// Monotonic admission generation. It is copied into the request's
+    /// [`BatchAttemptScope`] and is required for every terminal claim.
+    pub generation: u64,
     pub pending_done: Option<serde_json::Value>,
     pub deadline: Option<Instant>,
 }
 
 pub struct BatchTerminalState {
     pub entries: std::collections::HashMap<AttemptKey, BatchRegistryEntry>,
-    /// Retired keys reject late writers after lane teardown. A fresh announce
-    /// removes the key so deliberate request/attempt reuse starts clean.
-    pub retired: std::collections::HashSet<AttemptKey>,
+    /// Monotonic epoch for admissions. Retired entries are removed rather
+    /// than tombstoned; a stale writer carries its old generation in TLS and
+    /// therefore cannot claim a fresh entry with the same wire key.
+    pub next_generation: u64,
 }
 
 impl BatchTerminalState {
     pub fn new() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
-            retired: std::collections::HashSet::new(),
+            next_generation: 0,
         }
     }
 }
@@ -192,8 +272,9 @@ pub fn batch_terminal_control() -> &'static BatchTerminalCell {
 
 /// Claim exactly one wire-terminal owner for a continuous-batch attempt.
 ///
-/// Unknown keys are handled by [`claim_wire_terminal`], which falls back to
-/// the sequential singleton only when no batch lane owns the request.
+/// A request-owned [`BatchAttemptScope`] is required. This makes a cleared
+/// generation fail closed even if the same `(id, attempt_id)` is announced
+/// again before an old producer returns.
 pub fn batch_claim_terminal(id: &str, attempt_id: u64) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -201,7 +282,7 @@ pub fn batch_claim_terminal(id: &str, attempt_id: u64) -> bool {
     let Some(entry) = g.entries.get_mut(&key) else {
         return false;
     };
-    if entry.terminal_claimed {
+    if active_batch_generation() != Some(entry.generation) || entry.terminal_claimed {
         return false;
     }
     entry.terminal_claimed = true;
@@ -217,14 +298,16 @@ pub fn claim_wire_terminal(id: &str, attempt_id: u64) -> bool {
     let mut g = cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
     if let Some(entry) = g.entries.get_mut(&key) {
-        if entry.terminal_claimed {
+        if active_batch_generation() != Some(entry.generation) || entry.terminal_claimed {
             return false;
         }
         entry.terminal_claimed = true;
         cell.cv.notify_all();
         return true;
     }
-    if g.retired.contains(&key) || g.entries.keys().any(|candidate| candidate.id == id) {
+    // A scope with no live entry is a stale batch producer. Never let it
+    // fall through to the singleton after its keyed generation retired.
+    if active_batch_generation().is_some() || g.entries.keys().any(|candidate| candidate.id == id) {
         return false;
     }
     claim_terminal(id, attempt_id)
@@ -240,7 +323,8 @@ pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
     if g.entries.contains_key(&key) {
         return false;
     }
-    g.retired.remove(&key);
+    g.next_generation = g.next_generation.checked_add(1).unwrap_or(1);
+    let generation = g.next_generation;
     g.entries.insert(
         key,
         BatchRegistryEntry {
@@ -248,6 +332,7 @@ pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
             abort_latched: false,
             commit_latched: false,
             terminal_claimed: false,
+            generation,
             pending_done: None,
             deadline: None,
         },
@@ -333,9 +418,7 @@ pub fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
 pub fn batch_clear_terminal(id: &str, attempt_id: u64) {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    let key = AttemptKey::new(id, attempt_id);
-    g.entries.remove(&key);
-    g.retired.insert(key);
+    g.entries.remove(&AttemptKey::new(id, attempt_id));
     cell.cv.notify_all();
 }
 
@@ -343,7 +426,6 @@ pub fn batch_clear_all_terminals() {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     g.entries.clear();
-    g.retired.clear();
     cell.cv.notify_all();
 }
 
@@ -554,7 +636,10 @@ pub fn batch_is_ready(id: &str, attempt_id: u64) -> bool {
 thread_local! {
     /// Active generate attempt_id for typed errors emitted during a request.
     /// Reset path parses attempt_id from the message directly.
-    static ACTIVE_ATTEMPT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ACTIVE_ATTEMPT_ID: Cell<u64> = const { Cell::new(0) };
+    /// Batch admission generation paired with [`ACTIVE_ATTEMPT_ID`].
+    /// `None` means this scope is not a live keyed batch producer.
+    static ACTIVE_BATCH_GENERATION: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 pub fn active_attempt_id() -> u64 {
@@ -565,6 +650,23 @@ pub fn set_active_attempt_id(id: u64) {
     ACTIVE_ATTEMPT_ID.with(|c| c.set(id));
 }
 
+pub fn active_batch_generation() -> Option<u64> {
+    ACTIVE_BATCH_GENERATION.with(Cell::get)
+}
+
+fn batch_generation_for(id: Option<&str>, attempt_id: u64) -> Option<u64> {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    let mut generations = g.entries.iter().filter_map(|(key, entry)| {
+        (key.attempt_id == attempt_id && id.is_none_or(|id| key.id == id))
+            .then_some(entry.generation)
+    });
+    let generation = generations.next()?;
+    // An attempt id is globally unique in production. If a host-only test
+    // deliberately aliases it across lanes, refuse to guess a generation.
+    generations.next().is_none().then_some(generation)
+}
+
 pub struct ActiveAttemptGuard;
 impl Drop for ActiveAttemptGuard {
     fn drop(&mut self) {
@@ -572,26 +674,50 @@ impl Drop for ActiveAttemptGuard {
     }
 }
 
-/// Temporarily bind batch-lane emissions to their request attempt.
+/// Temporarily bind batch-lane emissions to their request attempt and
+/// admission generation.
 ///
 /// Continuous batching interleaves independent requests inside one outer
 /// daemon command, so every lane-specific wire event must restore the
-/// previously active attempt when its emission scope ends.
+/// previously active attempt and generation when its emission scope ends.
 pub struct BatchAttemptScope {
     pub previous: u64,
+    previous_batch_generation: Option<u64>,
 }
 
 impl BatchAttemptScope {
     pub fn enter(attempt_id: u64) -> Self {
-        let previous = active_attempt_id();
+        Self::enter_with_generation(attempt_id, batch_generation_for(None, attempt_id))
+    }
+
+    pub fn enter_for(id: &str, attempt_id: u64) -> Self {
+        Self::enter_with_generation(attempt_id, batch_generation_for(Some(id), attempt_id))
+    }
+
+    /// Rebind an existing outer scope after its keyed batch entry is retired.
+    /// Sequential fallback then remains eligible for the singleton claim while
+    /// preserving the scope's original TLS values for Drop restoration.
+    pub fn rebind_for(&mut self, id: &str, attempt_id: u64) {
         set_active_attempt_id(attempt_id);
-        Self { previous }
+        ACTIVE_BATCH_GENERATION.with(|c| c.set(batch_generation_for(Some(id), attempt_id)));
+    }
+
+    fn enter_with_generation(attempt_id: u64, generation: Option<u64>) -> Self {
+        let previous = active_attempt_id();
+        let previous_batch_generation = active_batch_generation();
+        set_active_attempt_id(attempt_id);
+        ACTIVE_BATCH_GENERATION.with(|c| c.set(generation));
+        Self {
+            previous,
+            previous_batch_generation,
+        }
     }
 }
 
 impl Drop for BatchAttemptScope {
     fn drop(&mut self) {
         set_active_attempt_id(self.previous);
+        ACTIVE_BATCH_GENERATION.with(|c| c.set(self.previous_batch_generation));
     }
 }
 

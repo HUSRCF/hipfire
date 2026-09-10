@@ -848,3 +848,47 @@ fn all_variant_count_is_twenty_two() {
     assert_eq!(GenerationRoute::ALL.len(), 22);
     assert_eq!(capability_rows().len(), 22);
 }
+
+#[test]
+fn route_cancel_releases_start_latch_and_claims_once() {
+    let id = "route-cancel-lifecycle";
+    let attempt = 7001;
+    activate_terminal_control(id, attempt);
+    set_active_attempt_id(attempt);
+    let mut sink = Vec::new();
+    emit_generation_start(GenerationRoute::GlimmerAr, &mut sink, id, false);
+    emit_generation_cancel(GenerationRoute::GlimmerAr, &mut sink, id, 3);
+    let first: Vec<_> = std::str::from_utf8(&sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0]["type"], "gen_start");
+    assert_eq!(first[1]["type"], "aborted");
+    assert_eq!(first[2]["finish_reason"], "aborted");
+
+    // The terminal claim remains one-shot, but the route-start latch is
+    // released by the cancel wrapper, so a same-key fallback start is visible.
+    emit_generation_start(GenerationRoute::GlimmerAr, &mut sink, id, false);
+    emit_generation_cancel(GenerationRoute::GlimmerAr, &mut sink, id, 4);
+    let all: Vec<_> = std::str::from_utf8(&sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        all.iter()
+            .filter(|event| event["type"] == "gen_start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|event| event["type"] == "aborted")
+            .count(),
+        1
+    );
+    clear_terminal_control();
+    set_active_attempt_id(0);
+}

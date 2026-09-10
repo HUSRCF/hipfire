@@ -317,7 +317,7 @@ pub fn drive_qwen_continuous_batch(
         };
         let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             crate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
@@ -365,13 +365,13 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             // Transactional commit: reset GPU first, then host commit_lane,
             // and only then emit the staged done. Never done+error.
             let reset_ok = match batch_state.reset_lane(gpu, &config, idx) {
@@ -420,8 +420,8 @@ pub fn drive_qwen_continuous_batch(
             }
         }
         for k in queued_abort {
-            let _scope = BatchAttemptScope::enter(k.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -446,8 +446,8 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -494,14 +494,14 @@ pub fn drive_qwen_continuous_batch(
                             .to_string();
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 false,
                             );
-                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -553,7 +553,7 @@ pub fn drive_qwen_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                     emit_uncorrelated_error(
                                         stdout,
                                         Some(&id),
@@ -589,7 +589,7 @@ pub fn drive_qwen_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter(attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                 emit_uncorrelated_error(
                                     stdout,
                                     Some(&id),
@@ -611,7 +611,7 @@ pub fn drive_qwen_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             emit_uncorrelated_error(
                                 stdout,
                                 Some(&id),
@@ -665,7 +665,7 @@ pub fn drive_qwen_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -899,7 +899,7 @@ pub fn drive_qwen_continuous_batch(
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
             let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
             let token_bytes = all_bytes[prev_fed..].to_vec();
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             // TTFT: host Instant immediately before the first classified emit.
             if lane.first_token_at.is_none() {
                 lane.first_token_at = Some(Instant::now());
@@ -987,7 +987,7 @@ pub fn drive_qwen_continuous_batch(
                         rolled_back: true,
                         context: None,
                     };
-                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                     emit_qwen_ar_open_think_terminal(
                         stdout,
                         &key.id,
@@ -1073,8 +1073,8 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -1094,7 +1094,7 @@ pub fn drive_qwen_continuous_batch(
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
@@ -1254,7 +1254,7 @@ pub fn drive_lfm_continuous_batch(
         };
         let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             crate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
@@ -1302,12 +1302,12 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let reset_ok = match batch_state.reset_lane(gpu, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -1350,8 +1350,8 @@ pub fn drive_lfm_continuous_batch(
             }
         }
         for k in queued_abort {
-            let _scope = BatchAttemptScope::enter(k.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -1376,8 +1376,8 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
         }
         let mut barrier: Option<DaemonMsg> = None;
@@ -1451,14 +1451,14 @@ pub fn drive_lfm_continuous_batch(
                             .to_string();
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::LfmAr,
                                 stdout,
                                 &id,
                                 false,
                             );
-                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -1510,7 +1510,7 @@ pub fn drive_lfm_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                     emit_uncorrelated_error(
                                         stdout,
                                         Some(&id),
@@ -1538,7 +1538,7 @@ pub fn drive_lfm_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter(attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                 emit_uncorrelated_error(
                                     stdout,
                                     Some(&id),
@@ -1557,7 +1557,7 @@ pub fn drive_lfm_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             emit_uncorrelated_error(
                                 stdout,
                                 Some(&id),
@@ -1574,7 +1574,7 @@ pub fn drive_lfm_continuous_batch(
                             max_tokens_req,
                             sched.lane_capacity,
                         ) {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             emit_uncorrelated_error(
                                 stdout,
                                 Some(&id),
@@ -1631,7 +1631,7 @@ pub fn drive_lfm_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::LfmAr,
                                 stdout,
@@ -1706,7 +1706,8 @@ pub fn drive_lfm_continuous_batch(
                                             format!("reset lane {lane_idx} on batched prefill abort: {e}"),
                                         );
                                     }
-                                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                                    let _scope =
+                                        BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                                     let ep = crate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -1821,7 +1822,7 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on capacity re-check: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 emit_uncorrelated_error(
                     stdout,
                     Some(&key.id),
@@ -1904,7 +1905,7 @@ pub fn drive_lfm_continuous_batch(
                     continue;
                 }
                 let write_ok = {
-                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                     writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
                 };
                 if !write_ok {
@@ -1927,7 +1928,7 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on pre-prefill abort: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 let ep = crate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
@@ -1978,7 +1979,7 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on prefill abort: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 let ep = crate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
@@ -2213,7 +2214,7 @@ pub fn drive_lfm_continuous_batch(
                     lane.first_token_at = Some(Instant::now());
                 }
                 {
-                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                     emit_visible_token(stdout, &key.id, frag);
                 }
             }
@@ -2292,7 +2293,7 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let ep = crate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
@@ -2315,7 +2316,7 @@ pub fn drive_lfm_continuous_batch(
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
@@ -2645,7 +2646,7 @@ pub fn drive_qwen35_ep_continuous_batch(
             reason.clone()
         };
         for key in &uniq {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let ep = crate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
@@ -2692,13 +2693,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
         for (idx, key, pending_done) in to_commit {
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             let reset_ok = match batch_state.reset_lane(gpus, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -2743,8 +2744,8 @@ pub fn drive_qwen35_ep_continuous_batch(
             }
         }
         for k in queued_abort {
-            let _scope = BatchAttemptScope::enter(k.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
             let _ = sched.abort_queued(&k);
         }
         let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
@@ -2769,8 +2770,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -2817,14 +2818,14 @@ pub fn drive_qwen35_ep_continuous_batch(
                             .to_string();
                         batch_announce_terminal(&id, attempt_id);
                         if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
                                 &id,
                                 false,
                             );
-                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            crate::ar::emit_active_route_cancel(stdout, &id, 0);
                             batch_clear_terminal(&id, attempt_id);
                             continue;
                         }
@@ -2877,7 +2878,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                     emit_uncorrelated_error(
                                         stdout,
                                         Some(&id),
@@ -2913,7 +2914,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter(attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                                 emit_uncorrelated_error(
                                     stdout,
                                     Some(&id),
@@ -2932,7 +2933,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             emit_uncorrelated_error(
                                 stdout,
                                 Some(&id),
@@ -2981,7 +2982,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -3203,7 +3204,7 @@ pub fn drive_qwen35_ep_continuous_batch(
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
             let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
             let token_bytes = all_bytes[prev_fed..].to_vec();
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
             if lane.first_token_at.is_none() {
                 lane.first_token_at = Some(Instant::now());
             }
@@ -3284,7 +3285,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                         rolled_back: true,
                         context: None,
                     };
-                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                     emit_qwen_ar_open_think_terminal(
                         stdout,
                         &key.id,
@@ -3373,8 +3374,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
             let _ = sched.abort_lane(idx, &key);
             producers[idx] = None;
         }
@@ -3393,7 +3394,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {

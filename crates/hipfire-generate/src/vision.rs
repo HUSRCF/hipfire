@@ -15,8 +15,7 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_qwen_ar_cancelled, emit_reasoning_token, emit_visible_token,
-    write_error,
+    emit_active_attempt_error, emit_reasoning_token, emit_visible_token, write_error,
 };
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
@@ -1039,7 +1038,7 @@ pub fn generate_vl(
         // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
         // every mid-encode disconnect before these polls existed).
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         if token == image_pad_id && visual_idx < n_visual_tokens {
@@ -1244,7 +1243,7 @@ pub fn generate_vl(
         // conversation_tokens) is reclaimed by the next dispatch's
         // non-zero-seq_pos reset, matching the dots.ocr cancel path.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
             return;
         }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
@@ -1617,7 +1616,7 @@ pub fn generate_vl(
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        crate::ar::emit_active_route_cancel(stdout, id, generated);
         return;
     }
     // Flush any trailing partial think marker as ordinary text in its
@@ -1762,7 +1761,7 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
         return;
     }
 
@@ -1787,7 +1786,7 @@ pub fn generate_vl_dots_ocr(
         Ok(Some(t)) => t,
         Ok(None) => {
             let _ = gpu.free_tensor(patches_gpu);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         Err(e) => {
@@ -1851,7 +1850,7 @@ pub fn generate_vl_dots_ocr(
     for (pos, &token) in prompt_ids.iter().enumerate() {
         if check_abort(id) {
             let _ = gpu.free_tensor(emb_scratch);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         if token == dots_ocr::IMGPAD_ID {
@@ -1888,7 +1887,7 @@ pub fn generate_vl_dots_ocr(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
         return;
     }
     if let Some(e) = embed_err {
@@ -1910,7 +1909,7 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1976,7 +1975,7 @@ pub fn generate_vl_dots_ocr(
 
     while generated < max_tokens {
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
             return;
         }
         if eos_set.contains(&next) {
@@ -2016,7 +2015,7 @@ pub fn generate_vl_dots_ocr(
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        crate::ar::emit_active_route_cancel(stdout, id, generated);
         return;
     }
 
@@ -2136,7 +2135,7 @@ pub fn run_dots_ocr_ngram_loop(
         Ok(PrefillOutcome::Aborted) => {
             // Client cancel during n-gram prefill: cancel lifecycle only
             // (no success done / commit_ready).
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            crate::ar::emit_active_route_cancel(stdout, id, 0);
             return;
         }
         Err(e) => {
@@ -2206,7 +2205,7 @@ pub fn run_dots_ocr_ngram_loop(
         // rule as the prefill-cancel site above). The caller restores
         // bundle/spec state on return; the next request resets at prefill.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
             return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
@@ -3058,7 +3057,7 @@ pub fn generate_lfm2_vl(
                 // top-of-loop abort check to avoid sampling empty logits,
                 // and would push the full prompt into conversation_tokens
                 // against a partially-filled KV.
-                emit_qwen_ar_cancelled(stdout, id, 0);
+                crate::ar::emit_active_route_cancel(stdout, id, 0);
                 return;
             }
             let res = if tok == image_token_id && vis_idx < n_visual_tokens {
@@ -3156,12 +3155,12 @@ pub fn generate_lfm2_vl(
     // `await_client_terminal_commit` would block forever waiting for a
     // commit that can never arrive and wedge the single slot (the exact
     // failure recorded in the 2026-08-27 serve ledger). Emits the CANONICAL
-    // cancelled-terminal pair via `emit_qwen_ar_cancelled` (wire `aborted` +
+    // cancelled-terminal pair via `emit_active_route_cancel` (wire `aborted` +
     // `aborted_done`) — serve's stream reader only releases an HTTP handler
     // on the recognized terminal dialect, so a raw custom event here would
     // hold the admission guard forever.
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         return;
     }
 
@@ -3189,7 +3188,7 @@ pub fn generate_lfm2_vl(
             // Same release contract as the post-loop latch: the terminal pair
             // must be the recognized wire dialect or serve holds its
             // admission guard forever.
-            emit_qwen_ar_cancelled(stdout, id, generated_count);
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         }
     }
 }

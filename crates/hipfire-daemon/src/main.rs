@@ -100,14 +100,21 @@ pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
 
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
-    hipfire_generate::dense::emit_active_attempt_error(
-        stdout,
-        None,
-        &message.to_string(),
-        "internal",
-        false,
-        false,
-    );
+    emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
+}
+
+/// Retire the reader-side batch admission on every generate exit. Batch
+/// drivers clear entries themselves; the guard is a no-op in that case, while
+/// singleton/image/error paths cannot leave a reusable key stuck announced.
+struct BatchTerminalCleanup {
+    id: String,
+    attempt_id: u64,
+}
+
+impl Drop for BatchTerminalCleanup {
+    fn drop(&mut self) {
+        batch_clear_terminal(&self.id, self.attempt_id);
+    }
 }
 
 /// Parse attempt_id from a JSON number only (u64 or non-neg i64).
@@ -1817,7 +1824,14 @@ fn main() {
                                     &prior_err,
                                     rollback_err.as_deref(),
                                 );
-                                write_error(&mut stdout, "", &msg);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &msg,
+                                    "gpu",
+                                    false,
+                                    false,
+                                );
                                 continue;
                             }
                         }
@@ -2148,8 +2162,17 @@ fn main() {
                         let total_mb = vram_total / (1024 * 1024);
                         // serde-escape: raw HipError debug contains { } and "
                         // which corrupt the JSONL protocol if interpolated raw.
-                        write_error(&mut stdout, "", &format!(
-                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!(
+                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
+                                gpu.arch
+                            ),
+                            "gpu",
+                            false,
+                            false,
+                        );
                     }
                 }
                 let _ = stdout.flush();
@@ -2209,7 +2232,7 @@ fn main() {
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
-                        hipfire_generate::dense::emit_active_attempt_error(
+                        emit_uncorrelated_error(
                             &mut stdout,
                             Some(id),
                             "no model loaded",
@@ -2218,6 +2241,7 @@ fn main() {
                             false,
                         );
                         let _ = stdout.flush();
+                        batch_clear_terminal(id, gen_attempt_id);
                         continue;
                     }
                 };
@@ -2226,7 +2250,7 @@ fn main() {
                 // Text generate on it must refuse — not fall through to the
                 // token path with a vocab-0 skeleton tokenizer.
                 if hipfire_loader::img_route(m.arch_id).is_diffusion() {
-                    hipfire_generate::dense::emit_active_attempt_error(
+                    emit_uncorrelated_error(
                         &mut stdout,
                         Some(id),
                         "text generate refused: loaded model is a diffusion checkpoint (arch 40/45) — use img_generate",
@@ -2235,10 +2259,11 @@ fn main() {
                         false,
                     );
                     let _ = stdout.flush();
+                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
                 if let Some(reason) = batch_poisoned.as_ref() {
-                    hipfire_generate::dense::emit_active_attempt_error(
+                    emit_uncorrelated_error(
                         &mut stdout,
                         Some(id),
                         &format!(
@@ -2249,6 +2274,7 @@ fn main() {
                         false,
                     );
                     let _ = stdout.flush();
+                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
                 // Sticky GPU fault (700/719) latched by an arch op: the HIP
@@ -2259,7 +2285,7 @@ fn main() {
                 // re-establishes a live context (model reload does not reset
                 // the primary context), so the latch is never cleared here.
                 if let Some(poison) = hipfire_runtime::reset_core::gpu_poison() {
-                    hipfire_generate::dense::emit_active_attempt_error(
+                    emit_uncorrelated_error(
                         &mut stdout,
                         Some(id),
                         &format!(
@@ -2271,6 +2297,7 @@ fn main() {
                         false,
                     );
                     let _ = stdout.flush();
+                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
 
@@ -2278,6 +2305,11 @@ fn main() {
                 // Cleared by TerminalControlGuard on all exits from this arm.
                 activate_terminal_control(id, gen_attempt_id);
                 let _terminal_control_guard = TerminalControlGuard;
+                let mut batch_scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                let _batch_cleanup = BatchTerminalCleanup {
+                    id: id.to_owned(),
+                    attempt_id: gen_attempt_id,
+                };
                 gpu.replay.begin_replay_observation_window();
                 let prompt = msg
                     .get("prompt")
@@ -2629,6 +2661,10 @@ fn main() {
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
 
+                if has_image {
+                    let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                    batch_scope.rebind_for(id, gen_attempt_id);
+                }
                 if has_image && !has_vl {
                     match vision_gated_off.as_deref() {
                         Some(sidecar) => write_error(
@@ -2940,14 +2976,14 @@ fn main() {
                     if ep_batch_eligible {
                         batch_transition_to_queued(id, gen_attempt_id);
                         if batch_check_abort(id, gen_attempt_id) {
-                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                            emit_gen_start(
+                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                            hipfire_generate::ar::emit_generation_start(
+                                hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
                                 id,
                                 false,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
-                            emit_qwen_ar_cancelled(&mut stdout, id, 0);
+                            hipfire_generate::ar::emit_active_route_cancel(&mut stdout, id, 0);
                             batch_clear_terminal(id, gen_attempt_id);
                             continue;
                         }
@@ -2967,7 +3003,7 @@ fn main() {
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                                 emit_uncorrelated_error(
                                     &mut stdout,
                                     Some(id),
@@ -2982,9 +3018,10 @@ fn main() {
                         };
                         if started_in_think {
                             let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                            batch_scope.rebind_for(id, gen_attempt_id);
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
-                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                                 emit_uncorrelated_error(
                                     &mut stdout,
                                     Some(id),
@@ -3026,12 +3063,12 @@ fn main() {
                                     continue;
                                 }
                                 {
-                                    let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                                    emit_gen_start(
+                                    let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                    hipfire_generate::ar::emit_generation_start(
+                                        hipfire_generate::ar::GenerationRoute::QwenAr,
                                         &mut stdout,
                                         id,
                                         false,
-                                        Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                                     );
                                 }
                                 let drive_res = drive_qwen35_ep_continuous_batch(
@@ -3066,7 +3103,7 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
-                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                             let ep = hipfire_generate::common::RollbackEpilogue {
                                 rolled_back: true,
                                 context: None,
@@ -3093,14 +3130,14 @@ fn main() {
                         batch_transition_to_queued(id, gen_attempt_id);
                         // If already aborted, emit cancelled and do not enqueue.
                         if batch_check_abort(id, gen_attempt_id) {
-                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                            emit_gen_start(
+                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                            hipfire_generate::ar::emit_generation_start(
+                                hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
                                 id,
                                 false,
-                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                             );
-                            emit_qwen_ar_cancelled(&mut stdout, id, 0);
+                            hipfire_generate::ar::emit_active_route_cancel(&mut stdout, id, 0);
                             batch_clear_terminal(id, gen_attempt_id);
                             continue;
                         }
@@ -3121,7 +3158,7 @@ fn main() {
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                                 emit_uncorrelated_error(
                                     &mut stdout,
                                     Some(id),
@@ -3139,10 +3176,11 @@ fn main() {
                             // barriers. Transfer any pre-latched abort exactly once
                             // (transfer itself clears the keyed entry).
                             let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                            batch_scope.rebind_for(id, gen_attempt_id);
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
-                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                                 emit_uncorrelated_error(
                                     &mut stdout,
                                     Some(id),
@@ -3189,12 +3227,13 @@ fn main() {
                                         continue;
                                     }
                                     {
-                                        let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                                        emit_gen_start(
+                                        let _scope =
+                                            BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                        hipfire_generate::ar::emit_generation_start(
+                                            hipfire_generate::ar::GenerationRoute::LfmAr,
                                             &mut stdout,
                                             id,
                                             false,
-                                            hipfire_generate::common::gen_start_contract_version_for_arch(arch),
                                         );
                                     }
                                     let drive_res = drive_lfm_continuous_batch(
@@ -3227,12 +3266,13 @@ fn main() {
                                         continue;
                                     }
                                     {
-                                        let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                                        emit_gen_start(
+                                        let _scope =
+                                            BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                        hipfire_generate::ar::emit_generation_start(
+                                            hipfire_generate::ar::GenerationRoute::QwenAr,
                                             &mut stdout,
                                             id,
                                             false,
-                                            Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
                                         );
                                     }
                                     let drive_res = drive_qwen_continuous_batch(
@@ -3260,7 +3300,7 @@ fn main() {
                                         "[batch] impossible arch {} reached scheduler — fail closed",
                                         arch
                                     );
-                                    let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
                                     let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -3289,6 +3329,7 @@ fn main() {
                         // keyed entry so default service cannot leak state across
                         // request-key reuse or a later batch-enabled load.
                         let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                        batch_scope.rebind_for(id, gen_attempt_id);
                     }
                     // Did the request explicitly set a non-temperature sampling
                     // control? (gates temp>0 spec routing — see generate()).

@@ -12,9 +12,10 @@ use hipfire_engine::emit::emit_active_attempt_error;
 use hipfire_engine::terminal::{
     activate_terminal_control, apply_terminal_control, await_client_terminal_commit,
     batch_announce_terminal, batch_bind_active, batch_clear_all_terminals, batch_clear_terminal,
-    batch_transition_to_queued, check_abort, claim_terminal, claim_wire_terminal,
-    clear_terminal_control, emit_staged_terminal_done, mark_terminal_control_ready,
-    set_active_attempt_id, terminal_control, wait_terminal_control_decision,
+    batch_terminal_control, batch_transition_to_queued, check_abort, claim_terminal,
+    claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
+    emit_staged_terminal_done, mark_terminal_control_ready, set_active_attempt_id,
+    terminal_control, terminal_generation, wait_terminal_control_decision, BatchAttemptScope,
     ClientTerminalDecision, LaneTicket, TerminalControlDecision,
 };
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
@@ -274,6 +275,39 @@ fn terminal_claim_is_exactly_once_under_race() {
 }
 
 #[test]
+fn terminal_claim_rejects_mismatch_and_late_writers() {
+    let _lock = begin_test();
+    activate_terminal_control("active", 91);
+    assert!(!claim_terminal("active", 92));
+    assert!(!claim_terminal("other", 91));
+    assert!(!claim_terminal("active", 0));
+    assert!(claim_terminal("active", 91));
+    clear_terminal_control();
+    assert!(!claim_terminal("active", 91));
+    set_active_attempt_id(91);
+    let mut late = Vec::new();
+    emit_active_attempt_error(&mut late, Some("active"), "late", "runtime", false, true);
+    assert!(late.is_empty(), "late writer must not reach the wire");
+    reset();
+}
+
+#[test]
+fn singleton_generation_reuse_rejects_old_writer() {
+    let _lock = begin_test();
+    activate_terminal_control("reuse", 7);
+    let first = terminal_generation("reuse", 7).expect("first generation");
+    clear_terminal_control();
+    assert!(!claim_terminal("reuse", 7));
+
+    activate_terminal_control("reuse", 7);
+    let second = terminal_generation("reuse", 7).expect("second generation");
+    assert_ne!(first, second);
+    assert!(!claim_terminal_at_generation("reuse", 7, first));
+    assert!(claim_terminal_at_generation("reuse", 7, second));
+    reset();
+}
+
+#[test]
 fn active_done_error_race_has_one_wire_terminal() {
     let _lock = begin_test();
     activate_terminal_control("semantic-race", 88);
@@ -340,14 +374,55 @@ fn batch_wire_claims_are_keyed_and_reusable_after_retirement() {
             generation: 1,
         }
     ));
-    assert!(claim_wire_terminal("lane-a", 1));
-    assert!(!claim_wire_terminal("lane-a", 1));
-    assert!(!claim_wire_terminal("lane-a", 2));
-    assert!(claim_wire_terminal("lane-b", 1));
+    {
+        let _scope = BatchAttemptScope::enter_for("lane-a", 1);
+        assert!(claim_wire_terminal("lane-a", 1));
+        assert!(!claim_wire_terminal("lane-a", 1));
+        assert!(!claim_wire_terminal("lane-a", 2));
+    }
+    {
+        let _scope = BatchAttemptScope::enter_for("lane-b", 1);
+        assert!(claim_wire_terminal("lane-b", 1));
+    }
+    let stale = BatchAttemptScope::enter_for("lane-a", 1);
     batch_clear_terminal("lane-a", 1);
     assert!(!claim_wire_terminal("lane-a", 1));
+    drop(stale);
     assert!(batch_announce_terminal("lane-a", 1));
-    assert!(claim_wire_terminal("lane-a", 1));
+    {
+        let _scope = BatchAttemptScope::enter_for("lane-a", 1);
+        assert!(claim_wire_terminal("lane-a", 1));
+    }
+    batch_clear_all_terminals();
+    reset();
+}
+
+#[test]
+fn batch_generation_reuse_rejects_stale_scope_without_retirement_growth() {
+    let _lock = begin_test();
+    batch_clear_all_terminals();
+    assert!(batch_announce_terminal("reuse", 41));
+    let stale = BatchAttemptScope::enter_for("reuse", 41);
+    batch_clear_terminal("reuse", 41);
+    assert!(batch_announce_terminal("reuse", 41));
+    assert!(!claim_wire_terminal("reuse", 41));
+    drop(stale);
+    {
+        let _fresh = BatchAttemptScope::enter_for("reuse", 41);
+        assert!(claim_wire_terminal("reuse", 41));
+    }
+    batch_clear_terminal("reuse", 41);
+
+    for attempt in 1..=256 {
+        let id = format!("churn-{attempt}");
+        assert!(batch_announce_terminal(&id, attempt + 1000));
+        let _scope = BatchAttemptScope::enter_for(&id, attempt + 1000);
+        assert!(claim_wire_terminal(&id, attempt + 1000));
+        batch_clear_terminal(&id, attempt + 1000);
+    }
+    let state = batch_terminal_control().mu.lock().unwrap();
+    assert!(state.entries.is_empty());
+    drop(state);
     batch_clear_all_terminals();
     reset();
 }

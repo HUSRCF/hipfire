@@ -29,14 +29,14 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
-use hipfire_engine::emit::{
-    emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token, emit_visible_token,
-    QWEN_AR_SEMANTIC_CONTRACT_VERSION,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::terminal::{
     batch_bind_active, batch_check_abort, batch_clear_terminal, batch_mark_ready_with_pending,
     batch_transition_to_queued, batch_wait_decision, BatchAttemptScope, LaneTicket,
     CLIENT_TERMINAL_COMMIT_TIMEOUT,
+};
+use hipfire_generate::ar::{
+    emit_active_route_cancel, emit_active_route_done, emit_generation_start, GenerationRoute,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::{
@@ -165,6 +165,7 @@ impl SlotBackend {
     ) -> Result<(), String> {
         // Guard active count and ensure keyed entry cleared on every exit.
         let Some(_guard) = self.acquire_guard() else {
+            let _scope = BatchAttemptScope::enter_for(id, attempt_id);
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -194,7 +195,7 @@ impl SlotBackend {
             _marker: std::marker::PhantomData,
         };
         hipfire_engine::terminal::set_active_attempt_id(attempt_id);
-        let _scope = BatchAttemptScope::enter(attempt_id);
+        let _scope = BatchAttemptScope::enter_for(id, attempt_id);
 
         // Require experimental marker.
         if !is_experimental_generate(msg) {
@@ -563,15 +564,10 @@ impl SlotBackend {
         };
 
         // Emit gen_start before blocking on engine. Must agree with enable_thinking.
-        emit_gen_start(
-            stdout,
-            id,
-            started_in_think,
-            Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
-        );
+        emit_generation_start(GenerationRoute::QwenAr, stdout, id, started_in_think);
         if batch_check_abort(id, attempt_id) {
+            emit_active_route_cancel(stdout, id, 0);
             batch_clear_terminal(id, attempt_id);
-            emit_qwen_ar_cancelled(stdout, id, 0);
             return Ok(());
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
@@ -675,7 +671,7 @@ impl SlotBackend {
                 if let Some(sess) = accepted_session.take() {
                     let _ = self.engine.close(sess);
                 }
-                emit_qwen_ar_cancelled(stdout, id, produced);
+                emit_active_route_cancel(stdout, id, produced);
                 return Ok(());
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -760,7 +756,7 @@ impl SlotBackend {
             if let Some(sess) = accepted_session.take() {
                 let _ = self.engine.close(sess);
             }
-            emit_qwen_ar_cancelled(stdout, id, produced);
+            emit_active_route_cancel(stdout, id, produced);
             return Ok(());
         }
 
@@ -812,15 +808,15 @@ impl SlotBackend {
         let decision = batch_wait_decision(id, attempt_id, CLIENT_TERMINAL_COMMIT_TIMEOUT);
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
-                // Emit byte-identical done
-                let _ = writeln!(stdout, "{}", pending_done);
-                let _ = stdout.flush();
+                // Emit byte-identical done through the route adapter so the
+                // keyed claim and route-start latch are retired together.
+                emit_active_route_done(stdout, id, &pending_done);
             }
             hipfire_engine::terminal::ClientTerminalDecision::Abort => {
                 if let Some(sess) = accepted_session.take() {
                     let _ = self.engine.close(sess);
                 }
-                emit_qwen_ar_cancelled(stdout, id, produced);
+                emit_active_route_cancel(stdout, id, produced);
             }
         }
         Ok(())

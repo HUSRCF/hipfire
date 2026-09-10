@@ -900,11 +900,17 @@ fn release_route_start(id: &str, attempt: u64) {
         latch.borrow_mut().remove(&(id.to_owned(), attempt));
     });
 }
-
 /// Set the route used by route-aware production terminal wrappers for the
 /// current generation thread.
 pub fn set_generation_route(route: GenerationRoute) {
     ACTIVE_GENERATION_ROUTE.with(|active| active.set(Some(route)));
+}
+
+/// Clear the producer route after a terminal event. Batch drivers do not own
+/// a [`GenerationRouteScope`], so terminal wrappers must release both the
+/// active route and its per-request start latch themselves.
+fn clear_generation_route() {
+    ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
 }
 
 struct GenerationRouteScope {
@@ -1328,6 +1334,7 @@ pub fn emit_generation_done(
     pending: &serde_json::Value,
 ) {
     production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
+    clear_generation_route();
 }
 
 pub fn emit_generation_error(
@@ -1348,6 +1355,7 @@ pub fn emit_generation_error(
         retryable,
         rolled_back,
     );
+    clear_generation_route();
 }
 
 pub fn emit_generation_cancel(
@@ -1357,6 +1365,7 @@ pub fn emit_generation_cancel(
     completion_tokens: usize,
 ) {
     production_route_adapter(route).emit_cancel(output, id, active_attempt_id(), completion_tokens);
+    clear_generation_route();
 }
 
 pub fn emit_active_route_error(

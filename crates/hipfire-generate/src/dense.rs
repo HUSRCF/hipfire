@@ -57,12 +57,17 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    let attempt_id = active_attempt_id();
+    // Attempt zero is reserved for emit_uncorrelated_error before admission.
+    if attempt_id == 0 {
+        return;
+    }
     if crate::ar::active_generation_route().is_some() {
         crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
         return;
     }
     if let Some(id) = id {
-        if !claim_wire_terminal(id, active_attempt_id()) {
+        if !claim_wire_terminal(id, attempt_id) {
             return;
         }
     }
@@ -73,7 +78,7 @@ pub fn emit_active_attempt_error(
         class,
         retryable,
         rolled_back,
-        active_attempt_id(),
+        attempt_id,
     );
 }
 
@@ -4356,18 +4361,7 @@ pub fn glimmer_commit_terminal(
             true
         }
         ClientTerminalDecision::Abort => {
-            let attempt_id = active_attempt_id();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
-            );
-            let _ = stdout.flush();
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
             false
         }
     }

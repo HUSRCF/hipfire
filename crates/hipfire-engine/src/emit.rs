@@ -193,8 +193,14 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    let attempt_id = active_attempt_id();
+    // Attempt zero is the uncorrelated pre-admission channel. It must never
+    // be emitted by an active terminal writer.
+    if attempt_id == 0 {
+        return;
+    }
     if let Some(id) = id {
-        if !claim_wire_terminal(id, active_attempt_id()) {
+        if !claim_wire_terminal(id, attempt_id) {
             return;
         }
     }
@@ -205,7 +211,7 @@ pub fn emit_active_attempt_error(
         class,
         retryable,
         rolled_back,
-        active_attempt_id(),
+        attempt_id,
     );
 }
 
