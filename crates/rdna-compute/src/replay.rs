@@ -1156,6 +1156,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc"
+        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
@@ -1573,6 +1574,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
+        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "hc_mix_4stream"
@@ -5957,6 +5959,7 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+        "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",

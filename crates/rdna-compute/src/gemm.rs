@@ -27033,6 +27033,21 @@ impl Gpu {
                 [64u32, 1, 1],
                 ((m as u32) + 1) / 2,
             )
+        } else if k == 2_816 {
+            // Gemma4 lowered MQ4 (K=2816, eleven groups): compile-time tail
+            // specialization mirroring the HFQ4 K2816 route. The generic
+            // kernel below hard-codes tail = 0 (valid for K=2048), which
+            // would silently drop the final three groups here.
+            self.ensure_kernel(
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+                crate::kernels::GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC,
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+            )?;
+            (
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+                [32u32, 1, 1],
+                m as u32,
+            )
         } else {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed",

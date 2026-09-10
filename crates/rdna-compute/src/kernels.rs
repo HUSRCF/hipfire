@@ -2028,6 +2028,20 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
 );
 
+/// Gemma4 lowered MQ4 decode specialization: MQ4G256 shares HFQ4G256's
+/// 136-byte/group layout, so K=2816 is the same eleven groups with a
+/// three-group tail. Exposing that count to LLVM keeps the lowered MQ4 route
+/// correct without introducing private scratch on retained-PM4 routes.
+/// FWHT input rotation stays caller-side (see
+/// `gemv_mq4g256_moe_gate_up_k8_indexed`).
+pub const GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11\n",
+    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_mq4g256_moe_gate_up_k8_indexed_k2816\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+
 /// gfx1151 structural gate producer for MQ4R A3B decode. Gate and up are
 /// intentionally compiled as separate fixed-K=2048 kernels so Redline can
 /// overlap their independent weight streams on retained PM4 queues.
@@ -7529,6 +7543,7 @@ mod dispatch_tests {
 
     #[test]
     fn gfx1100_awq_direct_keeps_abi_and_drops_full_lds_stage() {
+
         assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
             .contains("void fused_rmsnorm_mq_rotate_awq("));
         assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
