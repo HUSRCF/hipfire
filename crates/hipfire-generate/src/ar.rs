@@ -740,8 +740,9 @@ pub fn truncate_checkpoints(
 ///
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
-/// EP → arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots) →
-/// pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic wrapper) → default AR/unknown.
+/// EP → Qwen dense TP semantic AR / arch short-circuits (Qwen2, DeepSeek4, LFM,
+/// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
+/// wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
@@ -1452,6 +1453,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 1. Expert-parallel first (before any arch short-circuit).
     if i.ep {
         return match i.arch_id {
+            5 | 6 => GenerationRoute::QwenAr,
             9 => GenerationRoute::Deepseek4Ep,
             10 => GenerationRoute::MiniMaxEp,
             // EP on an unregistered arch — still EP-served, not tool-safe.
@@ -1901,8 +1903,9 @@ pub fn generate(
             );
             return;
         }
-        GenerationRoute::Unknown if m.ep.is_some() => {
-            // EP on an unregistered arch_id — preserve tool-free EP serve.
+        GenerationRoute::QwenAr | GenerationRoute::Unknown if m.ep.is_some() => {
+            // Dense Qwen TP is a QwenAr semantic producer; unknown EP
+            // architectures retain the historical tool-free EP fallback.
             let ep_sampling = crate::qwen::EpSampling {
                 temp,
                 top_p,

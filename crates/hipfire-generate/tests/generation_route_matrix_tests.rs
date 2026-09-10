@@ -410,9 +410,9 @@ fn precedence_ep_before_arch_short_circuit() {
         ..base()
     };
     assert_eq!(select_generation_route(&i), GenerationRoute::MiniMaxEp);
-    // EP on unregistered arch → Unknown (still EP-first).
+    // EP on an unregistered arch → Unknown (still EP-first).
     let i = GenerationRouteInputs {
-        arch_id: 5,
+        arch_id: 99,
         ep: true,
         has_speculator: true,
         ..base()
@@ -421,22 +421,36 @@ fn precedence_ep_before_arch_short_circuit() {
 }
 
 #[test]
-fn qwen_ep_batch_semantic_route_clears_ep_for_qwen_ar() {
-    // Global selector: arch 6 + EP topology → Unknown (EP short-circuit).
-    let with_ep = GenerationRouteInputs {
-        arch_id: 6,
-        ep: true,
-        ..base()
-    };
-    assert_eq!(select_generation_route(&with_ep), GenerationRoute::Unknown);
-    // Batch eligibility clears EP after independent topology gates so the
-    // non-spec Qwen AR ladder remains reachable (exact callsite invariant).
-    let cleared = GenerationRouteInputs {
-        arch_id: 6,
+fn qwen_ep_dense_tp_selects_qwen_ar_semantic_contract() {
+    for arch_id in [5, 6] {
+        let with_ep = GenerationRouteInputs {
+            arch_id,
+            ep: true,
+            ..base()
+        };
+        let route = select_generation_route(&with_ep);
+        assert_eq!(route, GenerationRoute::QwenAr);
+
+        let id = format!("qwen-ep-{arch_id}");
+        let mut sink = Vec::new();
+        generation_route_adapter(route)
+            .expect("every selected route has an adapter")
+            .emit_start(&mut sink, &id);
+        let start: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(start["type"], "gen_start");
+        assert_eq!(start["contract_version"], 2);
+    }
+
+    // The same Qwen route remains the ordinary AR route without EP.
+    let without_ep = GenerationRouteInputs {
+        arch_id: 5,
         ep: false,
         ..base()
     };
-    assert_eq!(select_generation_route(&cleared), GenerationRoute::QwenAr);
+    assert_eq!(
+        select_generation_route(&without_ep),
+        GenerationRoute::QwenAr
+    );
 }
 
 #[test]
