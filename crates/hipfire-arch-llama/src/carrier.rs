@@ -1513,7 +1513,7 @@ mod tests {
     /// canonical local file `~/.hipfire/models/qwen3-0.6b.hf4`). This is a
     /// distinct acceptance fixture: the historic `qwen3-0.6b-llama.mq4` pin
     /// is unavailable, and no equivalence with it is claimed. The path is
-    /// taken from `HIPFIRE_G3_FIXTURE` when set, else the canonical
+    /// taken from `G3_FIXTURE` when set, else the canonical
     /// `~/.hipfire/models` location. Skips silently when the file or a GPU is
     /// absent (no-GPU / no-fixture batteries stay green); fails loudly on a
     /// size or route-class mismatch so a substituted artifact cannot pass as
@@ -1537,7 +1537,7 @@ mod tests {
         let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
+        let fixture = std::env::var("G3_FIXTURE").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.hipfire/models/qwen3-0.6b.hf4")
         });
@@ -2267,7 +2267,7 @@ mod tests {
     /// `qwen3:0.6b` = `qwen3-0.6b.hf4`. No equivalence with the historic
     /// `.mq4` pin is claimed.
     fn pinned_fixture_path() -> Option<String> {
-        let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
+        let fixture = std::env::var("G3_FIXTURE").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.hipfire/models/qwen3-0.6b.hf4")
         });
