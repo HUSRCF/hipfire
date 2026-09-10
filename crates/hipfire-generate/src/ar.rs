@@ -921,14 +921,14 @@ fn clear_generation_route() {
 /// standalone entry points cannot erase an outer request's route when they
 /// return. The start latch is still keyed to the exact attempt captured on
 /// entry; dropping one guard never clears another request's latch.
-pub(crate) struct GenerationRouteScope {
+pub struct GenerationRouteScope {
     id: String,
     attempt: u64,
     previous_route: Option<GenerationRoute>,
 }
 
 impl GenerationRouteScope {
-    pub(crate) fn enter(route: GenerationRoute, id: &str) -> Self {
+    pub fn enter(route: GenerationRoute, id: &str) -> Self {
         let previous_route = active_generation_route();
         set_generation_route(route);
         Self {

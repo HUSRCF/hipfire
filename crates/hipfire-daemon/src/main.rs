@@ -84,6 +84,10 @@ use hipfire_generate::redline::{
     RedlineQwenSnapshot, RedlineSnapshot,
 };
 mod slots;
+
+#[cfg(test)]
+pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
@@ -4592,7 +4596,7 @@ fn main() {
 mod tests {
     use super::{
         announce_generate_terminal, apply_vision_mode_gate, emit_batch_admission_error,
-        require_wire_attempt_id,
+        require_wire_attempt_id, TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -4601,8 +4605,7 @@ mod tests {
         AttemptKey, BatchAttemptScope,
     };
 
-    static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 
     #[test]
     fn vision_mode_off_drops_even_an_explicit_sidecar() {
