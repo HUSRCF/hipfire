@@ -5630,4 +5630,121 @@ mod route_scope_tests {
         clear_terminal_control();
         set_active_attempt_id(0);
     }
+    #[test]
+    fn pipeline_parallel_start_precedes_token_and_done() {
+        let _guard = route_lock();
+        let id = "pipeline-order";
+        let attempt = 91_301;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+            emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, true);
+            sink.extend_from_slice(
+                serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": "answer",
+                    "attempt_id": attempt,
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            sink.push(b'\n');
+            let pending_done = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "tokens": 1,
+                "finish_reason": "stop",
+                "attempt_id": attempt,
+            });
+            emit_generation_done_value(GenerationRoute::PipelineParallel, &mut sink, &pending_done);
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[0]["contract_version"], 2);
+        assert_eq!(events[0]["started_in_think"], true);
+        assert_eq!(events[1]["type"], "token");
+        assert_eq!(events[2]["type"], "done");
+        assert_eq!(events[2]["finish_reason"], "stop");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn pipeline_parallel_prefill_decode_terminals_release_same_key() {
+        let _guard = route_lock();
+        let id = "pipeline-reuse";
+        let attempt = 91_302;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for message in [
+            "forward_prefill_batch_multi: injected",
+            "forward_scratch_multi decode: injected",
+        ] {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+            emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
+            emit_generation_error(
+                GenerationRoute::PipelineParallel,
+                &mut sink,
+                Some(id),
+                message,
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+        emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
+        emit_generation_cancel(GenerationRoute::PipelineParallel, &mut sink, id, 2);
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            3
+        );
+        let errors: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|event| event["class"] == "validation" && event["retryable"] == false));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "aborted")
+                .count(),
+            1
+        );
+        let aborted_done: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "done")
+            .collect();
+        assert_eq!(aborted_done.len(), 1);
+        assert_eq!(aborted_done[0]["finish_reason"], "aborted");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
 }

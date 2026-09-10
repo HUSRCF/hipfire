@@ -4323,6 +4323,31 @@ pub fn attach_mtp_window_timings(
     }
 }
 
+fn emit_pipeline_cancel_after_rollback(
+    stdout: &mut impl Write,
+    id: &str,
+    completion_tokens: usize,
+    epilogue: &RollbackEpilogue,
+) {
+    if epilogue.rolled_back {
+        crate::ar::emit_generation_cancel(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            completion_tokens,
+        );
+    } else {
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            Some(id),
+            "client cancelled; fail-closed rollback could not be attested",
+            "validation",
+            false,
+            epilogue,
+        );
+    }
+}
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -4332,6 +4357,7 @@ pub fn attach_mtp_window_timings(
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
 /// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
 /// arch_id < 5 are refused upstream at load.
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_multi(
     m: &mut LoadedModel,
@@ -4886,6 +4912,13 @@ pub fn generate_multi(
     };
     let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
 
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::PipelineParallel,
+        stdout,
+        id,
+        started_in_think,
+    );
+
     if let Err(e) = qwen35::forward_prefill_batch_multi(
         gpus,
         weights,
@@ -4900,7 +4933,8 @@ pub fn generate_multi(
         // advanced; without resetting, the next cold turn prefills over dirty
         // recurrent state (drift). Mirror both abort paths, which already reset.
         reset_pp_uncommitted_state!();
-        emit_active_attempt_error(
+        crate::ar::emit_generation_error(
+            crate::ar::GenerationRoute::PipelineParallel,
             stdout,
             Some(id),
             &format!("forward_prefill_batch_multi: {}", e),
@@ -4917,7 +4951,7 @@ pub fn generate_multi(
     if check_abort(id) {
         reset_pp_uncommitted_state!();
         let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        emit_pipeline_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
 
@@ -5009,7 +5043,7 @@ pub fn generate_multi(
         if check_abort(id) {
             reset_pp_uncommitted_state!();
             let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         generated += 1;
@@ -5051,7 +5085,8 @@ pub fn generate_multi(
             // (un-baked) conversation_tokens; reset so the next cold turn starts
             // clean. Mirrors both abort paths.
             reset_pp_uncommitted_state!();
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::PipelineParallel,
                 stdout,
                 Some(id),
                 &format!("forward_scratch_multi decode: {}", e),
@@ -5494,10 +5529,14 @@ pub fn generate_multi(
     if decision != ClientTerminalDecision::Commit {
         reset_pp_uncommitted_state!();
         let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
-    crate::ar::emit_active_route_done_value(stdout, &pending_done);
+    crate::ar::emit_generation_done_value(
+        crate::ar::GenerationRoute::PipelineParallel,
+        stdout,
+        &pending_done,
+    );
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
