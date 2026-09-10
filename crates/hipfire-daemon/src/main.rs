@@ -109,13 +109,13 @@ fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Di
 struct BatchTerminalCleanup {
     id: String,
     attempt_id: u64,
-    generation: Option<u64>,
+    admission: Option<BatchGeneration>,
 }
 
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
-        if let Some(generation) = self.generation {
-            batch_clear_terminal_at_generation(&self.id, self.attempt_id, generation);
+        if let Some(admission) = self.admission {
+            batch_clear_terminal_at_generation(&self.id, self.attempt_id, admission);
         }
     }
 }
@@ -130,17 +130,18 @@ fn emit_batch_admission_error(
     stdout: &mut impl std::io::Write,
     id: &str,
     attempt_id: u64,
+    admission: BatchGeneration,
     message: &str,
     class: &str,
     retryable: bool,
     rolled_back: bool,
 ) {
     {
-        let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
         emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
         let _ = stdout.flush();
     }
-    batch_clear_terminal(id, attempt_id);
+    batch_clear_terminal_at_generation(id, attempt_id, admission);
 }
 /// Parse attempt_id from a JSON number only (u64 or non-neg i64).
 /// Decimal strings are rejected — no further coercion.
@@ -175,9 +176,11 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
 /// Announce a generate key only after the command has a valid nonzero attempt.
 ///
 /// `None` means the request is malformed or uses reserved attempt zero and
-/// must continue to main for one uncorrelated validation error. `Some(false)`
-/// is a duplicate live key and must be dropped before dispatch.
-fn announce_generate_terminal(msg: &serde_json::Value) -> Option<(&str, u64, bool)> {
+/// must continue to main for one uncorrelated validation error. `Some((..., None))`
+/// is a duplicate live key; `Some((..., Some(token)))` owns a fresh admission.
+fn announce_generate_terminal(
+    msg: &serde_json::Value,
+) -> Option<(&str, u64, Option<BatchGeneration>)> {
     if msg.get("type").and_then(|v| v.as_str()) != Some("generate") {
         return None;
     }
@@ -652,8 +655,26 @@ fn receive_startup_config(
         }
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
-        return Ok(Some((config, Some(DaemonMsg::Regular(msg)), false)));
-    }
+        let pending = match announce_generate_terminal(&msg) {
+            Some((id, attempt_id, Some(admission))) => {
+                tracing::debug!(
+                    request_id = id,
+                    attempt_id,
+                    "announced startup generate request"
+                );
+                DaemonMsg::RegularWithAdmission(msg, admission)
+            }
+            Some((id, attempt_id, None)) => {
+                eprintln!(
+                    "[batch] duplicate startup generate dropped id={} attempt_id={}; preserving live registry",
+                    id, attempt_id
+                );
+                continue;
+            }
+            None => DaemonMsg::Regular(msg),
+        };
+        return Ok(Some((config, Some(pending), false)));
+}
 }
 
 fn main() {
@@ -812,30 +833,7 @@ fn main() {
     // even read the abort line until after the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
     if let Some(message) = pending_message {
-        let should_dispatch = match &message {
-            DaemonMsg::Regular(value) => match announce_generate_terminal(value) {
-                Some((id, attempt_id, true)) => {
-                    tracing::debug!(
-                        request_id = id,
-                        attempt_id,
-                        "announced startup generate request"
-                    );
-                    true
-                }
-                Some((id, attempt_id, false)) => {
-                    eprintln!(
-                        "[batch] duplicate startup generate dropped id={} attempt_id={}; preserving live registry",
-                        id, attempt_id
-                    );
-                    false
-                }
-                None => true,
-            },
-            DaemonMsg::ParseError(_) => true,
-        };
-        if should_dispatch {
-            let _ = msg_tx.send(message);
-        }
+        let _ = msg_tx.send(message);
     }
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -885,20 +883,24 @@ fn main() {
                         }
                         continue;
                     }
-                    // Batch: announce only well-formed, nonzero generate
-                    // keys before queueing. Reserved attempt zero continues
-                    // to main for one uncorrelated validation error.
-                    if let Some((id, attempt_id, is_new)) = announce_generate_terminal(&msg) {
-                        if !is_new {
+                    // Batch: carry the reader-minted admission token beside
+                    // the internal message. Never rediscover ownership from
+                    // the wire key after queueing.
+                    let queued = match announce_generate_terminal(&msg) {
+                        Some((_id, _attempt_id, Some(admission))) => {
+                            DaemonMsg::RegularWithAdmission(msg, admission)
+                        }
+                        Some((id, attempt_id, None)) => {
                             eprintln!(
                                 "[batch] duplicate generate dropped id={} attempt_id={}; preserving live registry",
                                 id, attempt_id
                             );
                             continue;
                         }
-                    }
+                        None => DaemonMsg::Regular(msg),
+                    };
 
-                    if msg_tx.send(DaemonMsg::Regular(msg)).is_err() {
+                    if msg_tx.send(queued).is_err() {
                         break;
                     }
                 }
@@ -912,8 +914,9 @@ fn main() {
     });
     let mut inbox = DaemonInbox::new(msg_rx);
     while let Ok(daemon_msg) = inbox.recv() {
-        let msg = match daemon_msg {
-            DaemonMsg::Regular(m) => m,
+        let (msg, admission_from_message) = match daemon_msg {
+            DaemonMsg::Regular(m) => (m, None),
+            DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission)),
             DaemonMsg::ParseError(e) => {
                 tracing::warn!(error = %e, "daemon received invalid JSON");
                 emit_uncorrelated_error(
@@ -2265,6 +2268,25 @@ fn main() {
                 set_active_attempt_id(gen_attempt_id);
                 let _attempt_guard = ActiveAttemptGuard;
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let admission = match admission_from_message {
+                    Some(admission) => admission,
+                    None => {
+                        eprintln!(
+                            "[batch] generate dispatch missing reader admission id={} attempt_id={}",
+                            id, gen_attempt_id
+                        );
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id),
+                            "generate missing internal batch admission token",
+                            "internal",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 #[cfg(feature = "serve-fault-inject")]
                 let _fault_guard = {
                     let want = msg
@@ -2282,6 +2304,7 @@ fn main() {
                     let msg_clone = msg.clone();
                     let id_owned = id.to_string();
                     let slot_clone = slot.clone();
+                    let admission = admission;
                     // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
                     // engine itself is the only GPU worker, so workers serialize on engine submit.
                     std::thread::spawn(move || {
@@ -2292,6 +2315,7 @@ fn main() {
                             &mut worker_stdout,
                             &id_owned,
                             gen_attempt_id,
+                            admission,
                         );
                         let _ = worker_stdout.flush();
                     });
@@ -2304,6 +2328,7 @@ fn main() {
                             &mut stdout,
                             id,
                             gen_attempt_id,
+                            admission,
                             "no model loaded",
                             "validation",
                             false,
@@ -2321,6 +2346,7 @@ fn main() {
                         &mut stdout,
                         id,
                         gen_attempt_id,
+                        admission,
                         "text generate refused: loaded model is a diffusion checkpoint (arch 40/45) — use img_generate",
                         "validation",
                         false,
@@ -2333,6 +2359,7 @@ fn main() {
                         &mut stdout,
                         id,
                         gen_attempt_id,
+                        admission,
                         &format!(
                             "continuous batch GPU state poisoned; unload/reload required: {reason}"
                         ),
@@ -2354,6 +2381,7 @@ fn main() {
                         &mut stdout,
                         id,
                         gen_attempt_id,
+                        admission,
                         &format!(
                             "GPU context dead after sticky HipError({}) at {}; process restart required",
                             poison.code, poison.site,
@@ -2369,11 +2397,12 @@ fn main() {
                 // Cleared by TerminalControlGuard on all exits from this arm.
                 activate_terminal_control(id, gen_attempt_id);
                 let _terminal_control_guard = TerminalControlGuard;
-                let mut batch_scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                let mut batch_scope =
+                    BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
                 let _batch_cleanup = BatchTerminalCleanup {
                     id: id.to_owned(),
                     attempt_id: gen_attempt_id,
-                    generation: batch_scope.admission_generation(),
+                    admission: Some(admission),
                 };
                 gpu.replay.begin_replay_observation_window();
                 let prompt = msg
@@ -2727,7 +2756,8 @@ fn main() {
                 let has_vl = m.has_vision_encoder();
 
                 if has_image {
-                    let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                    let _ =
+                        batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id, admission);
                     batch_scope.rebind_for(gen_attempt_id);
                 }
                 if has_image && !has_vl {
@@ -3039,9 +3069,10 @@ fn main() {
                         false
                     };
                     if ep_batch_eligible {
-                        batch_transition_to_queued(id, gen_attempt_id);
-                        if batch_check_abort(id, gen_attempt_id) {
-                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                        let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
+                        if batch_check_abort(id, gen_attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3049,7 +3080,7 @@ fn main() {
                                 false,
                             );
                             hipfire_generate::ar::emit_active_route_cancel(&mut stdout, id, 0);
-                            batch_clear_terminal(id, gen_attempt_id);
+                            batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
                             continue;
                         }
                         let sampling = resolve_batch_sampling(&msg, m);
@@ -3072,6 +3103,7 @@ fn main() {
                                     &mut stdout,
                                     id,
                                     gen_attempt_id,
+                                    admission,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
@@ -3081,14 +3113,18 @@ fn main() {
                             }
                         };
                         if started_in_think {
-                            let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                            batch_scope.rebind_for(gen_attempt_id);
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
                                 emit_batch_admission_error(
                                     &mut stdout,
                                     id,
                                     gen_attempt_id,
+                                    admission,
                                     "prompt exceeds lane capacity or empty",
                                     "validation",
                                     false,
@@ -3103,12 +3139,17 @@ fn main() {
                                 Ok(s) => s,
                                 Err(reason) => {
                                     write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal(id, gen_attempt_id);
+                                    batch_clear_terminal_at_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     continue;
                                 }
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
+                                admission,
                                 prompt: prompt_owned.clone(),
                                 prompt_tokens: prompt_tokens.clone(),
                                 started_in_think,
@@ -3126,7 +3167,11 @@ fn main() {
                                     continue;
                                 }
                                 {
-                                    let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     hipfire_generate::ar::emit_generation_start(
                                         hipfire_generate::ar::GenerationRoute::QwenAr,
                                         &mut stdout,
@@ -3166,14 +3211,15 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
-                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
                             let ep = hipfire_generate::common::RollbackEpilogue {
                                 rolled_back: true,
                                 context: None,
                             };
                             // Reset the specific lane if any (best-effort), else poison not needed; just fail this request.
                             hipfire_generate::common::emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
-                            batch_clear_terminal(id, gen_attempt_id);
+                            batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
                             continue;
                         }
                     }
@@ -3190,10 +3236,11 @@ fn main() {
                     };
                     if batch_eligible {
                         // Current request was already announced by the reader; promote to Queued.
-                        batch_transition_to_queued(id, gen_attempt_id);
+                        let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         // If already aborted, emit cancelled and do not enqueue.
-                        if batch_check_abort(id, gen_attempt_id) {
-                            let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                        if batch_check_abort(id, gen_attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3201,7 +3248,7 @@ fn main() {
                                 false,
                             );
                             hipfire_generate::ar::emit_active_route_cancel(&mut stdout, id, 0);
-                            batch_clear_terminal(id, gen_attempt_id);
+                            batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
                             continue;
                         }
                         let sampling = resolve_batch_sampling(&msg, m);
@@ -3225,6 +3272,7 @@ fn main() {
                                     &mut stdout,
                                     id,
                                     gen_attempt_id,
+                                    admission,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
@@ -3237,8 +3285,11 @@ fn main() {
                             // Rendered prompts that open a think span are sequential
                             // barriers. Transfer any pre-latched abort exactly once
                             // (transfer itself clears the keyed entry).
-                            let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
-                            batch_scope.rebind_for(gen_attempt_id);
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
@@ -3246,6 +3297,7 @@ fn main() {
                                     &mut stdout,
                                     id,
                                     gen_attempt_id,
+                                    admission,
                                     "prompt exceeds lane capacity or empty",
                                     "validation",
                                     false,
@@ -3260,12 +3312,17 @@ fn main() {
                                 Ok(s) => s,
                                 Err(reason) => {
                                     write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal(id, gen_attempt_id);
+                                    batch_clear_terminal_at_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     continue;
                                 }
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
+                                admission,
                                 prompt: prompt_owned.clone(),
                                 prompt_tokens: prompt_tokens.clone(),
                                 started_in_think,
@@ -3288,8 +3345,11 @@ fn main() {
                                         continue;
                                     }
                                     {
-                                        let _scope =
-                                            BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                        let _scope = BatchAttemptScope::enter_for_generation(
+                                            id,
+                                            gen_attempt_id,
+                                            admission,
+                                        );
                                         hipfire_generate::ar::emit_generation_start(
                                             hipfire_generate::ar::GenerationRoute::LfmAr,
                                             &mut stdout,
@@ -3327,8 +3387,11 @@ fn main() {
                                         continue;
                                     }
                                     {
-                                        let _scope =
-                                            BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                        let _scope = BatchAttemptScope::enter_for_generation(
+                                            id,
+                                            gen_attempt_id,
+                                            admission,
+                                        );
                                         hipfire_generate::ar::emit_generation_start(
                                             hipfire_generate::ar::GenerationRoute::QwenAr,
                                             &mut stdout,
@@ -3361,7 +3424,12 @@ fn main() {
                                         "[batch] impossible arch {} reached scheduler — fail closed",
                                         arch
                                     );
-                                    let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
+                                    let _scope =
+                                        BatchAttemptScope::enter_for_generation(
+                                            id,
+                                            gen_attempt_id,
+                                            admission,
+                                        );
                                     let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -3374,7 +3442,11 @@ fn main() {
                                         false,
                                         &ep,
                                     );
-                                    batch_clear_terminal(id, gen_attempt_id);
+                                    batch_clear_terminal_at_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     batch_scheduler = None;
                                     continuous_batch_size = 1;
                                     batch_poisoned = Some(format!("impossible arch {}", arch));
@@ -3389,7 +3461,8 @@ fn main() {
                         // any pre-latched abort into the singleton, then clear the
                         // keyed entry so default service cannot leak state across
                         // request-key reuse or a later batch-enabled load.
-                        let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                        let _ =
+                            batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id, admission);
                         batch_scope.rebind_for(gen_attempt_id);
                     }
                     // Did the request explicitly set a non-temperature sampling
@@ -4585,10 +4658,10 @@ mod tests {
             "attempt_id": 7,
         });
         assert_eq!(require_wire_attempt_id(valid.get("attempt_id")), Ok(7));
-        assert_eq!(
+        assert!(matches!(
             announce_generate_terminal(&valid),
-            Some(("req-valid", 7, true))
-        );
+            Some(("req-valid", 7, Some(_)))
+        ));
         assert!(batch_terminal_control()
             .mu
             .lock()
@@ -4618,10 +4691,10 @@ mod tests {
             "id": early_id,
             "attempt_id": early_attempt,
         });
-        assert_eq!(
+        assert!(matches!(
             announce_generate_terminal(&early_msg),
-            Some((early_id, early_attempt, true))
-        );
+            Some((id, attempt, Some(_)))
+        ));
         let mut early_out = Vec::new();
         {
             let _scope = BatchAttemptScope::enter_for(early_id, early_attempt);
@@ -4671,9 +4744,19 @@ mod tests {
         ] {
             let id = format!("admission-batch-{offset}");
             let attempt = 70_001 + offset;
-            assert!(batch_announce_terminal(&id, attempt));
+            let admission =
+                batch_announce_terminal(&id, attempt).expect("batch admission");
             let mut out = Vec::new();
-            emit_batch_admission_error(&mut out, &id, attempt, message, "validation", false, false);
+            emit_batch_admission_error(
+                &mut out,
+                &id,
+                attempt,
+                admission,
+                message,
+                "validation",
+                false,
+                false,
+            );
             let events: Vec<serde_json::Value> = std::str::from_utf8(&out)
                 .unwrap()
                 .lines()
@@ -4685,7 +4768,7 @@ mod tests {
             assert_ne!(events[0]["attempt_id"], 0);
             assert_eq!(events[0]["class"], "validation");
             assert!(
-                batch_announce_terminal(&id, attempt),
+                batch_announce_terminal(&id, attempt).is_some(),
                 "key must be retired only after the emitted terminal"
             );
             batch_clear_terminal(&id, attempt);

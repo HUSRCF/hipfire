@@ -21,7 +21,7 @@ fn emit_for_announced_key<F>(buf: &mut Vec<u8>, id: &str, attempt: u64, emit: F)
 where
     F: FnOnce(&mut Vec<u8>),
 {
-    assert!(batch_announce_terminal(id, attempt));
+    assert!(batch_announce_terminal(id, attempt).is_some());
     let _scope = BatchAttemptScope::enter_for(id, attempt);
     emit(buf);
     drop(_scope);

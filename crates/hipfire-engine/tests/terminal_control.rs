@@ -11,13 +11,13 @@
 use hipfire_engine::emit::emit_active_attempt_error;
 use hipfire_engine::terminal::{
     activate_terminal_control, active_batch_generation, apply_terminal_control,
-    await_client_terminal_commit, batch_announce_terminal, batch_bind_active,
-    batch_clear_all_terminals, batch_clear_terminal, batch_clear_terminal_at_generation,
-    batch_terminal_control, batch_terminal_generation, batch_transition_to_queued, check_abort,
-    claim_terminal, claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
+    await_client_terminal_commit, batch_bind_active, batch_clear_all_terminals,
+    batch_clear_terminal, batch_clear_terminal_at_generation, batch_mark_ready_with_pending,
+    batch_terminal_control, batch_terminal_generation, check_abort, claim_terminal,
+    claim_terminal_at_generation, claim_wire_terminal, clear_terminal_control,
     emit_staged_terminal_done, mark_terminal_control_ready, set_active_attempt_id,
-    terminal_control, terminal_generation, wait_terminal_control_decision, BatchAttemptScope,
-    ClientTerminalDecision, LaneTicket, TerminalControlDecision,
+    terminal_control, terminal_generation, wait_terminal_control_decision,
+    BatchAttemptScope, ClientTerminalDecision, LaneTicket, TerminalControlDecision,
 };
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -44,6 +44,16 @@ fn reset() {
     set_active_attempt_id(0);
 }
 
+
+fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
+    hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).is_some()
+}
+
+fn batch_transition_to_queued(id: &str, attempt_id: u64) -> bool {
+    batch_terminal_generation(id, attempt_id).is_some_and(|generation| {
+        hipfire_engine::terminal::batch_transition_to_queued(id, attempt_id, generation)
+    })
+}
 fn decision_of(id: &str, attempt_id: u64) -> Option<TerminalControlDecision> {
     let g = terminal_control().mu.lock().unwrap();
     g.active.as_ref().and_then(|a| {
@@ -383,20 +393,26 @@ fn batch_wire_claims_are_keyed_and_reusable_after_retirement() {
     assert!(batch_announce_terminal("lane-b", 1));
     assert!(batch_transition_to_queued("lane-a", 1));
     assert!(batch_transition_to_queued("lane-b", 1));
+    let generation_a = batch_terminal_generation("lane-a", 1).expect("lane-a admission");
+    let generation_b = batch_terminal_generation("lane-b", 1).expect("lane-b admission");
     assert!(batch_bind_active(
         "lane-a",
         1,
+        generation_a,
         LaneTicket {
             lane: 0,
             generation: 1,
+            admission: generation_a,
         }
     ));
     assert!(batch_bind_active(
         "lane-b",
         1,
+        generation_b,
         LaneTicket {
             lane: 1,
             generation: 1,
+            admission: generation_b,
         }
     ));
     {
@@ -528,5 +544,101 @@ fn batch_rebind_clears_tls_without_binding_reused_generation() {
     ));
     drop(scope_b);
     drop(scope_a);
+    reset();
+}
+
+#[test]
+fn batch_admission_token_reuse_rejects_stale_producer_operations() {
+    let _lock = begin_test();
+    batch_clear_all_terminals();
+    let id = "batch-owner-reuse";
+    let attempt_id = 43;
+    let generation_a =
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).expect("generation A");
+    assert!(hipfire_engine::terminal::batch_transition_to_queued(
+        id,
+        attempt_id,
+        generation_a
+    ));
+    let ticket_a = LaneTicket {
+        lane: 0,
+        generation: 1,
+        admission: generation_a,
+    };
+    assert!(batch_bind_active(
+        id,
+        attempt_id,
+        generation_a,
+        ticket_a
+    ));
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+
+    let generation_b =
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).expect("generation B");
+    assert_ne!(generation_a, generation_b);
+    assert!(!hipfire_engine::terminal::batch_transition_to_queued(
+        id,
+        attempt_id,
+        generation_a
+    ));
+    assert!(hipfire_engine::terminal::batch_transition_to_queued(
+        id,
+        attempt_id,
+        generation_b
+    ));
+    let ticket_b = LaneTicket {
+        lane: 0,
+        generation: 2,
+        admission: generation_b,
+    };
+    assert!(!batch_bind_active(
+        id,
+        attempt_id,
+        generation_a,
+        ticket_a
+    ));
+    assert!(batch_bind_active(
+        id,
+        attempt_id,
+        generation_b,
+        ticket_b
+    ));
+    let pending = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "attempt_id": attempt_id,
+    });
+    assert!(!batch_mark_ready_with_pending(
+        id,
+        attempt_id,
+        generation_a,
+        ticket_a,
+        pending.clone()
+    ));
+    assert!(batch_mark_ready_with_pending(
+        id,
+        attempt_id,
+        generation_b,
+        ticket_b,
+        pending
+    ));
+    assert!(!batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_a
+    ));
+    assert_eq!(
+        batch_terminal_generation(id, attempt_id),
+        Some(generation_b)
+    );
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_b
+    ));
     reset();
 }

@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::terminal::{
-    batch_bind_active, batch_check_abort, batch_clear_terminal, batch_mark_ready_with_pending,
-    batch_transition_to_queued, batch_wait_decision, BatchAttemptScope, LaneTicket,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_bind_active, batch_check_abort, batch_clear_terminal_at_generation,
+    batch_mark_ready_with_pending, batch_transition_to_queued, batch_wait_decision,
+    BatchAttemptScope, BatchGeneration, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 use hipfire_generate::ar::{
     emit_active_route_cancel, emit_active_route_done, emit_generation_start, GenerationRoute,
@@ -162,10 +162,11 @@ impl SlotBackend {
         stdout: &mut W,
         id: &str,
         attempt_id: u64,
+        admission: BatchGeneration,
     ) -> Result<(), String> {
         // Guard active count and ensure keyed entry cleared on every exit.
         let Some(_guard) = self.acquire_guard() else {
-            let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -175,27 +176,29 @@ impl SlotBackend {
                 false,
             );
             let _ = stdout.flush();
-            batch_clear_terminal(id, attempt_id);
+            batch_clear_terminal_at_generation(id, attempt_id, admission);
             return Ok(());
         };
         // Ensure keyed registry entry cleared on exit (including error paths).
         struct ClearOnExit<'a> {
             id: String,
             attempt_id: u64,
+            admission: BatchGeneration,
             _marker: std::marker::PhantomData<&'a ()>,
         }
         impl Drop for ClearOnExit<'_> {
             fn drop(&mut self) {
-                batch_clear_terminal(&self.id, self.attempt_id);
+                batch_clear_terminal_at_generation(&self.id, self.attempt_id, self.admission);
             }
         }
         let _clear = ClearOnExit {
             id: id.to_string(),
             attempt_id,
+            admission,
             _marker: std::marker::PhantomData,
         };
         hipfire_engine::terminal::set_active_attempt_id(attempt_id);
-        let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
 
         // Require experimental marker.
         if !is_experimental_generate(msg) {
@@ -565,13 +568,13 @@ impl SlotBackend {
 
         // Emit gen_start before blocking on engine. Must agree with enable_thinking.
         emit_generation_start(GenerationRoute::QwenAr, stdout, id, started_in_think);
-        if batch_check_abort(id, attempt_id) {
+        if batch_check_abort(id, attempt_id, admission) {
             emit_active_route_cancel(stdout, id, 0);
-            batch_clear_terminal(id, attempt_id);
+            batch_clear_terminal_at_generation(id, attempt_id, admission);
             return Ok(());
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
-        let _ = batch_transition_to_queued(id, attempt_id);
+        let _ = batch_transition_to_queued(id, attempt_id, admission);
 
         let (tx, rx) = mpsc::channel::<Event>();
         let req = SubmitRequest {
@@ -666,7 +669,7 @@ impl SlotBackend {
         let mut rejected: Option<String> = None;
 
         loop {
-            if batch_check_abort(id, attempt_id) {
+            if batch_check_abort(id, attempt_id, admission) {
                 drop(rx);
                 if let Some(sess) = accepted_session.take() {
                     let _ = self.engine.close(sess);
@@ -686,10 +689,11 @@ impl SlotBackend {
                         prefill_tokens = prefill;
                         let ticket = LaneTicket {
                             lane: (session % 1024) as usize,
-                            generation: attempt_id,
+                            generation: session,
+                            admission,
                         };
                         accepted_ticket = Some(ticket);
-                        let _ = batch_bind_active(id, attempt_id, ticket);
+                        let _ = batch_bind_active(id, attempt_id, admission, ticket);
                     }
                     Event::Token { id: tok_id } => {
                         let outcome = if first_token {
@@ -786,14 +790,17 @@ impl SlotBackend {
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
         let ticket = accepted_ticket.unwrap_or(LaneTicket {
             lane: 0,
-            generation: attempt_id,
+            generation: 0,
+            admission,
         });
         // If no session accepted, we still need to handle terminal: directly emit cancelled? But we have pending_done
         if accepted_session.is_some() {
-            let _ = batch_mark_ready_with_pending(id, attempt_id, ticket, pending_done.clone());
+            let _ =
+                batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
         } else {
             // No session: treat as ready with dummy ticket to allow commit wait? Just emit done directly
-            let _ = batch_mark_ready_with_pending(id, attempt_id, ticket, pending_done.clone());
+            let _ =
+                batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
         }
         let mut commit_ready = pending_done.clone();
         if let Some(map) = commit_ready.as_object_mut() {
@@ -805,7 +812,8 @@ impl SlotBackend {
         let _ = writeln!(stdout, "{}", commit_ready);
         let _ = stdout.flush();
 
-        let decision = batch_wait_decision(id, attempt_id, CLIENT_TERMINAL_COMMIT_TIMEOUT);
+        let decision =
+            batch_wait_decision(id, attempt_id, admission, CLIENT_TERMINAL_COMMIT_TIMEOUT);
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
                 // Emit byte-identical done through the route adapter so the

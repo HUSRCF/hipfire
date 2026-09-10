@@ -183,12 +183,28 @@ impl AttemptKey {
     }
 }
 
-/// Generation-owned lane ticket. Prevents a stale control from releasing a
-/// reused slot even when (id, attempt_id) would otherwise alias.
+/// Opaque admission generation owned by the keyed batch registry.
+///
+/// The registry is the only production code that can mint a token. Keeping
+/// the counter private prevents a lane or producer from manufacturing a
+/// generation that happens to match a later admission for the same wire key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BatchGeneration(u64);
+
+/// Generation-owned lane ticket. The scheduler's `generation` remains the
+/// lane-reuse generation; `admission` is the opaque registry generation.
+/// Both are required to identify a live producer owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LaneTicket {
     pub lane: usize,
     pub generation: u64,
+    pub admission: BatchGeneration,
+}
+
+impl LaneTicket {
+    pub fn admission(self) -> BatchGeneration {
+        self.admission
+    }
 }
 
 // ── Keyed terminal registry ────────────────────────────────────────────
@@ -209,13 +225,12 @@ pub struct BatchRegistryEntry {
     pub abort_latched: bool,
     pub commit_latched: bool,
     pub terminal_claimed: bool,
-    /// Monotonic admission generation. It is copied into the request's
-    /// [`BatchAttemptScope`] and is required for every terminal claim.
-    pub generation: u64,
+    /// Opaque admission generation. It is copied into every producer-owned
+    /// request/lane ticket and is required for terminal operations.
+    pub generation: BatchGeneration,
     pub pending_done: Option<serde_json::Value>,
     pub deadline: Option<Instant>,
 }
-
 pub struct BatchTerminalState {
     pub entries: std::collections::HashMap<AttemptKey, BatchRegistryEntry>,
     /// Monotonic epoch for admissions. Retired entries are removed rather
@@ -289,18 +304,17 @@ pub fn claim_wire_terminal(id: &str, attempt_id: u64) -> bool {
     claim_terminal(id, attempt_id)
 }
 
-/// Announce a generate key before queueing. Closes generate-then-immediate-
-/// abort races for requests that arrive while GPU work is active. Returns
-/// true if newly announced, false if already present.
-pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
+/// Announce a generate key before queueing and return its opaque admission
+/// generation. A present key is not re-owned.
+pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> Option<BatchGeneration> {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
     if g.entries.contains_key(&key) {
-        return false;
+        return None;
     }
     g.next_generation = g.next_generation.checked_add(1).unwrap_or(1);
-    let generation = g.next_generation;
+    let generation = BatchGeneration(g.next_generation);
     g.entries.insert(
         key,
         BatchRegistryEntry {
@@ -314,21 +328,28 @@ pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
         },
     );
     cell.cv.notify_all();
-    true
+    Some(generation)
 }
 
-/// Compatibility alias: current daemon generate arm still calls
-/// `batch_activate_terminal`. Keep it as Announced insertion and do not
-/// mutate the sequential singleton.
-pub fn batch_activate_terminal(id: &str, attempt_id: u64) {
-    batch_announce_terminal(id, attempt_id);
+/// Explicit batch admission alias. Returns the newly owned token.
+pub fn batch_activate_terminal(id: &str, attempt_id: u64) -> Option<BatchGeneration> {
+    batch_announce_terminal(id, attempt_id)
 }
 
-pub fn batch_transition_to_queued(id: &str, attempt_id: u64) -> bool {
+/// Promote an exact admission from Announced to Queued. Repeating the
+/// transition for the same owner is idempotent; a stale token fails closed.
+pub fn batch_transition_to_queued(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
-        if matches!(e.state, BatchRegistryState::Announced) {
+        if e.generation != generation {
+            return false;
+        }
+        if matches!(e.state, BatchRegistryState::Announced | BatchRegistryState::Queued) {
             e.state = BatchRegistryState::Queued;
             cell.cv.notify_all();
             return true;
@@ -337,11 +358,21 @@ pub fn batch_transition_to_queued(id: &str, attempt_id: u64) -> bool {
     false
 }
 
-pub fn batch_bind_active(id: &str, attempt_id: u64, owner: LaneTicket) -> bool {
+/// Bind a lane owner only when both the admission token and the lane ticket
+/// agree with the live registry entry.
+pub fn batch_bind_active(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+    owner: LaneTicket,
+) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
-        if matches!(e.state, BatchRegistryState::Queued) {
+        if e.generation == generation
+            && owner.admission == generation
+            && matches!(e.state, BatchRegistryState::Queued)
+        {
             e.state = BatchRegistryState::Active { owner };
             cell.cv.notify_all();
             return true;
@@ -353,13 +384,17 @@ pub fn batch_bind_active(id: &str, attempt_id: u64, owner: LaneTicket) -> bool {
 pub fn batch_mark_ready_with_pending(
     id: &str,
     attempt_id: u64,
+    generation: BatchGeneration,
     owner: LaneTicket,
     pending_done: serde_json::Value,
 ) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
-        if matches!(e.state, BatchRegistryState::Active { owner: o } if o == owner) {
+        if e.generation == generation
+            && owner.admission == generation
+            && matches!(e.state, BatchRegistryState::Active { owner: o } if o == owner)
+        {
             e.state = BatchRegistryState::Ready { owner };
             e.pending_done = Some(pending_done);
             e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
@@ -370,13 +405,15 @@ pub fn batch_mark_ready_with_pending(
     false
 }
 
-/// Legacy ready marker without payload. Transitions Active->Ready with a
-/// deadline and empty pending_done. Preserved for host-only tests that do
-/// not carry a full terminal payload yet.
-pub fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
+/// Host-only ready marker. Producer paths should use
+/// [`batch_mark_ready_with_pending`] with their captured token.
+pub fn batch_mark_ready(id: &str, attempt_id: u64, generation: BatchGeneration) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        if e.generation != generation {
+            return false;
+        }
         if let BatchRegistryState::Active { owner } = e.state {
             e.state = BatchRegistryState::Ready { owner };
             e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
@@ -391,6 +428,8 @@ pub fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
     false
 }
 
+/// Legacy administrative/test teardown. Producer paths must use
+/// [`batch_clear_terminal_at_generation`] so a stale owner cannot clear B.
 pub fn batch_clear_terminal(id: &str, attempt_id: u64) {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -399,11 +438,7 @@ pub fn batch_clear_terminal(id: &str, attempt_id: u64) {
 }
 
 /// Return the admission generation for an exact batch key.
-///
-/// Callers may capture this while entering a request-owned scope, but cleanup
-/// must pass the captured value to [`batch_clear_terminal_at_generation`]
-/// rather than looking it up again after work completes.
-pub fn batch_terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
+pub fn batch_terminal_generation(id: &str, attempt_id: u64) -> Option<BatchGeneration> {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     g.entries
@@ -411,14 +446,13 @@ pub fn batch_terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
         .map(|entry| entry.generation)
 }
 
-/// Remove a batch entry only when its admission generation still matches.
-///
-/// A request that has retired generation A must not remove a later admission
-/// B that reuses the same `(id, attempt_id)` key.
-pub fn batch_clear_terminal_at_generation(id: &str, attempt_id: u64, generation: u64) -> bool {
-    if generation == 0 {
-        return false;
-    }
+/// Remove a batch entry only when its opaque admission generation still
+/// matches. A retired A owner cannot remove later B.
+pub fn batch_clear_terminal_at_generation(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
@@ -433,6 +467,48 @@ pub fn batch_clear_terminal_at_generation(id: &str, attempt_id: u64, generation:
     matches
 }
 
+/// True when the exact admission is still live, regardless of lifecycle
+/// state. This is used before copying a request token into scheduler state.
+pub fn batch_is_current(id: &str, attempt_id: u64, generation: BatchGeneration) -> bool {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    g.entries
+        .get(&AttemptKey::new(id, attempt_id))
+        .is_some_and(|entry| entry.generation == generation)
+}
+
+pub fn batch_active_owner_matches(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+    owner: LaneTicket,
+) -> bool {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    matches!(
+        g.entries.get(&AttemptKey::new(id, attempt_id)),
+        Some(e)
+            if e.generation == generation
+                && matches!(e.state, BatchRegistryState::Active { owner: o } if o == owner)
+    )
+}
+
+pub fn batch_ready_owner_matches(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+    owner: LaneTicket,
+) -> bool {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    matches!(
+        g.entries.get(&AttemptKey::new(id, attempt_id)),
+        Some(e)
+            if e.generation == generation
+                && matches!(e.state, BatchRegistryState::Ready { owner: o } if o == owner)
+    )
+}
+
 pub fn batch_clear_all_terminals() {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -440,9 +516,8 @@ pub fn batch_clear_all_terminals() {
     cell.cv.notify_all();
 }
 
-/// Apply abort/commit control. Abort latches in any state; Commit only in
-/// Ready with matching owner. Stale or unknown keys are ignored and fail
-/// closed elsewhere. Never mutates the sequential singleton.
+/// Apply abort/commit control by current wire key. The wire protocol has no
+/// generation, so this is intentionally the sole key-only producer input.
 pub fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
@@ -468,21 +543,30 @@ pub fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
     }
 }
 
-pub fn batch_check_abort(id: &str, attempt_id: u64) -> bool {
+pub fn batch_check_abort(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> bool {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     g.entries
         .get(&AttemptKey::new(id, attempt_id))
-        .is_some_and(|e| e.abort_latched)
+        .is_some_and(|e| e.generation == generation && e.abort_latched)
 }
 
-/// Non-mutating poll. Returns Commit only if Ready and commit latched and
-/// not aborted; Abort if abort latched or deadline expired; None otherwise.
-/// Never latches or mutates.
-pub fn batch_poll_decision(id: &str, attempt_id: u64) -> Option<ClientTerminalDecision> {
+/// Non-mutating generation-checked poll.
+pub fn batch_poll_decision(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> Option<ClientTerminalDecision> {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     let e = g.entries.get(&AttemptKey::new(id, attempt_id))?;
+    if e.generation != generation {
+        return None;
+    }
     if e.abort_latched {
         return Some(ClientTerminalDecision::Abort);
     }
@@ -491,18 +575,19 @@ pub fn batch_poll_decision(id: &str, attempt_id: u64) -> Option<ClientTerminalDe
             return Some(ClientTerminalDecision::Abort);
         }
     }
-    if e.commit_latched {
-        if matches!(e.state, BatchRegistryState::Ready { .. }) {
-            return Some(ClientTerminalDecision::Commit);
-        }
+    if e.commit_latched && matches!(e.state, BatchRegistryState::Ready { .. }) {
+        return Some(ClientTerminalDecision::Commit);
     }
     None
 }
 
-/// Blocking wait used by lane commit polling (30 s deadline). Unlike the
-/// 5 ms host-sim poll, this waits on the condvar and respects the lane's
-/// deadline. Returns Abort on timeout/expiry.
-pub fn batch_wait_decision(id: &str, attempt_id: u64, timeout: Duration) -> ClientTerminalDecision {
+/// Blocking generation-checked wait used by lane commit polling.
+pub fn batch_wait_decision(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+    timeout: Duration,
+) -> ClientTerminalDecision {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     let deadline = Instant::now() + timeout;
@@ -511,7 +596,7 @@ pub fn batch_wait_decision(id: &str, attempt_id: u64, timeout: Duration) -> Clie
         match entry {
             None => return ClientTerminalDecision::Abort,
             Some(e) => {
-                if e.abort_latched {
+                if e.generation != generation || e.abort_latched {
                     return ClientTerminalDecision::Abort;
                 }
                 if let Some(dl) = e.deadline {
@@ -537,19 +622,33 @@ pub fn batch_wait_decision(id: &str, attempt_id: u64, timeout: Duration) -> Clie
     }
 }
 
-/// If an announced request becomes a sequential barrier, transfer any
-/// pre-latched Abort into the sequential singleton before invoking the
-/// unchanged sequential route, then remove the keyed announcement. Early
-/// Commit is ignored.
-pub fn batch_transfer_abort_to_singleton_and_clear(id: &str, attempt_id: u64) -> bool {
-    let had_abort = batch_check_abort(id, attempt_id);
-    batch_clear_terminal(id, attempt_id);
+/// Transfer an exact batch admission to the sequential singleton. The batch
+/// lock is released before taking the singleton lock or applying control.
+pub fn batch_transfer_abort_to_singleton_and_clear(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> bool {
+    let had_abort = {
+        let cell = batch_terminal_control();
+        let mut g = cell.mu.lock().unwrap();
+        let key = AttemptKey::new(id, attempt_id);
+        let Some(entry) = g.entries.get(&key) else {
+            return false;
+        };
+        if entry.generation != generation {
+            return false;
+        }
+        let had_abort = entry.abort_latched;
+        g.entries.remove(&key);
+        cell.cv.notify_all();
+        had_abort
+    };
     if had_abort {
         activate_terminal_control(id, attempt_id);
         apply_terminal_control("abort", id, attempt_id);
-        return true;
     }
-    false
+    had_abort
 }
 
 /// Pure commit-teardown classifier: success `done` is allowed only after both
@@ -625,20 +724,27 @@ pub fn batch_should_finish_decode(
     is_eos || hit_max_tokens || hit_lane_capacity || stopped || loop_hit
 }
 
-pub fn batch_pending_deadline(id: &str, attempt_id: u64) -> Option<Instant> {
+pub fn batch_pending_deadline(
+    id: &str,
+    attempt_id: u64,
+    generation: BatchGeneration,
+) -> Option<Instant> {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     g.entries
         .get(&AttemptKey::new(id, attempt_id))
+        .filter(|e| e.generation == generation)
         .and_then(|e| e.deadline)
 }
 
-pub fn batch_is_ready(id: &str, attempt_id: u64) -> bool {
+pub fn batch_is_ready(id: &str, attempt_id: u64, generation: BatchGeneration) -> bool {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     matches!(
         g.entries.get(&AttemptKey::new(id, attempt_id)),
-        Some(e) if matches!(e.state, BatchRegistryState::Ready { .. })
+        Some(e)
+            if e.generation == generation
+                && matches!(e.state, BatchRegistryState::Ready { .. })
     )
 }
 
@@ -648,9 +754,9 @@ thread_local! {
     /// Active generate attempt_id for typed errors emitted during a request.
     /// Reset path parses attempt_id from the message directly.
     static ACTIVE_ATTEMPT_ID: Cell<u64> = const { Cell::new(0) };
-    /// Batch admission generation paired with [`ACTIVE_ATTEMPT_ID`].
+    /// Opaque batch admission generation paired with [`ACTIVE_ATTEMPT_ID`].
     /// `None` means this scope is not a live keyed batch producer.
-    static ACTIVE_BATCH_GENERATION: Cell<Option<u64>> = const { Cell::new(None) };
+    static ACTIVE_BATCH_GENERATION: Cell<Option<BatchGeneration>> = const { Cell::new(None) };
 }
 
 pub fn active_attempt_id() -> u64 {
@@ -661,11 +767,11 @@ pub fn set_active_attempt_id(id: u64) {
     ACTIVE_ATTEMPT_ID.with(|c| c.set(id));
 }
 
-pub fn active_batch_generation() -> Option<u64> {
+pub fn active_batch_generation() -> Option<BatchGeneration> {
     ACTIVE_BATCH_GENERATION.with(Cell::get)
 }
 
-fn batch_generation_for(id: Option<&str>, attempt_id: u64) -> Option<u64> {
+fn batch_generation_for(id: Option<&str>, attempt_id: u64) -> Option<BatchGeneration> {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     let mut generations = g.entries.iter().filter_map(|(key, entry)| {
@@ -687,38 +793,47 @@ impl Drop for ActiveAttemptGuard {
 
 /// Temporarily bind batch-lane emissions to their request attempt and
 /// admission generation.
-///
-/// Continuous batching interleaves independent requests inside one outer
-/// daemon command, so every lane-specific wire event must restore the
-/// previously active attempt and generation when its emission scope ends.
 pub struct BatchAttemptScope {
     pub previous: u64,
-    previous_batch_generation: Option<u64>,
-    admission_generation: Option<u64>,
+    previous_batch_generation: Option<BatchGeneration>,
+    admission_generation: Option<BatchGeneration>,
 }
 
 impl BatchAttemptScope {
+    /// Test/admin convenience lookup. Producer paths should use
+    /// [`Self::enter_for_generation`] with their captured token.
     pub fn enter(attempt_id: u64) -> Self {
         Self::enter_with_generation(attempt_id, batch_generation_for(None, attempt_id))
     }
 
+    /// Test/admin convenience lookup. Producer paths should use
+    /// [`Self::enter_for_generation`] with their captured token.
     pub fn enter_for(id: &str, attempt_id: u64) -> Self {
         Self::enter_with_generation(attempt_id, batch_generation_for(Some(id), attempt_id))
     }
 
+    pub fn enter_for_generation(
+        id: &str,
+        attempt_id: u64,
+        generation: BatchGeneration,
+    ) -> Self {
+        let generation = batch_is_current(id, attempt_id, generation).then_some(generation);
+        Self::enter_with_generation(attempt_id, generation)
+    }
+
     /// Rebind an existing outer scope after its keyed batch entry is retired.
-    /// Sequential fallback then remains eligible for the singleton claim while
-    /// preserving the scope's original TLS values for Drop restoration.
+    /// Sequential fallback then remains eligible for the singleton claim.
     pub fn rebind_for(&mut self, attempt_id: u64) {
         set_active_attempt_id(attempt_id);
         ACTIVE_BATCH_GENERATION.with(|c| c.set(None));
+        self.admission_generation = None;
     }
 
-    pub fn admission_generation(&self) -> Option<u64> {
+    pub fn admission_generation(&self) -> Option<BatchGeneration> {
         self.admission_generation
     }
 
-    fn enter_with_generation(attempt_id: u64, generation: Option<u64>) -> Self {
+    fn enter_with_generation(attempt_id: u64, generation: Option<BatchGeneration>) -> Self {
         let previous = active_attempt_id();
         let previous_batch_generation = active_batch_generation();
         set_active_attempt_id(attempt_id);

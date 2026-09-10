@@ -45,47 +45,45 @@ use std::time::Instant;
 struct BatchTerminalCleanup {
     id: String,
     attempt_id: u64,
-    generation: Option<u64>,
+    admission: Option<BatchGeneration>,
 }
 
 impl BatchTerminalCleanup {
-    fn new(key: &AttemptKey, generation: Option<u64>) -> Self {
+    fn new(key: &AttemptKey, admission: Option<BatchGeneration>) -> Self {
         Self {
             id: key.id.clone(),
             attempt_id: key.attempt_id,
-            generation,
+            admission,
         }
     }
 }
 
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
-        if let Some(generation) = self.generation {
-            batch_clear_terminal_at_generation(&self.id, self.attempt_id, generation);
+        if let Some(admission) = self.admission {
+            batch_clear_terminal_at_generation(&self.id, self.attempt_id, admission);
         }
     }
 }
+
 /// Emit one correlated terminal error for a request that was already
 /// announced on the batch plane, then retire only that admission generation.
 fn emit_batch_admission_error(
     stdout: &mut impl Write,
     id: &str,
     attempt_id: u64,
+    admission: BatchGeneration,
     message: &str,
     class: &str,
     retryable: bool,
     rolled_back: bool,
 ) {
-    let generation = {
-        let scope = BatchAttemptScope::enter_for(id, attempt_id);
-        let generation = scope.admission_generation();
+    {
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
         emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
         let _ = stdout.flush();
-        generation
-    };
-    if let Some(generation) = generation {
-        batch_clear_terminal_at_generation(id, attempt_id, generation);
     }
+    batch_clear_terminal_at_generation(id, attempt_id, admission);
 }
 
 /// Cancellable LFM prefill helper. Attempts to use the arch's
@@ -333,22 +331,30 @@ pub fn drive_qwen_continuous_batch(
                     reason: String|
      -> Result<(), BatchDriveError> {
         let mut uniq_set = std::collections::HashSet::new();
-        let mut uniq: Vec<AttemptKey> = Vec::new();
-        for l in sched.lanes.iter() {
-            if let Some(k) = l.key() {
-                if uniq_set.insert(k.clone()) {
-                    uniq.push(k.clone());
+        let mut uniq: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for lane in sched.lanes.iter() {
+            let Some(key) = lane.key() else {
+                continue;
+            };
+            let admission = match lane {
+                BatchLane::Seeding(q) | BatchLane::Running(q) => q.ticket.admission,
+                BatchLane::AwaitingClient(t) => t.ticket.admission,
+                BatchLane::Empty { .. } => continue,
+            };
+            if uniq_set.insert((key.clone(), admission)) {
+                uniq.push((key.clone(), admission));
+            }
+        }
+        for key in sched.inbox.iter().cloned() {
+            if let Some(request) = sched.pending.get(&key) {
+                if uniq_set.insert((key.clone(), request.admission)) {
+                    uniq.push((key, request.admission));
                 }
             }
         }
-        for k in sched.inbox.iter().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
-            }
-        }
-        for k in sched.pending.keys().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
+        for (key, request) in sched.pending.iter() {
+            if uniq_set.insert((key.clone(), request.admission)) {
+                uniq.push((key.clone(), request.admission));
             }
         }
         let mut first_err: Option<String> = None;
@@ -362,8 +368,9 @@ pub fn drive_qwen_continuous_batch(
             None => Ok(()),
         };
         let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
-        for key in &uniq {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (key, admission) in &uniq {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, *admission);
             crate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
@@ -374,9 +381,6 @@ pub fn drive_qwen_continuous_batch(
             );
         }
         let _ = sched.fail_all_active();
-        for k in &uniq {
-            batch_clear_terminal(&k.id, k.attempt_id);
-        }
         if !ep.rolled_back {
             return Err(BatchDriveError::Poisoned(format!(
                 "{reason}; {}",
@@ -386,22 +390,24 @@ pub fn drive_qwen_continuous_batch(
         Err(BatchDriveError::Gpu(reason))
     };
     loop {
-        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_commit: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in 0..batch_size {
             if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
                 let key = term.key.clone();
+                let admission = term.ticket.admission;
                 let expired = Instant::now() >= term.deadline;
-                if batch_check_abort(&key.id, key.attempt_id) || expired {
-                    to_abort.push((idx, key));
+                if batch_check_abort(&key.id, key.attempt_id, admission) || expired {
+                    to_abort.push((idx, key, admission));
                 } else if let Some(ClientTerminalDecision::Commit) =
-                    batch_poll_decision(&key.id, key.attempt_id)
+                    batch_poll_decision(&key.id, key.attempt_id, admission)
                 {
-                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                    to_commit.push((idx, key.clone(), admission, term.pending_done.clone()));
                 }
             }
         }
-        for (idx, key) in to_abort {
+        for (idx, key, admission) in to_abort {
             if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
                 return fail_all(
                     sched,
@@ -411,13 +417,13 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
-        for (idx, key, pending_done) in to_commit {
-            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (idx, key, admission, pending_done) in to_commit {
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             // Transactional commit: reset GPU first, then host commit_lane,
             // and only then emit the staged done. Never done+error.
             let reset_ok = match batch_state.reset_lane(gpu, &config, idx) {
@@ -432,15 +438,13 @@ pub fn drive_qwen_continuous_batch(
                     );
                 }
             };
-            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key, admission);
             // Keep the keyed registry alive through the terminal writer. This
             // also clears it on error/early return after the host transition.
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, Some(admission));
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
-                    // GPU lane already reset; host release failed — no success
-                    // terminal. Fail closed for this key only and free the slot.
                     let ep = crate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
@@ -453,7 +457,7 @@ pub fn drive_qwen_continuous_batch(
                         false,
                         &ep,
                     );
-                    let _ = sched.abort_lane(idx, &key);
+                    let _ = sched.abort_lane(idx, &key, admission);
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
@@ -462,30 +466,36 @@ pub fn drive_qwen_continuous_batch(
                 }
             }
         }
-        let mut queued_abort: Vec<AttemptKey> = Vec::new();
-        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
-            if batch_check_abort(&k.id, k.attempt_id) {
-                queued_abort.push(k);
-            }
-        }
-        for k in queued_abort {
-            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
-            let _ = sched.abort_queued(&k);
-        }
-        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
-        for idx in 0..batch_size {
-            if let Some(k) = sched.lanes[idx].key().cloned() {
-                if matches!(
-                    sched.lanes[idx],
-                    BatchLane::Running(_) | BatchLane::Seeding(_)
-                ) && batch_check_abort(&k.id, k.attempt_id)
-                {
-                    running_abort.push((idx, k));
+        let mut queued_abort: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if let Some(request) = sched.pending.get(&key) {
+                if batch_check_abort(&key.id, key.attempt_id, request.admission) {
+                    queued_abort.push((key, request.admission));
                 }
             }
         }
-        for (idx, key) in running_abort {
+        for (key, admission) in queued_abort {
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            let _ = sched.abort_queued(&key, admission);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(key) = sched.lanes[idx].key().cloned() {
+                let admission = match &sched.lanes[idx] {
+                    BatchLane::Running(l) | BatchLane::Seeding(l) => l.ticket.admission,
+                    _ => continue,
+                };
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&key.id, key.attempt_id, admission)
+                {
+                    running_abort.push((idx, key, admission));
+                }
+            }
+        }
+        for (idx, key, admission) in running_abort {
             if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
                 return fail_all(
                     sched,
@@ -495,9 +505,9 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
         let mut barrier: Option<DaemonMsg> = None;
@@ -507,7 +517,17 @@ pub fn drive_qwen_continuous_batch(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             };
+            let (dm, carried_admission) = match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    (DaemonMsg::Regular(json), Some(admission))
+                }
+                other => (other, None),
+            };
             match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -552,9 +572,13 @@ pub fn drive_qwen_continuous_batch(
                             .and_then(|v| v.as_str())
                             .unwrap_or("0")
                             .to_string();
-                        batch_announce_terminal(&id, attempt_id);
-                        if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                        let Some(admission) = carried_admission else {
+                            barrier = Some(daemon_regular_with_admission(json, None));
+                            break;
+                        };
+                        if batch_check_abort(&id, attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -562,7 +586,7 @@ pub fn drive_qwen_continuous_batch(
                                 false,
                             );
                             crate::ar::emit_active_route_cancel(stdout, &id, 0);
-                            batch_clear_terminal(&id, attempt_id);
+                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
                             continue;
                         }
                         if !is_batch_request_eligible(
@@ -572,7 +596,7 @@ pub fn drive_qwen_continuous_batch(
                             parse_serve_continuous_batch(&json),
                             false,
                         ) {
-                            barrier = Some(DaemonMsg::Regular(json));
+                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
                         }
                         let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
@@ -617,6 +641,7 @@ pub fn drive_qwen_continuous_batch(
                                         stdout,
                                         &id,
                                         attempt_id,
+                                        admission,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
@@ -652,6 +677,7 @@ pub fn drive_qwen_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
@@ -664,8 +690,12 @@ pub fn drive_qwen_continuous_batch(
                             // Pre-latched abort must move to the sequential
                             // singleton before this key leaves the batch plane.
                             // Transfer clears the keyed entry exactly once.
-                            let _ = batch_transfer_abort_to_singleton_and_clear(&id, attempt_id);
-                            barrier = Some(DaemonMsg::Regular(json));
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
+                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
@@ -673,6 +703,7 @@ pub fn drive_qwen_continuous_batch(
                                 stdout,
                                 &id,
                                 attempt_id,
+                                admission,
                                 "prompt exceeds lane capacity or empty",
                                 "validation",
                                 false,
@@ -690,6 +721,7 @@ pub fn drive_qwen_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &reason,
                                     "validation",
                                     false,
@@ -698,10 +730,11 @@ pub fn drive_qwen_continuous_batch(
                                 continue;
                             }
                         };
-                        batch_transition_to_queued(&id, attempt_id);
+                        batch_transition_to_queued(&id, attempt_id, admission);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
+                            admission,
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -722,7 +755,11 @@ pub fn drive_qwen_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -739,7 +776,7 @@ pub fn drive_qwen_continuous_batch(
                             batch_apply_terminal_control(kind, id, aid);
                         }
                     } else {
-                        barrier = Some(DaemonMsg::Regular(json));
+                        barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
                     }
                 }
@@ -766,8 +803,13 @@ pub fn drive_qwen_continuous_batch(
                 // any pre-latched abort once, free the just-assigned lane, and
                 // push the generate back for outer sequential handling.
                 let prompt = pending_req.prompt.clone();
-                let _ = batch_transfer_abort_to_singleton_and_clear(&key.id, key.attempt_id);
-                let _ = sched.abort_lane(lane_idx, &key);
+                let admission = pending_req.admission;
+                let _ = batch_transfer_abort_to_singleton_and_clear(
+                    &key.id,
+                    key.attempt_id,
+                    admission,
+                );
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 if let Err(err) = batch_state.reset_lane(gpu, &config, lane_idx) {
                     return fail_all(
                         sched,
@@ -777,13 +819,16 @@ pub fn drive_qwen_continuous_batch(
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                inbox.push_front(DaemonMsg::Regular(serde_json::json!({
+                let requeued = serde_json::json!({
                     "type": "generate",
                     "id": key.id,
                     "attempt_id": key.attempt_id,
                     "prompt": prompt
-                })));
-                break;
+                });
+                inbox.push_front(daemon_regular_with_admission(
+                    requeued,
+                    Some(admission),
+                ));
             }
 
             if let Err(e) = batch_state.reset_lane(gpu, &config, lane_idx) {
@@ -929,15 +974,20 @@ pub fn drive_qwen_continuous_batch(
         let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
         let mut rng_states: Vec<u32> = vec![0; batch_size];
         let mut survivors: Vec<usize> = Vec::new();
-        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in running.clone() {
             let key = match sched.lanes[idx].key().cloned() {
                 Some(k) => k,
                 None => continue,
             };
-            if batch_check_abort(&key.id, key.attempt_id) {
-                to_abort_running.push((idx, key));
+            let admission = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.ticket.admission,
+                _ => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id, admission) {
+                to_abort_running.push((idx, key, admission));
                 continue;
             }
             let lane_ptr = match &mut sched.lanes[idx] {
@@ -956,7 +1006,8 @@ pub fn drive_qwen_continuous_batch(
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
             let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
             let token_bytes = all_bytes[prev_fed..].to_vec();
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             // TTFT: host Instant immediately before the first classified emit.
             if lane.first_token_at.is_none() {
                 lane.first_token_at = Some(Instant::now());
@@ -1002,8 +1053,6 @@ pub fn drive_qwen_continuous_batch(
             let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
             let is_eos = cur_token == eos_tok || cur_token == im_end_tok;
             let hit_max = lane.streamed_tokens.len() >= lane_max_tokens(&key, sched);
-            // After committing the current token, seq_pos is the next decode
-            // index and must stay strictly below lane_capacity.
             let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, sched.lane_capacity);
             let should_finish =
                 batch_should_finish_decode(is_eos, hit_max, hit_lane_cap, stopped, loop_hit);
@@ -1028,9 +1077,6 @@ pub fn drive_qwen_continuous_batch(
                     }
                 };
                 if matches!(finish.cause, QwenArTerminalCause::OpenThink) && !is_eos {
-                    // A single lane's semantic validation error is not a GPU core
-                    // failure. Roll the lane back and report this key only; peers
-                    // keep decoding and the lane is reset before any refill.
                     if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
                         return fail_all(
                             sched,
@@ -1044,14 +1090,13 @@ pub fn drive_qwen_continuous_batch(
                         rolled_back: true,
                         context: None,
                     };
-                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
                     emit_qwen_ar_open_think_terminal(
                         stdout,
                         &key.id,
                         lane.streamed_tokens.len(),
                         &ep,
                     );
-                    let _ = sched.abort_lane(idx, &key);
+                    let _ = sched.abort_lane(idx, &key, admission);
                     producers[idx] = None;
                     continue;
                 }
@@ -1101,7 +1146,7 @@ pub fn drive_qwen_continuous_batch(
                     /*max_active_lanes=*/ lane.max_active_lanes.max(1),
                 );
                 let _ = visible_text;
-                to_await.push((idx, key.clone(), pending_done));
+                to_await.push((idx, key.clone(), admission, pending_done));
             } else {
                 survivors.push(idx);
                 let window = lane
@@ -1120,7 +1165,7 @@ pub fn drive_qwen_continuous_batch(
                 rng_states[idx] = lane.rng_state as u32;
             }
         }
-        for (idx, key) in to_abort_running {
+        for (idx, key, admission) in to_abort_running {
             if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
                 return fail_all(
                     sched,
@@ -1130,13 +1175,14 @@ pub fn drive_qwen_continuous_batch(
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
         // Install AwaitingClient/Ready BEFORE publishing commit_ready; rollback if publish fails.
-        for (idx, key, pending_done) in to_await {
+        for (idx, key, admission, pending_done) in to_await {
             let mut envelope = pending_done.clone();
             envelope["type"] = serde_json::json!("commit_ready");
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
@@ -1146,17 +1192,18 @@ pub fn drive_qwen_continuous_batch(
                     key.id
                 );
                 let _ = batch_state.reset_lane(gpu, &config, idx);
-                let _ = sched.abort_lane(idx, &key);
+                let _ = sched.abort_lane(idx, &key, admission);
                 producers[idx] = None;
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
                 let _ = batch_state.reset_lane(gpu, &config, idx);
-                let _ = sched.abort_lane(idx, &key);
+                let _ = sched.abort_lane(idx, &key, admission);
                 producers[idx] = None;
             }
             // On success, lane stays AwaitingClient reserved until commit/abort decision.
@@ -1281,22 +1328,30 @@ pub fn drive_lfm_continuous_batch(
                     reason: String|
      -> Result<(), BatchDriveError> {
         let mut uniq_set = std::collections::HashSet::new();
-        let mut uniq: Vec<AttemptKey> = Vec::new();
-        for l in sched.lanes.iter() {
-            if let Some(k) = l.key() {
-                if uniq_set.insert(k.clone()) {
-                    uniq.push(k.clone());
+        let mut uniq: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for lane in sched.lanes.iter() {
+            let Some(key) = lane.key() else {
+                continue;
+            };
+            let admission = match lane {
+                BatchLane::Seeding(q) | BatchLane::Running(q) => q.ticket.admission,
+                BatchLane::AwaitingClient(t) => t.ticket.admission,
+                BatchLane::Empty { .. } => continue,
+            };
+            if uniq_set.insert((key.clone(), admission)) {
+                uniq.push((key.clone(), admission));
+            }
+        }
+        for key in sched.inbox.iter().cloned() {
+            if let Some(request) = sched.pending.get(&key) {
+                if uniq_set.insert((key.clone(), request.admission)) {
+                    uniq.push((key, request.admission));
                 }
             }
         }
-        for k in sched.inbox.iter().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
-            }
-        }
-        for k in sched.pending.keys().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
+        for (key, request) in sched.pending.iter() {
+            if uniq_set.insert((key.clone(), request.admission)) {
+                uniq.push((key.clone(), request.admission));
             }
         }
         let mut first_err: Option<String> = None;
@@ -1310,8 +1365,9 @@ pub fn drive_lfm_continuous_batch(
             None => Ok(()),
         };
         let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
-        for key in &uniq {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (key, admission) in &uniq {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, *admission);
             crate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
@@ -1322,9 +1378,6 @@ pub fn drive_lfm_continuous_batch(
             );
         }
         let _ = sched.fail_all_active();
-        for k in &uniq {
-            batch_clear_terminal(&k.id, k.attempt_id);
-        }
         if !ep.rolled_back {
             return Err(BatchDriveError::Poisoned(format!(
                 "{reason}; {}",
@@ -1334,22 +1387,24 @@ pub fn drive_lfm_continuous_batch(
         Err(BatchDriveError::Gpu(reason))
     };
     loop {
-        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_commit: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in 0..batch_size {
             if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
                 let key = term.key.clone();
+                let admission = term.ticket.admission;
                 let expired = Instant::now() >= term.deadline;
-                if batch_check_abort(&key.id, key.attempt_id) || expired {
-                    to_abort.push((idx, key));
+                if batch_check_abort(&key.id, key.attempt_id, admission) || expired {
+                    to_abort.push((idx, key, admission));
                 } else if let Some(ClientTerminalDecision::Commit) =
-                    batch_poll_decision(&key.id, key.attempt_id)
+                    batch_poll_decision(&key.id, key.attempt_id, admission)
                 {
-                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                    to_commit.push((idx, key.clone(), admission, term.pending_done.clone()));
                 }
             }
         }
-        for (idx, key) in to_abort {
+        for (idx, key, admission) in to_abort {
             if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
                 return fail_all(
                     sched,
@@ -1359,12 +1414,14 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
         }
-        for (idx, key, pending_done) in to_commit {
-            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (idx, key, admission, pending_done) in to_commit {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             let reset_ok = match batch_state.reset_lane(gpu, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -1377,8 +1434,8 @@ pub fn drive_lfm_continuous_batch(
                     );
                 }
             };
-            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key, admission);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, Some(admission));
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -1394,37 +1451,44 @@ pub fn drive_lfm_continuous_batch(
                         false,
                         &ep,
                     );
-                    let _ = sched.abort_lane(idx, &key);
+                    let _ = sched.abort_lane(idx, &key, admission);
                 }
                 BatchCommitTeardownClass::EmitDone => {
                     crate::ar::emit_active_route_done_value(stdout, &pending_done);
                 }
             }
         }
-        let mut queued_abort: Vec<AttemptKey> = Vec::new();
-        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
-            if batch_check_abort(&k.id, k.attempt_id) {
-                queued_abort.push(k);
-            }
-        }
-        for k in queued_abort {
-            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
-            let _ = sched.abort_queued(&k);
-        }
-        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
-        for idx in 0..batch_size {
-            if let Some(k) = sched.lanes[idx].key().cloned() {
-                if matches!(
-                    sched.lanes[idx],
-                    BatchLane::Running(_) | BatchLane::Seeding(_)
-                ) && batch_check_abort(&k.id, k.attempt_id)
-                {
-                    running_abort.push((idx, k));
+        let mut queued_abort: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if let Some(request) = sched.pending.get(&key) {
+                if batch_check_abort(&key.id, key.attempt_id, request.admission) {
+                    queued_abort.push((key, request.admission));
                 }
             }
         }
-        for (idx, key) in running_abort {
+        for (key, admission) in queued_abort {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            let _ = sched.abort_queued(&key, admission);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(key) = sched.lanes[idx].key().cloned() {
+                let admission = match &sched.lanes[idx] {
+                    BatchLane::Running(l) | BatchLane::Seeding(l) => l.ticket.admission,
+                    _ => continue,
+                };
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&key.id, key.attempt_id, admission)
+                {
+                    running_abort.push((idx, key, admission));
+                }
+            }
+        }
+        for (idx, key, admission) in running_abort {
             if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
                 return fail_all(
                     sched,
@@ -1434,9 +1498,10 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
         }
         let mut barrier: Option<DaemonMsg> = None;
         // A fresh continuous-batch wave reaches the daemon through many
@@ -1473,7 +1538,17 @@ pub fn drive_lfm_continuous_batch(
                 }
                 Err(mpsc::TryRecvError::Disconnected) => break,
             };
+            let (dm, carried_admission) = match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    (DaemonMsg::Regular(json), Some(admission))
+                }
+                other => (other, None),
+            };
             match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -1518,9 +1593,13 @@ pub fn drive_lfm_continuous_batch(
                             .and_then(|v| v.as_str())
                             .unwrap_or("0")
                             .to_string();
-                        batch_announce_terminal(&id, attempt_id);
-                        if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                        let Some(admission) = carried_admission else {
+                            barrier = Some(daemon_regular_with_admission(json, None));
+                            break;
+                        };
+                        if batch_check_abort(&id, attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::LfmAr,
                                 stdout,
@@ -1528,7 +1607,7 @@ pub fn drive_lfm_continuous_batch(
                                 false,
                             );
                             crate::ar::emit_active_route_cancel(stdout, &id, 0);
-                            batch_clear_terminal(&id, attempt_id);
+                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
                             continue;
                         }
                         if !is_batch_request_eligible(
@@ -1538,7 +1617,7 @@ pub fn drive_lfm_continuous_batch(
                             parse_serve_continuous_batch(&json),
                             false,
                         ) {
-                            barrier = Some(DaemonMsg::Regular(json));
+                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
                         }
                         let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
@@ -1583,6 +1662,7 @@ pub fn drive_lfm_continuous_batch(
                                         stdout,
                                         &id,
                                         attempt_id,
+                                        admission,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
@@ -1610,6 +1690,7 @@ pub fn drive_lfm_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
@@ -1619,8 +1700,12 @@ pub fn drive_lfm_continuous_batch(
                             }
                         };
                         if started_in_think {
-                            let _ = batch_transfer_abort_to_singleton_and_clear(&id, attempt_id);
-                            barrier = Some(DaemonMsg::Regular(json));
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
+                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
                         }
                         if prompt_tokens.is_empty() {
@@ -1628,6 +1713,7 @@ pub fn drive_lfm_continuous_batch(
                                 stdout,
                                 &id,
                                 attempt_id,
+                                admission,
                                 "empty prompt after tokenize",
                                 "validation",
                                 false,
@@ -1644,6 +1730,7 @@ pub fn drive_lfm_continuous_batch(
                                 stdout,
                                 &id,
                                 attempt_id,
+                                admission,
                                 &format!(
                                     "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
                                     prompt_tokens.len(),
@@ -1666,6 +1753,7 @@ pub fn drive_lfm_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &reason,
                                     "validation",
                                     false,
@@ -1674,10 +1762,11 @@ pub fn drive_lfm_continuous_batch(
                                 continue;
                             }
                         };
-                        batch_transition_to_queued(&id, attempt_id);
+                        batch_transition_to_queued(&id, attempt_id, admission);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
+                            admission,
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -1696,7 +1785,11 @@ pub fn drive_lfm_continuous_batch(
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::LfmAr,
                                 stdout,
@@ -1713,7 +1806,7 @@ pub fn drive_lfm_continuous_batch(
                             batch_apply_terminal_control(kind, id, aid);
                         }
                     } else {
-                        barrier = Some(DaemonMsg::Regular(json));
+                        barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
                     }
                 }
@@ -1760,8 +1853,10 @@ pub fn drive_lfm_continuous_batch(
                     match prefill_res {
                         Ok(()) => {
                             for (idx, key) in assigned_keys.iter().enumerate() {
-                                let lane_idx = assigned_tickets[idx].lane;
-                                if batch_check_abort(&key.id, key.attempt_id) {
+                                let ticket = assigned_tickets[idx];
+                                let lane_idx = ticket.lane;
+                                let admission = ticket.admission;
+                                if batch_check_abort(&key.id, key.attempt_id, admission) {
                                     if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
                                         return fail_all(
                                             sched,
@@ -1771,8 +1866,11 @@ pub fn drive_lfm_continuous_batch(
                                             format!("reset lane {lane_idx} on batched prefill abort: {e}"),
                                         );
                                     }
-                                    let _scope =
-                                        BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                                    let _scope = BatchAttemptScope::enter_for_generation(
+                                        &key.id,
+                                        key.attempt_id,
+                                        admission,
+                                    );
                                     let ep = crate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -1780,7 +1878,7 @@ pub fn drive_lfm_continuous_batch(
                                     crate::common::emit_spec_cancel_after_rollback(
                                         stdout, &key.id, 0, &ep,
                                     );
-                                    let _ = sched.abort_lane(lane_idx, key);
+                                    let _ = sched.abort_lane(lane_idx, key, admission);
                                     continue;
                                 }
                                 let hist: &[u32] = &[];
@@ -1835,10 +1933,10 @@ pub fn drive_lfm_continuous_batch(
                         }
                     }
                 } else {
-                    // Partial assign failure: rollback any already-assigned lanes
+                    // Partial assign failure: rollback any already-assigned lanes.
                     for (k, t) in assigned_keys.iter().zip(assigned_tickets.iter()) {
                         let _ = batch_state.reset_lane(gpu, config, t.lane);
-                        let _ = sched.abort_lane(t.lane, k);
+                        let _ = sched.abort_lane(t.lane, k, t.admission);
                     }
                 }
             }
@@ -1852,10 +1950,15 @@ pub fn drive_lfm_continuous_batch(
             let prompt_tokens = pending_req.prompt_tokens.clone();
             let max_tokens_req = pending_req.max_tokens;
             let started_in_think = pending_req.started_in_think;
+            let admission = pending_req.admission;
             if started_in_think {
                 let prompt = pending_req.prompt.clone();
-                let _ = batch_transfer_abort_to_singleton_and_clear(&key.id, key.attempt_id);
-                let _ = sched.abort_lane(lane_idx, &key);
+                let _ = batch_transfer_abort_to_singleton_and_clear(
+                    &key.id,
+                    key.attempt_id,
+                    admission,
+                );
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 if let Err(err) = batch_state.reset_lane(gpu, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -1865,19 +1968,21 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                inbox.push_front(DaemonMsg::Regular(serde_json::json!({
+                let requeued = serde_json::json!({
                     "type": "generate",
                     "id": key.id,
                     "attempt_id": key.attempt_id,
                     "prompt": prompt
-                })));
+                });
+                inbox.push_front(daemon_regular_with_admission(
+                    requeued,
+                    Some(admission),
+                ));
                 break;
             }
             // Re-validate capacity at assignment time (defensive; lane_capacity is the source of truth).
             if batch_lfm_exceeds_capacity(prompt_tokens.len(), max_tokens_req, sched.lane_capacity)
             {
-                // This should have been rejected before gen_start, but if it slipped through (e.g. clamped capacity race),
-                // fail closed for this lane only without GPU work.
                 if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -1887,7 +1992,8 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on capacity re-check: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 emit_uncorrelated_error(
                     stdout,
                     Some(&key.id),
@@ -1901,7 +2007,7 @@ pub fn drive_lfm_continuous_batch(
                     false,
                     false,
                 );
-                let _ = sched.abort_lane(lane_idx, &key);
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 continue;
             }
             if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
@@ -1966,24 +2072,25 @@ pub fn drive_lfm_continuous_batch(
                 if !marked {
                     // Failed to mark — rollback lane without publishing.
                     let _ = batch_state.reset_lane(gpu, config, lane_idx);
-                    let _ = sched.abort_lane(lane_idx, &key);
+                    let _ = sched.abort_lane(lane_idx, &key, admission);
                     continue;
                 }
                 let write_ok = {
-                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                     writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
                 };
                 if !write_ok {
                     // Publication failed — rollback attested reset and free lane.
                     let _ = batch_state.reset_lane(gpu, config, lane_idx);
-                    let _ = sched.abort_lane(lane_idx, &key);
+                    let _ = sched.abort_lane(lane_idx, &key, admission);
                 }
                 continue;
             }
             // Cancellable prefill: check abort before GPU, then delegate to batch prefill.
             // If abort is latched before or during prefill, we must reset only this lane,
             // emit attested abort, and continue peers without sampling.
-            if batch_check_abort(&key.id, key.attempt_id) {
+            if batch_check_abort(&key.id, key.attempt_id, admission) {
                 if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -1993,13 +2100,14 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on pre-prefill abort: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 let ep = crate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
                 };
                 crate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
-                let _ = sched.abort_lane(lane_idx, &key);
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 continue;
             }
             // Try cancellable prefill if the arch provides it; otherwise fall back to
@@ -2007,10 +2115,7 @@ pub fn drive_lfm_continuous_batch(
             let prefill_is_aborted = {
                 // Prefer the cancellable variant when available (sibling adds it).
                 // We probe via a helper that returns Ok(false) on abort without sampling.
-                // Fallback: call the standard prefill and then check abort.
-                let abort_check = || batch_check_abort(&key.id, key.attempt_id);
-                // Attempt to call the new API via a daemon helper; if not present we fall back.
-                // This helper will be overridden by the arch's implementation once it lands.
+                let abort_check = || batch_check_abort(&key.id, key.attempt_id, admission);
                 let res = lfm_prefill_cancellable_or_fallback(
                     batch_state,
                     gpu,
@@ -2021,8 +2126,8 @@ pub fn drive_lfm_continuous_batch(
                     &abort_check,
                 );
                 match res {
-                    Ok(true) => false, // completed
-                    Ok(false) => true, // aborted
+                    Ok(true) => false,
+                    Ok(false) => true,
                     Err(e) => {
                         return fail_all(
                             sched,
@@ -2034,7 +2139,7 @@ pub fn drive_lfm_continuous_batch(
                     }
                 }
             };
-            if prefill_is_aborted || batch_check_abort(&key.id, key.attempt_id) {
+            if prefill_is_aborted || batch_check_abort(&key.id, key.attempt_id, admission) {
                 if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -2044,13 +2149,14 @@ pub fn drive_lfm_continuous_batch(
                         format!("reset lane {lane_idx} on prefill abort: {e}"),
                     );
                 }
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 let ep = crate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
                 };
                 crate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
-                let _ = sched.abort_lane(lane_idx, &key);
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 continue;
             }
             let hist: &[u32] = &[];
@@ -2164,15 +2270,20 @@ pub fn drive_lfm_continuous_batch(
         let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
         let mut rng_states: Vec<u32> = vec![0; batch_size];
         let mut survivors: Vec<usize> = Vec::new();
-        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in running.clone() {
             let key = match sched.lanes[idx].key().cloned() {
                 Some(k) => k,
                 None => continue,
             };
-            if batch_check_abort(&key.id, key.attempt_id) {
-                to_abort_running.push((idx, key));
+            let admission = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.ticket.admission,
+                _ => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id, admission) {
+                to_abort_running.push((idx, key, admission));
                 continue;
             }
             let lane_ptr = match &mut sched.lanes[idx] {
@@ -2181,7 +2292,6 @@ pub fn drive_lfm_continuous_batch(
             };
             let lane = unsafe { &mut *lane_ptr };
             let cur_token = lane.next_token.unwrap_or(eos_tok);
-            // Suppress EOS-class IDs before any decode/wire output.
             if stop_toks.contains(&cur_token) {
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
@@ -2215,13 +2325,9 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
-                to_await.push((idx, key.clone(), pending_done));
+                to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
-            // Cumulative byte-correct incremental decode with holdback.
-            // Never use `tokenizer.decode(&[cur_token])` (lossy, splits UTF-8 into FFFD).
-            // Instead decode all streamed tokens + cur_token as bytes and emit only the
-            // newly completed UTF-8 prefix beyond `bytes_fed_to_filter`.
             let mut future_streamed = lane.streamed_tokens.clone();
             future_streamed.push(cur_token);
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
@@ -2235,7 +2341,6 @@ pub fn drive_lfm_continuous_batch(
                 Ok(s) => s,
                 Err(_) => "",
             };
-            // Suppress decoded EOS-class markers (e.g. "<|endoftext|>" that doesn't round-trip via ID).
             if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
@@ -2269,28 +2374,25 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
-                to_await.push((idx, key.clone(), pending_done));
+                to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
-            // Visible fragment (may be empty due to holdback for split UTF-8).
             let has_visible = !frag.is_empty();
             if has_visible {
                 if lane.first_token_at.is_none() {
                     lane.first_token_at = Some(Instant::now());
                 }
-                {
-                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
-                    emit_visible_token(stdout, &key.id, frag);
-                }
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                emit_visible_token(stdout, &key.id, frag);
             }
-            // Commit token to lane state: streamed tokens and byte holdback, seq_pos.
             lane.streamed_tokens.push(cur_token);
             lane.bytes_fed_to_filter = valid_len;
             lane.seq_pos += 1;
             let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
             let hit_max = lane.streamed_tokens.len() >= lane_max_tokens(&key, sched);
             let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, sched.lane_capacity);
-            let is_eos = false; // already filtered EOS IDs/markers above
+            let is_eos = false;
             let should_finish =
                 batch_should_finish_decode(is_eos, hit_max, hit_lane_cap, false, loop_hit);
             if should_finish {
@@ -2329,7 +2431,7 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
-                to_await.push((idx, key.clone(), pending_done));
+                to_await.push((idx, key.clone(), admission, pending_done));
             } else {
                 survivors.push(idx);
                 let window = lane
@@ -2348,7 +2450,7 @@ pub fn drive_lfm_continuous_batch(
                 rng_states[idx] = lane.rng_state as u32;
             }
         }
-        for (idx, key) in to_abort_running {
+        for (idx, key, admission) in to_abort_running {
             if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
                 return fail_all(
                     sched,
@@ -2358,16 +2460,17 @@ pub fn drive_lfm_continuous_batch(
                     format!("reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             let ep = crate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
             };
             crate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
         }
         // Install AwaitingClient/Ready BEFORE publishing commit_ready; rollback if publish fails.
-        for (idx, key, pending_done) in to_await {
+        for (idx, key, admission, pending_done) in to_await {
             let mut envelope = pending_done.clone();
             envelope["type"] = serde_json::json!("commit_ready");
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
@@ -2377,21 +2480,19 @@ pub fn drive_lfm_continuous_batch(
                     key.id
                 );
                 let _ = batch_state.reset_lane(gpu, config, idx);
-                let _ = sched.abort_lane(idx, &key);
+                let _ = sched.abort_lane(idx, &key, admission);
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
-                // Publication failed — rollback attested reset and free lane (no duplicate done).
                 let _ = batch_state.reset_lane(gpu, config, idx);
-                let _ = sched.abort_lane(idx, &key);
-                // Do not requeue; lane is now free.
+                let _ = sched.abort_lane(idx, &key, admission);
                 continue;
             }
-            // Lane stays AwaitingClient until commit/abort decision.
         }
         if survivors.is_empty() {
             continue;
@@ -2685,22 +2786,30 @@ pub fn drive_qwen35_ep_continuous_batch(
                     reason: String|
      -> Result<(), BatchDriveError> {
         let mut uniq_set = std::collections::HashSet::new();
-        let mut uniq: Vec<AttemptKey> = Vec::new();
-        for l in sched.lanes.iter() {
-            if let Some(k) = l.key() {
-                if uniq_set.insert(k.clone()) {
-                    uniq.push(k.clone());
+        let mut uniq: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for lane in sched.lanes.iter() {
+            let Some(key) = lane.key() else {
+                continue;
+            };
+            let admission = match lane {
+                BatchLane::Seeding(q) | BatchLane::Running(q) => q.ticket.admission,
+                BatchLane::AwaitingClient(t) => t.ticket.admission,
+                BatchLane::Empty { .. } => continue,
+            };
+            if uniq_set.insert((key.clone(), admission)) {
+                uniq.push((key.clone(), admission));
+            }
+        }
+        for key in sched.inbox.iter().cloned() {
+            if let Some(request) = sched.pending.get(&key) {
+                if uniq_set.insert((key.clone(), request.admission)) {
+                    uniq.push((key, request.admission));
                 }
             }
         }
-        for k in sched.inbox.iter().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
-            }
-        }
-        for k in sched.pending.keys().cloned() {
-            if uniq_set.insert(k.clone()) {
-                uniq.push(k);
+        for (key, request) in sched.pending.iter() {
+            if uniq_set.insert((key.clone(), request.admission)) {
+                uniq.push((key.clone(), request.admission));
             }
         }
         let reset_res = batch_state.reset_all(gpus);
@@ -2710,8 +2819,9 @@ pub fn drive_qwen35_ep_continuous_batch(
         } else {
             reason.clone()
         };
-        for key in &uniq {
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (key, admission) in &uniq {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, *admission);
             let ep = crate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
@@ -2726,29 +2836,28 @@ pub fn drive_qwen35_ep_continuous_batch(
             );
         }
         let _ = sched.fail_all_active();
-        for k in &uniq {
-            batch_clear_terminal(&k.id, k.attempt_id);
-        }
         Err(BatchDriveError::Poisoned(reason2))
     };
     loop {
         // handle awaiting commit/abort
-        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_commit: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         for idx in 0..batch_size {
             if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
                 let key = term.key.clone();
+                let admission = term.ticket.admission;
                 let expired = Instant::now() >= term.deadline;
-                if batch_check_abort(&key.id, key.attempt_id) || expired {
-                    to_abort.push((idx, key));
+                if batch_check_abort(&key.id, key.attempt_id, admission) || expired {
+                    to_abort.push((idx, key, admission));
                 } else if let Some(ClientTerminalDecision::Commit) =
-                    batch_poll_decision(&key.id, key.attempt_id)
+                    batch_poll_decision(&key.id, key.attempt_id, admission)
                 {
-                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                    to_commit.push((idx, key.clone(), admission, term.pending_done.clone()));
                 }
             }
         }
-        for (idx, key) in to_abort {
+        for (idx, key, admission) in to_abort {
             if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
                 return fail_all(
                     sched,
@@ -2758,13 +2867,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
-        for (idx, key, pending_done) in to_commit {
-            let scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+        for (idx, key, admission, pending_done) in to_commit {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             let reset_ok = match batch_state.reset_lane(gpus, config, idx) {
                 Ok(()) => true,
                 Err(e) => {
@@ -2777,8 +2888,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
-            let commit_ok = sched.commit_lane_retain_terminal(idx, &key);
-            let _terminal_cleanup = BatchTerminalCleanup::new(&key, scope.admission_generation());
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key, admission);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, Some(admission));
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!(),
                 BatchCommitTeardownClass::CommitFailed => {
@@ -2794,7 +2905,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                         false,
                         &ep,
                     );
-                    let _ = sched.abort_lane(idx, &key);
+                    let _ = sched.abort_lane(idx, &key, admission);
                     producers[idx] = None;
                 }
                 BatchCommitTeardownClass::EmitDone => {
@@ -2803,30 +2914,37 @@ pub fn drive_qwen35_ep_continuous_batch(
                 }
             }
         }
-        let mut queued_abort: Vec<AttemptKey> = Vec::new();
-        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
-            if batch_check_abort(&k.id, k.attempt_id) {
-                queued_abort.push(k);
-            }
-        }
-        for k in queued_abort {
-            let _scope = BatchAttemptScope::enter_for(&k.id, k.attempt_id);
-            crate::ar::emit_active_route_cancel(stdout, &k.id, 0);
-            let _ = sched.abort_queued(&k);
-        }
-        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
-        for idx in 0..batch_size {
-            if let Some(k) = sched.lanes[idx].key().cloned() {
-                if matches!(
-                    sched.lanes[idx],
-                    BatchLane::Running(_) | BatchLane::Seeding(_)
-                ) && batch_check_abort(&k.id, k.attempt_id)
-                {
-                    running_abort.push((idx, k));
+        let mut queued_abort: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if let Some(request) = sched.pending.get(&key) {
+                if batch_check_abort(&key.id, key.attempt_id, request.admission) {
+                    queued_abort.push((key, request.admission));
                 }
             }
         }
-        for (idx, key) in running_abort {
+        for (key, admission) in queued_abort {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
+            let _ = sched.abort_queued(&key, admission);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(key) = sched.lanes[idx].key().cloned() {
+                let admission = match &sched.lanes[idx] {
+                    BatchLane::Running(l) | BatchLane::Seeding(l) => l.ticket.admission,
+                    _ => continue,
+                };
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&key.id, key.attempt_id, admission)
+                {
+                    running_abort.push((idx, key, admission));
+                }
+            }
+        }
+        for (idx, key, admission) in running_abort {
             if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
                 return fail_all(
                     sched,
@@ -2836,9 +2954,10 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on running abort: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
         let mut barrier: Option<DaemonMsg> = None;
@@ -2848,7 +2967,17 @@ pub fn drive_qwen35_ep_continuous_batch(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             };
+            let (dm, carried_admission) = match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    (DaemonMsg::Regular(json), Some(admission))
+                }
+                other => (other, None),
+            };
             match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
+                    break;
+                }
                 DaemonMsg::ParseError(e) => {
                     emit_uncorrelated_error(
                         stdout,
@@ -2893,9 +3022,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                             .and_then(|v| v.as_str())
                             .unwrap_or("0")
                             .to_string();
-                        batch_announce_terminal(&id, attempt_id);
-                        if batch_check_abort(&id, attempt_id) {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                        let Some(admission) = carried_admission else {
+                            barrier = Some(daemon_regular_with_admission(json, None));
+                            break;
+                        };
+                        if batch_check_abort(&id, attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -2903,10 +3036,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                                 false,
                             );
                             crate::ar::emit_active_route_cancel(stdout, &id, 0);
-                            batch_clear_terminal(&id, attempt_id);
+                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
                             continue;
                         }
-                        // EP batch-only admission; non-eligible becomes barrier.
+                        // EP batch-only admission; non-eligible becomes a
+                        // barrier while preserving the reader-owned token.
                         if !is_qwen_ep_batch_request_eligible(
                             &json,
                             model,
@@ -2914,7 +3048,8 @@ pub fn drive_qwen35_ep_continuous_batch(
                             parse_serve_continuous_batch(&json),
                             false,
                         ) {
-                            barrier = Some(DaemonMsg::Regular(json));
+                            barrier =
+                                Some(daemon_regular_with_admission(json, Some(admission)));
                             break;
                         }
                         let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
@@ -2959,6 +3094,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                                         stdout,
                                         &id,
                                         attempt_id,
+                                        admission,
                                         &format!("invalid messages field: {e}"),
                                         "validation",
                                         false,
@@ -2994,6 +3130,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
@@ -3003,8 +3140,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                             }
                         };
                         if started_in_think {
-                            let _ = batch_transfer_abort_to_singleton_and_clear(&id, attempt_id);
-                            barrier = Some(DaemonMsg::Regular(json));
+                            let _ = batch_transfer_abort_to_singleton_and_clear(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
+                            barrier =
+                                Some(daemon_regular_with_admission(json, Some(admission)));
                             break;
                         }
                         if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
@@ -3012,6 +3154,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                                 stdout,
                                 &id,
                                 attempt_id,
+                                admission,
                                 "prompt exceeds lane capacity or empty",
                                 "validation",
                                 false,
@@ -3029,6 +3172,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                                     stdout,
                                     &id,
                                     attempt_id,
+                                    admission,
                                     &reason,
                                     "validation",
                                     false,
@@ -3037,10 +3181,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                                 continue;
                             }
                         };
-                        batch_transition_to_queued(&id, attempt_id);
+                        batch_transition_to_queued(&id, attempt_id, admission);
                         let sampling = resolve_batch_sampling(&json, model);
                         let req = BatchPendingRequest {
                             key: AttemptKey::new(&id, attempt_id),
+                            admission,
                             prompt: prompt_str.clone(),
                             prompt_tokens: prompt_tokens.clone(),
                             started_in_think,
@@ -3052,11 +3197,18 @@ pub fn drive_qwen35_ep_continuous_batch(
                             sampling,
                         };
                         if !sched.enqueue(req) {
-                            eprintln!("[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry", id, attempt_id);
+                            eprintln!(
+                                "[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
                             continue;
                         }
                         {
-                            let _scope = BatchAttemptScope::enter_for(&id, attempt_id);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                &id,
+                                attempt_id,
+                                admission,
+                            );
                             crate::ar::emit_generation_start(
                                 crate::ar::GenerationRoute::QwenAr,
                                 stdout,
@@ -3073,7 +3225,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                             batch_apply_terminal_control(kind, id, aid);
                         }
                     } else {
-                        barrier = Some(DaemonMsg::Regular(json));
+                        barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
                     }
                 }
@@ -3094,10 +3246,15 @@ pub fn drive_qwen35_ep_continuous_batch(
             let sampling = pending_req.sampling.clone();
             let prompt_tokens = pending_req.prompt_tokens.clone();
             let started_in_think = pending_req.started_in_think;
+            let admission = pending_req.admission;
             if started_in_think {
                 let prompt = pending_req.prompt.clone();
-                let _ = batch_transfer_abort_to_singleton_and_clear(&key.id, key.attempt_id);
-                let _ = sched.abort_lane(lane_idx, &key);
+                let _ = batch_transfer_abort_to_singleton_and_clear(
+                    &key.id,
+                    key.attempt_id,
+                    admission,
+                );
+                let _ = sched.abort_lane(lane_idx, &key, admission);
                 if let Err(err) = batch_state.reset_lane(gpus, config, lane_idx) {
                     return fail_all(
                         sched,
@@ -3107,7 +3264,16 @@ pub fn drive_qwen35_ep_continuous_batch(
                         format!("EP reset lane {lane_idx} on think barrier: {err}"),
                     );
                 }
-                inbox.push_front(DaemonMsg::Regular(serde_json::json!({"type":"generate","id":key.id,"attempt_id":key.attempt_id,"prompt":prompt})));
+                let requeued = serde_json::json!({
+                    "type":"generate",
+                    "id":key.id,
+                    "attempt_id":key.attempt_id,
+                    "prompt":prompt
+                });
+                inbox.push_front(daemon_regular_with_admission(
+                    requeued,
+                    Some(admission),
+                ));
                 break;
             }
             if let Err(e) = batch_state.reset_lane(gpus, config, lane_idx) {
@@ -3250,16 +3416,21 @@ pub fn drive_qwen35_ep_continuous_batch(
                 }
             };
         last_receipt = Some(receipt);
-        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
-        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
         for idx in running.clone() {
             let key = match sched.lanes[idx].key().cloned() {
                 Some(k) => k,
                 None => continue,
             };
-            if batch_check_abort(&key.id, key.attempt_id) {
-                to_abort_running.push((idx, key));
+            let admission = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.ticket.admission,
+                _ => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id, admission) {
+                to_abort_running.push((idx, key, admission));
                 continue;
             }
             let lane_ptr = match &mut sched.lanes[idx] {
@@ -3278,7 +3449,8 @@ pub fn drive_qwen35_ep_continuous_batch(
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
             let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
             let token_bytes = all_bytes[prev_fed..].to_vec();
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             if lane.first_token_at.is_none() {
                 lane.first_token_at = Some(Instant::now());
             }
@@ -3359,14 +3531,15 @@ pub fn drive_qwen35_ep_continuous_batch(
                         rolled_back: true,
                         context: None,
                     };
-                    let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                     emit_qwen_ar_open_think_terminal(
                         stdout,
                         &key.id,
                         lane.streamed_tokens.len(),
                         &ep,
                     );
-                    let _ = sched.abort_lane(idx, &key);
+                    let _ = sched.abort_lane(idx, &key, admission);
                     producers[idx] = None;
                     continue;
                 }
@@ -3433,12 +3606,12 @@ pub fn drive_qwen35_ep_continuous_batch(
                         serde_json::json!("peer_rooted_f32");
                 }
                 let _ = visible_text;
-                to_await.push((idx, key.clone(), pending_done));
+                to_await.push((idx, key.clone(), admission, pending_done));
             } else {
                 survivors.push(idx);
             }
         }
-        for (idx, key) in to_abort_running {
+        for (idx, key, admission) in to_abort_running {
             if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
                 return fail_all(
                     sched,
@@ -3448,12 +3621,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                     format!("EP reset lane {idx} on abort post-forward: {e}"),
                 );
             }
-            let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_active_route_cancel(stdout, &key.id, 0);
-            let _ = sched.abort_lane(idx, &key);
+            let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
-        for (idx, key, pending_done) in to_await {
+        for (idx, key, admission, pending_done) in to_await {
             let mut envelope = pending_done.clone();
             envelope["type"] = serde_json::json!("commit_ready");
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
@@ -3463,17 +3637,18 @@ pub fn drive_qwen35_ep_continuous_batch(
                     key.id
                 );
                 let _ = batch_state.reset_lane(gpus, config, idx);
-                let _ = sched.abort_lane(idx, &key);
+                let _ = sched.abort_lane(idx, &key, admission);
                 producers[idx] = None;
                 continue;
             }
             let write_ok = {
-                let _scope = BatchAttemptScope::enter_for(&key.id, key.attempt_id);
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
                 let _ = batch_state.reset_lane(gpus, config, idx);
-                let _ = sched.abort_lane(idx, &key);
+                let _ = sched.abort_lane(idx, &key, admission);
                 producers[idx] = None;
             }
         }
@@ -3597,10 +3772,20 @@ mod tests {
                 "validation",
             ),
         ] {
-            assert!(batch_announce_terminal(id, attempt_id), "{driver} announce");
+            let admission =
+                batch_announce_terminal(id, attempt_id).expect("{driver} announce");
 
             let mut output = Vec::new();
-            emit_batch_admission_error(&mut output, id, attempt_id, message, class, false, false);
+            emit_batch_admission_error(
+                &mut output,
+                id,
+                attempt_id,
+                admission,
+                message,
+                class,
+                false,
+                false,
+            );
 
             let lines: Vec<&str> = std::str::from_utf8(&output)
                 .expect("UTF-8 error envelope")

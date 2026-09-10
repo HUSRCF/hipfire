@@ -57,7 +57,10 @@ fn sampling_with_window(temp: f32, window: usize) -> BatchSampling {
     }
 }
 fn req(key: AttemptKey, sampling: BatchSampling) -> BatchPendingRequest {
+    let admission =
+        batch_terminal_generation(&key.id, key.attempt_id).expect("live batch admission");
     BatchPendingRequest {
+        admission,
         key,
         prompt: "hi".into(),
         prompt_tokens: vec![1, 2, 3],

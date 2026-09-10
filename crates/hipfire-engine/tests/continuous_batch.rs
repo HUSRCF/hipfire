@@ -15,12 +15,11 @@ use hipfire_engine::scheduler::{
     DaemonMsg,
 };
 use hipfire_engine::terminal::{
-    batch_announce_terminal, batch_apply_terminal_control, batch_check_abort,
-    batch_clear_all_terminals, batch_clear_terminal, batch_commit_teardown_class,
-    batch_hit_length_cap, batch_lane_at_capacity, batch_mark_ready, batch_mark_ready_with_pending,
-    batch_poll_decision, batch_should_finish_decode, batch_terminal_control,
-    batch_transfer_abort_to_singleton_and_clear, emit_staged_terminal_done, AttemptKey,
-    BatchAttemptScope, BatchCommitTeardownClass, ClientTerminalDecision, LaneTicket,
+    batch_apply_terminal_control, batch_clear_all_terminals, batch_clear_terminal,
+    batch_clear_terminal_at_generation, batch_commit_teardown_class, batch_hit_length_cap,
+    batch_lane_at_capacity, batch_terminal_control, batch_terminal_generation,
+    batch_should_finish_decode, emit_staged_terminal_done, AttemptKey, BatchAttemptScope,
+    BatchCommitTeardownClass, BatchGeneration, ClientTerminalDecision,
 };
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -65,8 +64,37 @@ fn sampling_with_window(temp: f32, window: usize) -> BatchSampling {
         repeat_window: window,
     }
 }
+fn admission(key: &AttemptKey) -> BatchGeneration {
+    batch_terminal_generation(&key.id, key.attempt_id).expect("live batch admission")
+}
+
+fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
+    hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).is_some()
+}
+
+fn batch_check_abort(id: &str, attempt_id: u64) -> bool {
+    batch_terminal_generation(id, attempt_id)
+        .is_some_and(|generation| hipfire_engine::terminal::batch_check_abort(id, attempt_id, generation))
+}
+
+fn batch_poll_decision(id: &str, attempt_id: u64) -> Option<ClientTerminalDecision> {
+    batch_terminal_generation(id, attempt_id)
+        .and_then(|generation| hipfire_engine::terminal::batch_poll_decision(id, attempt_id, generation))
+}
+
+fn batch_transfer_abort_to_singleton_and_clear(id: &str, attempt_id: u64) -> bool {
+    batch_terminal_generation(id, attempt_id).is_some_and(|generation| {
+        hipfire_engine::terminal::batch_transfer_abort_to_singleton_and_clear(
+            id,
+            attempt_id,
+            generation,
+        )
+    })
+}
+
 fn req(key: AttemptKey, sampling: BatchSampling) -> BatchPendingRequest {
     BatchPendingRequest {
+        admission: admission(&key),
         key,
         prompt: "hi".into(),
         prompt_tokens: vec![1, 2, 3],
@@ -236,7 +264,7 @@ fn announcement_race_abort_before_queue_is_latched() {
     let pending = req(k.clone(), sampling(0.3, 1.0));
     assert!(sched.enqueue(pending));
     assert!(batch_check_abort(&k.id, k.attempt_id));
-    assert!(sched.abort_queued(&k));
+    assert!(sched.abort_queued(&k, admission(&k)));
     assert!(sched.inbox.is_empty());
     assert!(!sched.pending.contains_key(&k));
     batch_apply_terminal_control("abort", &k.id, k.attempt_id);
@@ -266,7 +294,7 @@ fn early_commit_before_ready_rejected_and_poll_is_nonmutating() {
         batch_poll_decision(&k.id, k.attempt_id),
         Some(ClientTerminalDecision::Commit)
     );
-    assert!(sched.commit_lane(ticket.lane, &k));
+    assert!(sched.commit_lane(ticket.lane, &k, admission(&k)));
     assert!(sched.lanes[ticket.lane].is_empty());
     assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
 }
@@ -283,7 +311,7 @@ fn retained_commit_keeps_registry_until_single_done_claim() {
     assert!(sched.mark_awaiting_commit(ticket.lane, pending.clone()));
     batch_apply_terminal_control("commit", &k.id, k.attempt_id);
 
-    assert!(sched.commit_lane_retain_terminal(ticket.lane, &k));
+    assert!(sched.commit_lane_retain_terminal(ticket.lane, &k, admission(&k)));
     assert!(sched.lanes[ticket.lane].is_empty());
     assert_eq!(
         batch_poll_decision(&k.id, k.attempt_id),
@@ -327,7 +355,7 @@ fn stale_owner_generation_prevents_release_of_reused_slot() {
         serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
     assert!(sched.mark_awaiting_commit(t1.lane, pending));
     batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
-    assert!(sched.commit_lane(t1.lane, &k1));
+    assert!(sched.commit_lane(t1.lane, &k1, admission(&k1)));
     let gen_after = sched.lanes[t1.lane].generation();
     assert!(gen_after > t1.generation);
     let k2 = AttemptKey::new("r2", 2);
@@ -345,7 +373,7 @@ fn stale_owner_generation_prevents_release_of_reused_slot() {
         hipfire_engine::scheduler::BatchLane::Running(_)
     ));
     batch_apply_terminal_control("abort", &k2.id, k2.attempt_id);
-    assert!(sched.abort_lane(t2.lane, &k2));
+    assert!(sched.abort_lane(t2.lane, &k2, admission(&k2)));
     assert!(sched.lanes[t2.lane].is_empty());
 }
 
@@ -357,7 +385,7 @@ fn queued_abort_drains_without_assigning_lane() {
     let mut sched = ContinuousBatchScheduler::new(1, 4096);
     sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
     batch_apply_terminal_control("abort", &k.id, k.attempt_id);
-    assert!(sched.abort_queued(&k));
+    assert!(sched.abort_queued(&k, admission(&k)));
     assert!(sched.inbox.is_empty());
     assert!(sched.lanes[0].is_empty());
     assert!(sched.try_assign_one().is_none());
@@ -386,7 +414,7 @@ fn immutable_ready_payload_preserved_until_commit() {
     assert_eq!(stored3["tokens"], 5);
     assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
     batch_apply_terminal_control("commit", &k.id, k.attempt_id);
-    assert!(sched.commit_lane(ticket.lane, &k));
+    assert!(sched.commit_lane(ticket.lane, &k, admission(&k)));
     assert!(sched.lanes[ticket.lane].is_empty());
     assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
 }
@@ -421,7 +449,7 @@ fn deadline_30s_is_set_and_poll_returns_abort_after_expiry() {
         batch_poll_decision(&k.id, k.attempt_id),
         Some(ClientTerminalDecision::Abort)
     );
-    assert!(sched.abort_lane(ticket.lane, &k));
+    assert!(sched.abort_lane(ticket.lane, &k, admission(&k)));
     assert!(sched.lanes[ticket.lane].is_empty());
 }
 
@@ -449,7 +477,7 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
         serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
     assert!(sched.mark_awaiting_commit(t1.lane, pending));
     batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
-    assert!(sched.commit_lane(t1.lane, &k1));
+    assert!(sched.commit_lane(t1.lane, &k1, admission(&k1)));
     let (_b, t2) = sched.try_assign_one().unwrap();
     assert_eq!(t2.lane, 0);
     assert_eq!(sched.inbox.front().unwrap(), &k3);
@@ -459,7 +487,7 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     let lane_for_k2 = sched.find_lane_by_key(&k2).unwrap();
     assert!(sched.mark_awaiting_commit(lane_for_k2, pending2));
     batch_apply_terminal_control("commit", &k2.id, k2.attempt_id);
-    assert!(sched.commit_lane(lane_for_k2, &k2));
+    assert!(sched.commit_lane(lane_for_k2, &k2, admission(&k2)));
     let (_a3, t3) = sched.try_assign_one().unwrap();
     assert_eq!(t3.lane, 0);
     let pending3 =
@@ -467,7 +495,7 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     let lane_for_k3 = sched.find_lane_by_key(&k3).unwrap();
     assert!(sched.mark_awaiting_commit(lane_for_k3, pending3));
     batch_apply_terminal_control("commit", &k3.id, k3.attempt_id);
-    assert!(sched.commit_lane(lane_for_k3, &k3));
+    assert!(sched.commit_lane(lane_for_k3, &k3, admission(&k3)));
 }
 
 #[test]
@@ -490,7 +518,7 @@ fn refill_reservation_awaiting_client_not_reused_until_commit() {
     assert!(sched.try_assign_one().is_none());
     assert_eq!(sched.inbox.front().unwrap(), &k2);
     batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
-    assert!(sched.commit_lane(t1.lane, &k1));
+    assert!(sched.commit_lane(t1.lane, &k1, admission(&k1)));
     assert_eq!(sched.empty_lanes().len(), 1);
     let (_k2, t2) = sched.try_assign_one().unwrap();
     assert_eq!(t2.lane, t1.lane);
@@ -500,24 +528,30 @@ fn refill_reservation_awaiting_client_not_reused_until_commit() {
     let lane = sched.find_lane_by_key(&k2).unwrap();
     assert!(sched.mark_awaiting_commit(lane, pending2));
     batch_apply_terminal_control("commit", &k2.id, k2.attempt_id);
-    assert!(sched.commit_lane(lane, &k2));
+    assert!(sched.commit_lane(lane, &k2, admission(&k2)));
 }
 
 #[test]
 fn inbox_pushback_restores_barrier_for_outer_recv() {
     let _l = begin();
+    let admission =
+        hipfire_engine::terminal::batch_announce_terminal("r1", 1).expect("batch admission");
     let (tx, rx) = std::sync::mpsc::channel::<DaemonMsg>();
     let mut inbox = DaemonInbox::new(rx);
     let barrier = DaemonMsg::Regular(serde_json::json!({"type":"reset","attempt_id":99}));
-    let gen = DaemonMsg::Regular(
+    let gen = DaemonMsg::RegularWithAdmission(
         serde_json::json!({"type":"generate","id":"r1","attempt_id":1,"prompt":"hi"}),
+        admission,
     );
     tx.send(gen).unwrap();
     tx.send(barrier.clone()).unwrap();
     let m1 = inbox.try_recv().unwrap();
     match m1 {
-        DaemonMsg::Regular(v) => assert_eq!(v["type"], "generate"),
-        _ => panic!("expected generate"),
+        DaemonMsg::RegularWithAdmission(v, token) => {
+            assert_eq!(v["type"], "generate");
+            assert_eq!(token, admission);
+        }
+        _ => panic!("expected generate with admission"),
     }
     let m2 = inbox.try_recv().unwrap();
     match &m2 {
@@ -532,6 +566,7 @@ fn inbox_pushback_restores_barrier_for_outer_recv() {
         _ => panic!("expected barrier after pushback"),
     }
     assert!(inbox.try_recv().is_err());
+    assert!(batch_clear_terminal_at_generation("r1", 1, admission));
 }
 
 #[test]
@@ -853,7 +888,7 @@ fn commit_race_immediate_latches_and_early_rejected() {
     // Early commit before Ready: must be rejected
     batch_apply_terminal_control("commit", &k.id, k.attempt_id);
     assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
-    assert!(!sched.commit_lane(ticket.lane, &k));
+    assert!(!sched.commit_lane(ticket.lane, &k, admission(&k)));
     // Now install Ready BEFORE publish (correct order)
     let pending = serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":1});
     assert!(sched.mark_awaiting_commit(ticket.lane, pending.clone()));
@@ -868,7 +903,7 @@ fn commit_race_immediate_latches_and_early_rejected() {
         batch_poll_decision(&k.id, k.attempt_id),
         Some(ClientTerminalDecision::Commit)
     );
-    assert!(sched.commit_lane(ticket.lane, &k));
+    assert!(sched.commit_lane(ticket.lane, &k, admission(&k)));
     assert!(sched.lanes[ticket.lane].is_empty());
     // After commit, further commit is rejected (key gone)
     batch_apply_terminal_control("commit", &k.id, k.attempt_id);
@@ -894,7 +929,7 @@ fn commit_race_qwen_and_lfm_both_paths() {
             batch_poll_decision(&k.id, k.attempt_id),
             Some(ClientTerminalDecision::Commit)
         );
-        assert!(sched.commit_lane(ticket.lane, &k));
+        assert!(sched.commit_lane(ticket.lane, &k, admission(&k)));
         assert!(sched.lanes[ticket.lane].is_empty());
     }
 }
@@ -977,7 +1012,7 @@ fn lfm_cancel_decision_semantics() {
     assert!(batch_check_abort(&k1.id, k1.attempt_id));
     assert!(!batch_check_abort(&k2.id, k2.attempt_id));
     // Simulate daemon's cancellable prefill handling: reset only lane 0
-    assert!(sched.abort_lane(t1.lane, &k1));
+    assert!(sched.abort_lane(t1.lane, &k1, admission(&k1)));
     assert!(sched.lanes[t1.lane].is_empty());
     // Peer lane remains Running
     assert!(matches!(
@@ -1082,6 +1117,7 @@ fn req_with_tokens(
     think: bool,
 ) -> BatchPendingRequest {
     BatchPendingRequest {
+        admission: admission(&key),
         key,
         prompt: "hi".into(),
         prompt_tokens: tokens,
