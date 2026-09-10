@@ -154,6 +154,62 @@ fn resolve_vision_sidecar(
     Ok(Some(std::path::PathBuf::from(path)))
 }
 
+/// Maple head-overlay arch id (`hipfire-quantize --head-only` carriers).
+const MAPLE_ARCH_ID: u32 = 15;
+
+/// Validate a `--head` overlay against the already-open base and attach it so
+/// the retained source IS the effective base+head: loading consumes it with
+/// no second open. Every refusal fires here, before prior-model teardown.
+/// Empty string counts as unset (explicit opt-out, same as vision/draft).
+/// Refusals, never silent fallbacks: serving the base head when an overlay
+/// was requested hands back a model the operator did not ask for.
+fn admit_head_overlay(
+    head: Option<&str>,
+    base: &mut ModelSource,
+    arch_id: u32,
+    topology: EffectiveTopology,
+) -> Result<(), String> {
+    let path = match head.filter(|s| !s.is_empty()) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if base.is_dir() {
+        return Err(format!(
+            "--head '{path}' requires an HFQ trunk: safetensors directory \
+             sources cannot carry a head overlay"
+        ));
+    }
+    if topology != EffectiveTopology::Single {
+        return Err(format!(
+            "--head '{path}' requires a single-device load (tp=1, pp=1): \
+             expert/pipeline-parallel loads use the head baked into the model file"
+        ));
+    }
+    if arch_id != MAPLE_ARCH_ID {
+        return Err(format!(
+            "--head '{path}' requested for arch_id={arch_id}: head overlays only \
+             serve Maple (arch_id 15) — refusing rather than silently serving \
+             the base head"
+        ));
+    }
+    let ModelSource::Hfq(hfq) = &mut *base else {
+        return Err(format!("--head '{path}' requires an HFQ trunk"));
+    };
+    // The overlay slot holds at most one file: a REAP splice already
+    // installed there would be silently discarded by the head attach.
+    // Conservatively refuse the combination instead of stacking overlays.
+    if hfq.has_overlay() {
+        return Err(format!(
+            "--head '{path}' cannot combine with an active REAP overlay \
+             (single overlay slot): disable one of them"
+        ));
+    }
+    let ov = hipfire_runtime::hfq::HfqFile::open_at_offset(std::path::Path::new(path), 0)
+        .map_err(|e| format!("head overlay '{path}': open failed: {e}"))?;
+    hfq.attach_opened_head(ov, std::path::Path::new(path))?;
+    Ok(())
+}
+
 /// Resolve the single carrier that claims a source, refusing no-carrier and
 /// ambiguous-carrier sources exactly as the load entries do.
 fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
@@ -251,8 +307,9 @@ pub fn admit_source(
     draft_path: Option<&str>,
     gpu_arch: &str,
     vision: Option<&str>,
+    head: Option<&str>,
 ) -> Result<SourceAdmission, String> {
-    let source = ModelSource::from_path(path)?;
+    let mut source = ModelSource::from_path(path)?;
     let arch_id = source
         .arch_id()
         .ok_or_else(|| format!("unrecognized source: {}", source.describe()))?;
@@ -326,6 +383,11 @@ pub fn admit_source(
     if let ModelSource::Hfq(hfq) = &source {
         df_lash_lm_head_admission(hfq, draft_path, gpu_arch)?;
     }
+    // Head overlay (`params.head`): validated AND attached to the retained
+    // base here, so the admitted source is already effective and loading
+    // consumes it with no second open. Any refusal leaves the prior model
+    // loaded — the overlay is in-memory only; no GPU state is touched.
+    admit_head_overlay(head, &mut source, arch_id, topology)?;
 
     Ok(SourceAdmission {
         source,
@@ -465,6 +527,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                None,
             )
             .expect("tower sidecar must admit");
             assert!(admitted.has_vision, "sidecar tower promotes trunk to VL");
@@ -490,6 +553,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                None,
             )
             .map(|_| ())
             .expect_err("tower-less sidecar must refuse");
@@ -511,12 +575,287 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                None,
             )
             .map(|_| ())
             .expect_err("wrong-arch sidecar must refuse");
             assert!(err.contains("arch_id=9"), "names the sidecar arch: {err}");
             cleanup(&trunk);
             cleanup(&sidecar);
+        }
+    }
+    mod head_overlay {
+        use super::super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+
+        fn write_tensors(
+            name: &str,
+            arch_id: u32,
+            specs: &[(&str, u8, Vec<u32>, Vec<u8>)],
+        ) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-head-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            let tensors: Vec<HfqMemTensor> = specs
+                .iter()
+                .map(|(n, qt, shape, data)| HfqMemTensor {
+                    name: (*n).into(),
+                    quant_type: *qt,
+                    shape: shape.clone(),
+                    group_size: 0,
+                    data: data.clone(),
+                })
+                .collect();
+            write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+            path
+        }
+
+        fn maple_trunk(name: &str) -> std::path::PathBuf {
+            write_tensors(
+                name,
+                15,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 3, vec![2, 4], vec![1u8; 32]),
+                ],
+            )
+        }
+
+        fn maple_head(name: &str, byte: u8) -> std::path::PathBuf {
+            write_tensors(
+                name,
+                15,
+                &[("lm_head.weight", 13, vec![2, 4], vec![byte; 32])],
+            )
+        }
+
+        fn cleanup(paths: &[std::path::PathBuf]) {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_dir(path.parent().unwrap());
+            }
+        }
+
+        fn head_bytes(admitted: &SourceAdmission) -> Vec<u8> {
+            let ModelSource::Hfq(hfq) = &admitted.source else {
+                panic!("expected HFQ source");
+            };
+            hfq.tensor_data("lm_head.weight")
+                .map(|(_, d)| d.to_vec())
+                .expect(" admitted source must serve lm_head.weight")
+        }
+
+        /// A valid maple head admits and shadows the base head in the
+        /// retained source — loading consumes this, never reopens the file.
+        #[test]
+        fn head_on_maple_admits_and_shadows_base() {
+            let trunk = maple_trunk("d-trunk");
+            let head = maple_head("d-head", 7);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(head.to_str().unwrap()),
+            )
+            .expect("valid maple head must admit");
+            assert!(
+                admitted.carrier.is_some_and(|c| c.name() == "maple"),
+                "trunk still routes to maple"
+            );
+            assert_eq!(
+                head_bytes(&admitted),
+                vec![7u8; 32],
+                "retained source serves the overlay head, not the base"
+            );
+            cleanup(&[trunk, head]);
+        }
+
+        /// Empty head string opts out exactly like vision/draft.
+        #[test]
+        fn empty_head_string_is_unset() {
+            let trunk = maple_trunk("e-trunk");
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(""),
+            )
+            .expect("empty head must admit as unset");
+            assert_eq!(
+                head_bytes(&admitted),
+                vec![1u8; 32],
+                "unset head serves the baked base head"
+            );
+            cleanup(&[trunk]);
+        }
+
+        /// A head on a non-Maple trunk refuses instead of being ignored.
+        #[test]
+        fn head_on_non_maple_refuses() {
+            let trunk = write_tensors(
+                "f-trunk",
+                5,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 3, vec![2, 4], vec![1u8; 32]),
+                ],
+            );
+            let head = maple_head("f-head", 7);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(head.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("non-maple head must refuse");
+            assert!(err.contains("only serve Maple"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A head with expert-parallel topology refuses in preflight.
+        #[test]
+        fn head_on_ep_topology_refuses() {
+            let trunk = maple_trunk("g-trunk");
+            let mut base = ModelSource::from_path(trunk.to_str().unwrap()).expect("open trunk");
+            let err = super::super::admit_head_overlay(
+                Some("g-head"),
+                &mut base,
+                15,
+                EffectiveTopology::Expert(2),
+            )
+            .expect_err("EP head must refuse");
+            assert!(err.contains("single-device"), "refusal: {err}");
+            cleanup(&[trunk]);
+        }
+
+        /// A head cannot stack on an installed REAP overlay (single slot).
+        #[test]
+        fn head_with_reap_overlay_refuses() {
+            let trunk = maple_trunk("h-trunk");
+            let plan = std::env::temp_dir()
+                .join(format!("hipfire-head-admit-{}-h-plan", std::process::id()));
+            std::fs::create_dir_all(&plan).unwrap();
+            // Install a REAP overlay through the injected plan (deterministic:
+            // no process-config snapshot involved).
+            let plan_file = plan.join("overlay.hfq");
+            let staged = write_tensors(
+                "h-ov",
+                15,
+                &[("lm_head.weight", 8, vec![2, 4], vec![9u8; 32])],
+            );
+            std::fs::rename(&staged, &plan_file).unwrap();
+            let head = maple_head("h-head", 7);
+            let base = HfqFile::open_with_reap_plan(&trunk, Some(&plan)).expect("open trunk");
+            assert!(base.has_overlay(), "REAP overlay must install");
+            let mut source = ModelSource::Hfq(base);
+            let err = super::super::admit_head_overlay(
+                Some(head.to_str().unwrap()),
+                &mut source,
+                15,
+                EffectiveTopology::Single,
+            )
+            .expect_err("REAP+head must refuse");
+            assert!(err.contains("REAP"), "refusal: {err}");
+            cleanup(&[trunk, head, plan_file, staged]);
+            let _ = std::fs::remove_dir(&plan);
+        }
+
+        /// A truncated head (valid header/index, short payload) refuses.
+        #[test]
+        fn truncated_head_refuses() {
+            let trunk = maple_trunk("i-trunk");
+            let head = maple_head("i-head", 7);
+            let len = std::fs::metadata(&head).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&head)
+                .unwrap()
+                .set_len(len - 10)
+                .unwrap();
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(head.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("truncated head must refuse");
+            assert!(err.contains("truncated"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A head stamped for another arch refuses.
+        #[test]
+        fn head_with_wrong_arch_refuses() {
+            let trunk = maple_trunk("j-trunk");
+            let head = write_tensors(
+                "j-head",
+                9,
+                &[("lm_head.weight", 13, vec![2, 4], vec![7u8; 32])],
+            );
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(head.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("wrong-arch head must refuse");
+            assert!(err.contains("arch_id"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A full model passed as --head refuses (single-tensor guard).
+        #[test]
+        fn full_model_as_head_refuses() {
+            let trunk = maple_trunk("k-trunk");
+            let head = write_tensors(
+                "k-head",
+                15,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 13, vec![2, 4], vec![7u8; 32]),
+                ],
+            );
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                Some(head.to_str().unwrap()),
+            )
+            .map(|_| ())
+            .expect_err("full model as head must refuse");
+            assert!(err.contains("expected only"), "refusal: {err}");
+            cleanup(&[trunk, head]);
         }
     }
 }
