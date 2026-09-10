@@ -5472,4 +5472,162 @@ mod route_scope_tests {
         clear_terminal_control();
         set_active_attempt_id(0);
     }
+
+    #[test]
+    fn qwen_ar_same_key_reuse_after_error_reopens_latch() {
+        let _guard = route_lock();
+        let id = "qwen-ar-reuse";
+        let attempt = 91_201;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for n in 0..2 {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+            emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+            emit_generation_error(
+                GenerationRoute::QwenAr,
+                &mut sink,
+                Some(id),
+                &format!("qwen ar failure {n}"),
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            2
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn speculative_routes_same_key_reuse_after_error_reopens_latch() {
+        let _guard = route_lock();
+        let attempt = 91_202;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for (route, id) in [
+            (GenerationRoute::QwenDflash, "qwen-dflash-reuse"),
+            (GenerationRoute::Qwen2Spec, "qwen-spec-reuse"),
+        ] {
+            for n in 0..2 {
+                clear_terminal_control();
+                activate_terminal_control(id, attempt);
+                let _scope = GenerationRouteScope::enter(route, id);
+                emit_generation_start(route, &mut sink, id, false);
+                emit_generation_error(
+                    route,
+                    &mut sink,
+                    Some(id),
+                    &format!("{} failure {n}", route.name()),
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            4
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn expert_parallel_error_and_cancel_reuse_same_key() {
+        let _guard = route_lock();
+        let attempt = 91_203;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for (route, id) in [
+            (GenerationRoute::Deepseek4Ep, "ds4-ep-reuse"),
+            (GenerationRoute::MiniMaxEp, "minimax-ep-reuse"),
+        ] {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            {
+                let _scope = GenerationRouteScope::enter(route, id);
+                emit_generation_start(route, &mut sink, id, false);
+                emit_generation_error(
+                    route,
+                    &mut sink,
+                    Some(id),
+                    "EP failure",
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(route, id);
+            emit_generation_start(route, &mut sink, id, false);
+            emit_generation_cancel(route, &mut sink, id, 0);
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "aborted")
+                .count(),
+            2
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
 }

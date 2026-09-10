@@ -413,7 +413,7 @@ pub fn ep_serve_qwen35_dense_tp(
             qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1)
         }
         None => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 "dense TP serve without EP state",
@@ -427,7 +427,13 @@ pub fn ep_serve_qwen35_dense_tp(
     };
     for (chunk_index, chunk) in prompt_ids.chunks(tp_prefill_chunk).enumerate() {
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, 0);
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                0,
+            );
             return;
         }
         let result = {
@@ -443,7 +449,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 scratches,
             } = inner
             else {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     "EP arch mismatch (expected dense Qwen TP)",
@@ -466,7 +472,7 @@ pub fn ep_serve_qwen35_dense_tp(
             )
         };
         if let Err(e) = result {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("dense TP prefill: {e:?}"),
@@ -491,7 +497,7 @@ pub fn ep_serve_qwen35_dense_tp(
             return;
         };
         if let Err(e) = gpus.devices[0].bind_thread() {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("dense TP first-logits bind_thread: {e:?}"),
@@ -505,7 +511,7 @@ pub fn ep_serve_qwen35_dense_tp(
         match gpus.devices[0].download_f32(&scratches[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     &format!("dense TP first-logits download: {e:?}"),
@@ -528,7 +534,13 @@ pub fn ep_serve_qwen35_dense_tp(
     let mut hit_custom_stop = false;
     while generated < max_tokens {
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         let next = llama::sample_full_dist(
@@ -561,7 +573,7 @@ pub fn ep_serve_qwen35_dense_tp(
             )
         };
         if let Err(e) = forward {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("dense TP decode: {e:?}"),
@@ -596,7 +608,7 @@ pub fn ep_serve_qwen35_dense_tp(
         ) {
             Ok(stop) => stop,
             Err(err) => {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     &format!("dense TP semantic classify: {err}"),
@@ -655,7 +667,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 return;
             };
             if let Err(e) = gpus.devices[0].bind_thread() {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     &format!("dense TP decode logits bind_thread: {e:?}"),
@@ -669,7 +681,7 @@ pub fn ep_serve_qwen35_dense_tp(
             match gpus.devices[0].download_f32(&scratches[0].logits) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_active_attempt_error(
+                    crate::ar::emit_active_route_error(
                         stdout,
                         Some(id),
                         &format!("dense TP decode logits download: {e:?}"),
@@ -688,7 +700,7 @@ pub fn ep_serve_qwen35_dense_tp(
     let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
         Ok(pair) => pair,
         Err(err) => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("dense TP semantic finish: {err}"),
@@ -711,6 +723,7 @@ pub fn ep_serve_qwen35_dense_tp(
         _ => "stop",
     };
     ep_emit_done(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         m,
@@ -723,6 +736,7 @@ pub fn ep_serve_qwen35_dense_tp(
 }
 
 pub fn ep_emit_done(
+    route: crate::ar::GenerationRoute,
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,
@@ -768,9 +782,9 @@ pub fn ep_emit_done(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
-            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+            crate::ar::emit_generation_done_value(route, stdout, &pending_done);
         }
-        ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
+        ClientTerminalDecision::Abort => ep_emit_abort(route, stdout, id, m, generated),
     }
 }
 
@@ -870,6 +884,7 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
 /// `aborted`+`done(aborted)` only when rollback is attested. Unattested →
 /// one fail-closed error, no done.
 pub fn ep_emit_abort(
+    route: crate::ar::GenerationRoute,
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,
@@ -877,7 +892,8 @@ pub fn ep_emit_abort(
 ) {
     let epilogue = ep_reset_after_abort(m);
     if !epilogue.rolled_back {
-        emit_fail_closed_error(
+        emit_fail_closed_error_for_route(
+            route,
             stdout,
             Some(id),
             "client cancelled; fail-closed EP rollback could not be attested",
@@ -887,13 +903,7 @@ pub fn ep_emit_abort(
         );
         return;
     }
-    let attempt_id = active_attempt_id();
-    if !claim_wire_terminal(id, attempt_id) {
-        return;
-    }
-    let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
-    let _ = writeln!(stdout, "{}", done);
+    crate::ar::emit_generation_cancel(route, stdout, id, completion_tokens);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -1040,7 +1050,7 @@ pub fn ep_serve_ds4(
     // not inherit their emitter-side latch.  Open it after all early request
     // validation but before prefill/decode can produce a client event.
     crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ep),
+        crate::ar::GenerationRoute::Deepseek4Ep,
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
@@ -1061,7 +1071,8 @@ pub fn ep_serve_ds4(
             prefill,
         } = inner
         else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected ds4)",
@@ -1084,7 +1095,8 @@ pub fn ep_serve_ds4(
                 &prompt_ids,
                 0,
             ) {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::Deepseek4Ep,
                     stdout,
                     Some(id),
                     &format!(
@@ -1119,7 +1131,8 @@ pub fn ep_serve_ds4(
                 if let Err(e) = deepseek4::forward::forward_ep(
                     gpus, weights, config, state, partials, t, pos as u32,
                 ) {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
@@ -1141,14 +1154,15 @@ pub fn ep_serve_ds4(
     // Mirror the single-GPU paths: emit aborted+done and reset every rank's KV
     // cursor.
     if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
+        ep_emit_abort(crate::ar::GenerationRoute::Deepseek4Ep, stdout, id, m, 0);
         return;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 { state, .. } = inner else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected ds4)",
@@ -1167,7 +1181,8 @@ pub fn ep_serve_ds4(
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!(
@@ -1183,7 +1198,8 @@ pub fn ep_serve_ds4(
                 }
             },
             None => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::Deepseek4Ep,
                     stdout,
                     Some(id),
                     "EP logits unset after prefill",
@@ -1207,7 +1223,13 @@ pub fn ep_serve_ds4(
         // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
         // decode loop running for the full max_tokens of wasted multi-GPU work.
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::GenerationRoute::Deepseek4Ep,
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         if grammar_active && !matcher.is_free() {
@@ -1263,7 +1285,8 @@ pub fn ep_serve_ds4(
         if let Err(e) =
             deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
         {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
@@ -1282,7 +1305,8 @@ pub fn ep_serve_ds4(
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!(
@@ -1355,7 +1379,13 @@ pub fn ep_serve_ds4(
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     let effects = ds4_client_commit_effects(decision, finish_reason == "tool_calls", store_cache);
     if !effects.emit_done {
-        ep_emit_abort(stdout, id, m, generated);
+        ep_emit_abort(
+            crate::ar::GenerationRoute::Deepseek4Ep,
+            stdout,
+            id,
+            m,
+            generated,
+        );
         return;
     }
     let mut action = ds4_ar_ep_cache_action(&terminal, &emit_text_buf);
@@ -1402,7 +1432,11 @@ pub fn ep_serve_ds4(
         );
     }
 
-    crate::ar::emit_active_route_done_value(stdout, &pending_done);
+    crate::ar::emit_generation_done_value(
+        crate::ar::GenerationRoute::Deepseek4Ep,
+        stdout,
+        &pending_done,
+    );
     let _ = stdout.flush();
 }
 
@@ -1426,6 +1460,12 @@ pub fn ep_serve_minimax(
 ) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::MiniMaxEp,
+        stdout,
+        id,
+        primed_think,
+    );
 
     // O2b-2 capacity guard (minimax EP): even with LCP reuse the KV ends up
     // holding [0, prompt_n) after prefill, then decode appends max_tokens, so
@@ -1436,13 +1476,17 @@ pub fn ep_serve_minimax(
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
-        emit_active_attempt_error(
+        crate::ar::emit_generation_error(
+            crate::ar::GenerationRoute::MiniMaxEp,
             stdout,
             Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_n, max_tokens, m.physical_cap),
+            &format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
+                prompt_n, max_tokens, m.physical_cap
+            ),
             "context_length",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -1512,7 +1556,8 @@ pub fn ep_serve_minimax(
             partials,
         } = inner
         else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected minimax)",
@@ -1538,7 +1583,8 @@ pub fn ep_serve_minimax(
             if let Err(e) =
                 minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
             {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
@@ -1564,7 +1610,7 @@ pub fn ep_serve_minimax(
     // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
     // post-loop check_abort catches a cancel that arrived after the last token.
     if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
+        ep_emit_abort(crate::ar::GenerationRoute::MiniMaxEp, stdout, id, m, 0);
         return;
     }
 
@@ -1582,6 +1628,15 @@ pub fn ep_serve_minimax(
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax { state, .. } = inner else {
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
+                stdout,
+                Some(id),
+                "EP arch mismatch (expected minimax)",
+                "validation",
+                false,
+                false,
+            );
             return;
         };
         let _ = gpus.devices[0].bind_thread();
@@ -1590,7 +1645,8 @@ pub fn ep_serve_minimax(
         match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!(
@@ -1615,7 +1671,13 @@ pub fn ep_serve_minimax(
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
         // reset EP cursors, stop.
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::GenerationRoute::MiniMaxEp,
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
@@ -1653,7 +1715,8 @@ pub fn ep_serve_minimax(
         if let Err(e) =
             minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
         {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
                 stdout,
                 Some(id),
                 &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
@@ -1671,7 +1734,8 @@ pub fn ep_serve_minimax(
         logits = match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!(
@@ -1693,6 +1757,7 @@ pub fn ep_serve_minimax(
         "stop"
     };
     ep_emit_done(
+        crate::ar::GenerationRoute::MiniMaxEp,
         stdout,
         id,
         m,
@@ -2920,7 +2985,7 @@ pub fn generate_spec(
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
     // Correlated validation error only — wrapper sees None and skips done/cache.
     if max_tokens == 0 {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             "max_tokens must be > 0",
@@ -2935,7 +3000,7 @@ pub fn generate_spec(
     // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
     // rather than run unsupported speculation past floor-reserved capacity.
     if m.kv_adaptive.is_some() {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
@@ -2958,7 +3023,7 @@ pub fn generate_spec(
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
         Some(s) => (s.block_size(), s.ctx_capacity()),
         None => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 "dflash path entered without a loaded speculator",
@@ -2978,7 +3043,7 @@ pub fn generate_spec(
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("no carrier for arch_id {}", arch_id),
@@ -2998,7 +3063,7 @@ pub fn generate_spec(
     let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
         Ok(g) => g,
         Err(e) => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("{}", e),
@@ -3021,7 +3086,7 @@ pub fn generate_spec(
         let slot = match guard.slot() {
             Ok(s) => s,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     &format!("{}", e),
@@ -3087,7 +3152,7 @@ pub fn generate_spec(
         ctx_capacity
     };
     if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             &format!(
@@ -3113,7 +3178,7 @@ pub fn generate_spec(
     if m.eviction.is_none()
         && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
     {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             &format!(
@@ -3138,7 +3203,7 @@ pub fn generate_spec(
     let slot = match guard.slot() {
         Ok(s) => s,
         Err(e) => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("{}", e),

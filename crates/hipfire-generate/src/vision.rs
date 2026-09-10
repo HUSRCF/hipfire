@@ -14,13 +14,27 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_reasoning_token, emit_visible_token, write_error,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision,
 };
+
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+}
+
+fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    crate::ar::emit_active_route_error(stdout, Some(id), message, "internal", false, false);
+}
+
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, FilterAction};

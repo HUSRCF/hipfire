@@ -297,6 +297,21 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+fn emit_active_error_route_aware(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if crate::ar::active_generation_route().is_some() {
+        crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+    } else {
+        emit_active_attempt_error(stdout, id, message, class, retryable, rolled_back);
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -311,7 +326,7 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
-    emit_active_attempt_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
     let _ = stdout.flush();
 }
 
@@ -644,7 +659,7 @@ pub fn emit_ds4_malformed_action(
     debug_assert!(!action.store_cache);
     debug_assert!(!action.expose_tool_calls);
     debug_assert!(!action.retryable);
-    emit_active_attempt_error(
+    emit_active_error_route_aware(
         stdout,
         Some(id),
         &action.message,
