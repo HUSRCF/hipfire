@@ -3065,6 +3065,17 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
+        // (gfx1100) maps a second, later segment onto the SAME physical pages as
+        // the first (vmm_arena_smoke boundary-growth assert fails; every
+        // subsequent KV growth corrupts all prior KV -> token soup). Single
+        // segment maps are proven correct. So on Windows, map the FULL
+        // reservation in one map_next up front instead of growing in small
+        // segments; grow_vmm_tensor then becomes a no-op (already fully
+        // mapped). Costs up-front VRAM for the whole reservation; correctness
+        // over on-demand commit on the platform whose driver breaks growth.
+        #[cfg(windows)]
+        let initial_mapped_bytes = arena.reserved_bytes();
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -5300,9 +5311,98 @@ mod tests {
             .expect_err("load cleanup must refuse a still-owned VMM arena");
         assert!(err.to_string().contains("live VMM"), "{err}");
         assert_eq!(gpu.vmm_allocation_count(), 1);
+        #[cfg(not(windows))]
         assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(0));
+        #[cfg(windows)]
+        {
+            // Single-segment workaround: the full reservation is mapped up front,
+            // so a 4096-byte reserve already reports a granularity-aligned prefix.
+            let mapped = gpu
+                .vmm_mapped_bytes(&tensor)
+                .expect("windows full-map must report mapped bytes");
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            assert_eq!(mapped % gran, 0, "mapped must be granularity-aligned");
+            assert!(
+                mapped >= 4096,
+                "full-map must cover the 4096-byte reservation, got {mapped}"
+            );
+        }
 
         gpu.free_tensor(tensor).expect("free live owner");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
+    fn vmm_fullmap_covers_unaligned_reservation() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        // 4097 is a multiple of no real VMM granularity: the pre-fix Windows
+        // path (map_next with the raw byte size) rejected it even though the
+        // reservation itself was valid.
+        const UNALIGNED: usize = 4097;
+        let mut tensor =
+            match unsafe { gpu.alloc_vmm_tensor(&[UNALIGNED], super::DType::Raw, 0, &access) } {
+                Ok(tensor) => tensor,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        #[cfg(not(windows))]
+        {
+            // Growth path: nothing is mapped up front, so grow an aligned
+            // cover for the unaligned reservation.
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(0));
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            let cover = UNALIGNED.div_ceil(gran) * gran;
+            gpu.grow_vmm_tensor(&mut tensor, cover, &access)
+                .expect("grow to cover unaligned reservation");
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(cover));
+        }
+        #[cfg(windows)]
+        {
+            // Single-segment path: the whole reservation is mapped up front,
+            // so any further growth must fail without disturbing the mapping.
+            let mapped = gpu
+                .vmm_mapped_bytes(&tensor)
+                .expect("windows full-map must report mapped bytes");
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            assert_eq!(mapped % gran, 0, "mapped must be granularity-aligned");
+            assert!(
+                mapped >= UNALIGNED,
+                "full-map must cover the {UNALIGNED}-byte reservation, got {mapped}"
+            );
+            let over_err = gpu
+                .grow_vmm_tensor(&mut tensor, gran, &access)
+                .expect_err("windows full-map must already cover the reservation");
+            assert!(
+                over_err.to_string().contains("exceed reserve"),
+                "unexpected full-map growth error: {over_err}"
+            );
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(mapped));
+        }
+        // The observable logical prefix is usable on both paths.
+        let expect: Vec<u8> = (0..UNALIGNED).map(|i| (i % 251) as u8).collect();
+        gpu.hip
+            .memcpy_htod(&tensor.buf, &expect)
+            .expect("htod unaligned prefix");
+        let mut actual = vec![0u8; UNALIGNED];
+        gpu.hip
+            .memcpy_dtoh(&mut actual, &tensor.buf)
+            .expect("dtoh unaligned prefix");
+        assert_eq!(actual, expect);
+        gpu.free_tensor(tensor).expect("free");
         assert_eq!(gpu.vmm_allocation_count(), 0);
     }
 
