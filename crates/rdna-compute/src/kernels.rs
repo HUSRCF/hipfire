@@ -7068,6 +7068,16 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// gfx12/RDNA4 sister of `GEMM_F16_X_F16_WMMA_SRC` — same math, same
+/// `(A, X, Y, M, K, B)` signature and `[B, M]` F32 output layout, but half8
+/// operands with `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and the
+/// contiguous-per-half C mapping. The gfx11 `_w32` builtin needs
+/// `wmma-256b-insts,wavefrontsize32` and does not compile for gfx1201.
+/// Selected by `Gpu::gemm_f16_x_f16_wmma` on `has_wmma_w32_gfx12()`; the gfx11
+/// path is unchanged.
+pub const GEMM_F16_X_F16_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.gfx12.hip");
+
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from
 /// 8 to 64 FLOP/byte for the dense FLUX MMDiT linears. Requires K % 64 == 0.

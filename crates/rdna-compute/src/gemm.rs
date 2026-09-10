@@ -24991,6 +24991,13 @@ impl Gpu {
             )
         }
     }
+    /// F16 weight × F16 input → F32 batched GEMM, arch-routed.
+    ///
+    /// gfx11 takes the wave32 `gemm_f16_x_f16_wmma` kernel; gfx12 (RDNA4)
+    /// takes the `gemm_f16_x_f16_wmma_gfx12` sister (half8 operands,
+    /// `_w32_gfx12` builtin, contiguous-per-half C mapping) because the gfx11
+    /// `_w32` builtin does not compile for gfx1201. Same operand contract,
+    /// same grid/block, same `[B, M]` F32 result — purely an ISA-level swap.
     pub fn gemm_f16_x_f16_wmma(
         &mut self,
         a_f16: &GpuTensor,
@@ -25001,11 +25008,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_f16_x_f16_wmma",
-            kernels::GEMM_F16_X_F16_WMMA_SRC,
-            "gemm_f16_x_f16_wmma",
-        )?;
+        let (module, source, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "gemm_f16_x_f16_wmma_gfx12",
+                kernels::GEMM_F16_X_F16_WMMA_GFX12_SRC,
+                "gemm_f16_x_f16_wmma_gfx12",
+            )
+        } else {
+            (
+                "gemm_f16_x_f16_wmma",
+                kernels::GEMM_F16_X_F16_WMMA_SRC,
+                "gemm_f16_x_f16_wmma",
+            )
+        };
+        self.ensure_kernel(module, source, symbol)?;
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -25023,7 +25039,7 @@ impl Gpu {
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
         self.launch_maybe_blob(
-            "gemm_f16_x_f16_wmma",
+            module,
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,

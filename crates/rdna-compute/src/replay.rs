@@ -859,6 +859,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), write(16)]);
     }
+    // F16 dense batched GEMM (Maple router + DeepSeek compressor shapes). 3 pointers
+    // + 3 i32 (M,K,B) = 36 explicit bytes. A@0 and X@8 are reads; Y@16 is a pure
+    // overwrite (`Y[...] = acc`), so write — never an RMW. gfx11 and gfx12 are
+    // distinct symbols with one shared contract, like the residual `_wmma`/`_gfx12` pairs.
+    if matches!(
+        kernel,
+        "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12"
+    ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
 
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
@@ -1494,6 +1504,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+    ) {
+        return Some(48);
+    }
+    // F16 dense batched GEMM: 3 ptr + M,K,B = 36 → 48 padded. gfx11 and gfx12
+    // share one ABI — see `Gpu::gemm_f16_x_f16_wmma`, whose blob builder pushes
+    // the same 3 ptr + 3 i32 on both paths before the record path's pad_to(16).
+    if matches!(
+        kernel,
+        "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12"
     ) {
         return Some(48);
     }
