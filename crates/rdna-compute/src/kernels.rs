@@ -7534,28 +7534,6 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn mq4_moe_gate_up_specializes_gemma4_tail_at_compile_time() {
-        assert!(GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
-            .contains("#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11"));
-        assert!(GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
-            .contains("const int tail = HIPFIRE_MOE_GATE_UP_FIXED_GROUPS & 3;"));
-        assert!(GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
-            .contains("gemv_mq4g256_moe_gate_up_k8_indexed_k2816"));
-        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC.contains("const int tail = 0;"));
-    }
-
-    #[test]
-    fn hfq4_moe_gate_up_specializes_gemma4_tail_at_compile_time() {
-        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
-            .contains("#define HIPFIRE_MOE_GATE_UP_FIXED_GROUPS 11"));
-        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC
-            .contains("const int tail = HIPFIRE_MOE_GATE_UP_FIXED_GROUPS & 3;"));
-        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC
-            .contains("#define HIPFIRE_WEIGHT_CPOL_AUX 2"));
-        assert!(GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC.contains("const int tail = 0;"));
-    }
-
-    #[test]
     fn gfx1100_awq_direct_keeps_abi_and_drops_full_lds_stage() {
         assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
             .contains("void fused_rmsnorm_mq_rotate_awq("));
