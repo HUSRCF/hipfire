@@ -4399,16 +4399,14 @@ mod tests {
             assert_eq!(transfer.admission(), admission);
             assert_eq!(batch_terminal_generation(id, attempt_id), None);
 
-            // Handoff bootstraps and then preserves the exact singleton
-            // lifecycle; main adopts this transfer instead of rediscovering it.
-            let singleton_generation =
-                terminal_generation(id, attempt_id).expect("bootstrapped singleton transaction");
+            // Handoff bootstraps the singleton inside the tombstone; main
+            // adopts that exact owner instead of rediscovering it.
+            assert_eq!(terminal_generation(id, attempt_id), None);
             clear_terminal_control();
             assert!(adopt_singleton_transfer(id, attempt_id, transfer));
-            assert_eq!(
-                terminal_generation(id, attempt_id),
-                Some(singleton_generation)
-            );
+            let singleton_generation =
+                terminal_generation(id, attempt_id).expect("adopted singleton transaction");
+            assert!(singleton_generation > 0);
             admissions.push(admission);
             singleton_generations.push(singleton_generation);
 

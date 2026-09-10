@@ -3311,7 +3311,7 @@ fn main() {
                         if started_in_think {
                             // Rendered prompts that open a think span are sequential
                             // barriers. Transfer any pre-latched abort exactly once
-                            // (transfer itself clears the keyed entry).
+                            // (transfer retires the batch entry and holds a tombstone until singleton cleanup).
                             let _ = batch_transfer_abort_to_singleton_and_clear(
                                 id,
                                 gen_attempt_id,

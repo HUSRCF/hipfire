@@ -549,6 +549,156 @@ fn batch_rebind_clears_tls_without_binding_reused_generation() {
 }
 
 #[test]
+fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
+    let _lock = begin_test();
+    let id = "handoff-abort-phase";
+    let attempt_id = 88_u64;
+
+    for phase in 0..3 {
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+        let generation =
+            hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+                .expect("batch generation");
+        activate_terminal_control(id, attempt_id);
+
+        let abort_at_phase = || {
+            let gate = Arc::new(Barrier::new(2));
+            let worker_gate = Arc::clone(&gate);
+            let worker = std::thread::spawn(move || {
+                worker_gate.wait();
+                apply_terminal_control("abort", id, attempt_id);
+                hipfire_engine::terminal::batch_apply_terminal_control(
+                    "abort",
+                    id,
+                    attempt_id,
+                );
+            });
+            gate.wait();
+            worker.join().expect("abort worker");
+        };
+
+        let transfer = if phase == 0 {
+            // Abort before the handoff snapshots either owner.
+            abort_at_phase();
+            batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
+                .expect("singleton handoff")
+        } else {
+            let transfer =
+                batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
+                    .expect("singleton handoff");
+            if phase == 1 {
+                // Abort after the exact snapshot/tombstone boundary but before
+                // adoption; the tombstone must retain it.
+                abort_at_phase();
+                assert!(check_abort(id));
+            } else {
+                // Abort after adoption must hit the restored singleton directly.
+                assert!(adopt_singleton_transfer(
+                    id,
+                    attempt_id,
+                    transfer.clone()
+                ));
+                abort_at_phase();
+                assert!(check_abort(id));
+            }
+            transfer
+        };
+
+        if phase != 2 {
+            assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+        }
+        assert!(check_abort(id), "abort must survive phase {phase}");
+
+        let _scope = BatchAttemptScope::enter_singleton(attempt_id);
+        assert!(claim_wire_terminal(id, attempt_id));
+        assert!(
+            !claim_wire_terminal(id, attempt_id),
+            "singleton terminal must be claimed exactly once"
+        );
+        drop(_scope);
+        clear_terminal_control();
+        let next_generation =
+            hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+                .expect("next generation after old terminal");
+        assert_ne!(generation, next_generation);
+        assert!(batch_clear_terminal_at_generation(
+            id,
+            attempt_id,
+            next_generation
+        ));
+    }
+    batch_clear_all_terminals();
+    clear_terminal_control();
+    set_active_attempt_id(0);
+}
+
+#[test]
+fn singleton_handoff_tombstone_serializes_abort_and_same_key_admission() {
+    let _lock = begin_test();
+    let id = "handoff-admission-barrier";
+    let attempt_id = 89_u64;
+    let generation =
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+            .expect("batch generation");
+    activate_terminal_control(id, attempt_id);
+    let transfer =
+        batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
+            .expect("singleton handoff");
+
+    let gate = Arc::new(Barrier::new(3));
+    let abort_gate = Arc::clone(&gate);
+    let abort_worker = std::thread::spawn(move || {
+        abort_gate.wait();
+        apply_terminal_control("abort", id, attempt_id);
+        hipfire_engine::terminal::batch_apply_terminal_control("abort", id, attempt_id);
+    });
+    let announce_gate = Arc::clone(&gate);
+    let (announce_tx, announce_rx) = std::sync::mpsc::channel();
+    let announce_worker = std::thread::spawn(move || {
+        announce_gate.wait();
+        announce_tx
+            .send(hipfire_engine::terminal::batch_announce_terminal(
+                id,
+                attempt_id,
+            ))
+            .expect("announce result");
+    });
+    gate.wait();
+    abort_worker.join().expect("abort worker");
+    announce_worker.join().expect("announce worker");
+    assert!(
+        announce_rx.recv().expect("announce result").is_none(),
+        "same-key B cannot enter while A transfer tombstone is live"
+    );
+
+    assert!(adopt_singleton_transfer(id, attempt_id, transfer));
+    assert!(check_abort(id), "abort during transfer must be adopted");
+    assert!(
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).is_none(),
+        "same-key B remains blocked until A closes"
+    );
+    let _scope = BatchAttemptScope::enter_singleton(attempt_id);
+    assert!(claim_wire_terminal(id, attempt_id));
+    assert!(!claim_wire_terminal(id, attempt_id));
+    drop(_scope);
+    clear_terminal_control();
+
+    let generation_b =
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+            .expect("B admitted after A release");
+    assert_ne!(generation, generation_b);
+    assert!(batch_clear_terminal_at_generation(
+        id,
+        attempt_id,
+        generation_b
+    ));
+    batch_clear_all_terminals();
+    set_active_attempt_id(0);
+}
+
+#[test]
 fn singleton_handoff_scope_cannot_bind_reannounced_batch_owner() {
     let _lock = begin_test();
     batch_clear_all_terminals();
@@ -561,18 +711,21 @@ fn singleton_handoff_scope_cannot_bind_reannounced_batch_owner() {
     let transfer =
         batch_handoff_to_singleton_and_clear(id, attempt_id, generation_a).expect("handoff A");
 
-    // A fresh batch admission for the same wire key can arrive before main
-    // consumes A's internal handoff message.
-    clear_terminal_control();
-    let generation_b = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
-        .expect("batch generation B");
-    assert_ne!(generation_a, generation_b);
-
+    // A fresh batch admission for the same wire key is blocked while A's
+    // tombstone is pending and remains blocked until A is adopted and closed.
     assert!(adopt_singleton_transfer(id, attempt_id, transfer));
     assert_eq!(
         terminal_generation(id, attempt_id),
         Some(singleton_generation)
     );
+    assert!(
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).is_none(),
+        "batch generation B must wait for singleton A to close"
+    );
+    clear_terminal_control();
+    let generation_b = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+        .expect("batch generation B after A terminal cleanup");
+    assert_ne!(generation_a, generation_b);
     let scope_a = BatchAttemptScope::enter_singleton(attempt_id);
     assert_eq!(scope_a.admission_generation(), None);
     assert_eq!(active_batch_generation(), None);

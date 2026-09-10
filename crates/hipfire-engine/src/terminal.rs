@@ -52,9 +52,11 @@ pub struct ActiveTerminalControl {
 /// The batch admission is provenance only after handoff; the singleton
 /// transaction snapshot is restored verbatim by the main loop. In particular,
 /// a pre-latched abort and its lifecycle generation must survive the driver's
-/// return and the outer terminal-control guard.
+/// return and the outer terminal-control guard. The exact key and admission
+/// token are retained so adoption cannot rediscover a reused wire key.
 #[derive(Debug, Clone)]
 pub struct SingletonTransfer {
+    key: AttemptKey,
     admission: BatchGeneration,
     batch_abort_latched: bool,
     singleton: Option<ActiveTerminalControl>,
@@ -105,12 +107,24 @@ pub fn terminal_control() -> &'static TerminalControlCell {
 pub const CLIENT_TERMINAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Activate a fresh terminal-control transaction for this generate.
+///
+/// The batch tombstone is checked under the same terminal→batch lock order as
+/// handoff and reader control. A stale caller cannot overwrite a transfer that
+/// is still waiting for adoption.
 pub fn activate_terminal_control(id: &str, attempt_id: u64) {
-    let cell = terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    g.next_generation = g.next_generation.checked_add(1).unwrap_or(1);
-    let generation = g.next_generation;
-    g.active = Some(ActiveTerminalControl {
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let batch = batch_cell.mu.lock().unwrap();
+    if batch
+        .handoffs
+        .contains_key(&AttemptKey::new(id, attempt_id))
+    {
+        return;
+    }
+    terminal.next_generation = terminal.next_generation.checked_add(1).unwrap_or(1);
+    let generation = terminal.next_generation;
+    terminal.active = Some(ActiveTerminalControl {
         id: id.to_string(),
         attempt_id,
         generation,
@@ -118,19 +132,32 @@ pub fn activate_terminal_control(id: &str, attempt_id: u64) {
         decision: None,
         terminal_claimed: false,
     });
-    cell.cv.notify_all();
+    terminal_cell.cv.notify_all();
 }
 
 /// Clear the active terminal-control transaction (request end / guard drop).
 ///
 /// Clearing is fail-closed: a writer may not infer ownership from a nonzero
-/// attempt after the lifecycle ends. Callers must explicitly activate the
-/// next transaction before any correlated terminal can be emitted.
+/// attempt after the lifecycle ends. An adopted handoff tombstone is released
+/// only with its matching singleton owner; a pending transfer stays protected
+/// across the outer batch driver's guard drop.
 pub fn clear_terminal_control() {
-    let cell = terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    g.active = None;
-    cell.cv.notify_all();
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let completed_key = terminal
+        .active
+        .as_ref()
+        .map(|active| AttemptKey::new(&active.id, active.attempt_id));
+    terminal.active = None;
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    if let Some(key) = completed_key {
+        if batch.handoffs.get(&key).is_some_and(|handoff| handoff.adopted) {
+            batch.handoffs.remove(&key);
+            batch_cell.cv.notify_all();
+        }
+    }
+    terminal_cell.cv.notify_all();
 }
 
 /// Return the active singleton generation for an exact request key.
@@ -142,6 +169,28 @@ pub fn terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
     })
 }
 
+fn claim_terminal_state(
+    state: &mut TerminalControlState,
+    id: &str,
+    attempt_id: u64,
+    generation: Option<u64>,
+) -> bool {
+    let Some(active) = state.active.as_mut() else {
+        return false;
+    };
+    if active.id != id
+        || active.attempt_id != attempt_id
+        || generation.is_some_and(|expected| active.generation != expected)
+    {
+        return false;
+    }
+    if active.terminal_claimed {
+        return false;
+    }
+    active.terminal_claimed = true;
+    true
+}
+
 /// Claim a terminal only for a captured singleton lifecycle generation.
 ///
 /// This is the strict form used by race/reuse tests and any caller that holds
@@ -151,17 +200,7 @@ pub fn terminal_generation(id: &str, attempt_id: u64) -> Option<u64> {
 pub fn claim_terminal_at_generation(id: &str, attempt_id: u64, generation: u64) -> bool {
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    let Some(active) = g.active.as_mut() else {
-        return false;
-    };
-    if active.id != id || active.attempt_id != attempt_id || active.generation != generation {
-        return false;
-    }
-    if active.terminal_claimed {
-        return false;
-    }
-    active.terminal_claimed = true;
-    true
+    claim_terminal_state(&mut g, id, attempt_id, Some(generation))
 }
 
 /// Claim the sole terminal slot for the current request key.
@@ -176,17 +215,7 @@ pub fn claim_terminal(id: &str, attempt_id: u64) -> bool {
     }
     let cell = terminal_control();
     let mut g = cell.mu.lock().unwrap();
-    let Some(active) = g.active.as_mut() else {
-        return false;
-    };
-    if active.id != id || active.attempt_id != attempt_id {
-        return false;
-    }
-    if active.terminal_claimed {
-        return false;
-    }
-    active.terminal_claimed = true;
-    true
+    claim_terminal_state(&mut g, id, attempt_id, None)
 }
 
 /// Key for multiplexed terminal control and inbox, as required by the
@@ -255,11 +284,42 @@ pub struct BatchRegistryEntry {
     pub pending_done: Option<serde_json::Value>,
     pub deadline: Option<Instant>,
 }
+#[derive(Debug, Clone)]
+struct SingletonHandoff {
+    admission: BatchGeneration,
+    singleton: Option<ActiveTerminalControl>,
+    abort_latched: bool,
+    adopted: bool,
+}
+
+impl SingletonHandoff {
+    fn new(
+        admission: BatchGeneration,
+        singleton: Option<ActiveTerminalControl>,
+        abort_latched: bool,
+    ) -> Self {
+        Self {
+            admission,
+            singleton,
+            abort_latched,
+            adopted: false,
+        }
+    }
+}
+
+// Entries are removed only after adoption/terminal cleanup. A handoff tombstone
+// reserves the exact wire key so the next admission cannot overtake its owner.
+//
+// Every operation that needs both cells takes terminal_control().mu first and
+// batch_terminal_control().mu second. This ordering is the transfer boundary:
+// reader controls, handoff, claims, admission, and cleanup cannot deadlock or
+// observe a removal-before-adoption gap.
 pub struct BatchTerminalState {
     pub entries: std::collections::HashMap<AttemptKey, BatchRegistryEntry>,
-    /// Monotonic epoch for admissions. Retired entries are removed rather
-    /// than tombstoned; a stale writer carries its old generation in TLS and
-    /// therefore cannot claim a fresh entry with the same wire key.
+    handoffs: std::collections::HashMap<AttemptKey, SingletonHandoff>,
+    /// Monotonic epoch for ordinary admissions. Retired batch entries are
+    /// removed; only in-flight singleton handoffs use the separate tombstone
+    /// map above to reserve their exact wire key.
     pub next_generation: u64,
 }
 
@@ -267,6 +327,7 @@ impl BatchTerminalState {
     pub fn new() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            handoffs: std::collections::HashMap::new(),
             next_generation: 0,
         }
     }
@@ -308,38 +369,61 @@ pub fn batch_claim_terminal(id: &str, attempt_id: u64) -> bool {
 /// Claim the wire-terminal boundary for either a continuous-batch lane or
 /// the sequential active attempt. Batch keys are checked first so a stale or
 /// wrong-attempt writer cannot fall through to the singleton claim.
+///
+/// This takes the terminal lock before the batch lock. The handoff tombstone
+/// therefore keeps the adopted singleton eligible while rejecting stale batch
+/// producers and same-key re-admission.
 pub fn claim_wire_terminal(id: &str, attempt_id: u64) -> bool {
-    let cell = batch_terminal_control();
-    let mut g = cell.mu.lock().unwrap();
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
-    if let Some(entry) = g.entries.get_mut(&key) {
+    if let Some(entry) = batch.entries.get_mut(&key) {
         if active_batch_generation() != Some(entry.generation) || entry.terminal_claimed {
             return false;
         }
         entry.terminal_claimed = true;
-        cell.cv.notify_all();
+        batch_cell.cv.notify_all();
         return true;
+    }
+    if let Some(handoff) = batch.handoffs.get(&key) {
+        if active_batch_generation().is_some() || !handoff.adopted {
+            return false;
+        }
+        let claimed = claim_terminal_state(&mut terminal, id, attempt_id, None);
+        if claimed {
+            terminal_cell.cv.notify_all();
+        }
+        return claimed;
     }
     // A scope with no live entry is a stale batch producer. Never let it
     // fall through to the singleton after its keyed generation retired.
-    if active_batch_generation().is_some() || g.entries.keys().any(|candidate| candidate.id == id) {
+    if active_batch_generation().is_some() || batch.entries.keys().any(|candidate| candidate.id == id)
+    {
         return false;
     }
-    claim_terminal(id, attempt_id)
+    let claimed = claim_terminal_state(&mut terminal, id, attempt_id, None);
+    if claimed {
+        terminal_cell.cv.notify_all();
+    }
+    claimed
 }
 
 /// Announce a generate key before queueing and return its opaque admission
-/// generation. A present key is not re-owned.
+/// generation. A present key or transfer tombstone is not re-owned.
 pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> Option<BatchGeneration> {
-    let cell = batch_terminal_control();
-    let mut g = cell.mu.lock().unwrap();
+    let terminal_cell = terminal_control();
+    let _terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
-    if g.entries.contains_key(&key) {
+    if batch.entries.contains_key(&key) || batch.handoffs.contains_key(&key) {
         return None;
     }
-    g.next_generation = g.next_generation.checked_add(1).unwrap_or(1);
-    let generation = BatchGeneration(g.next_generation);
-    g.entries.insert(
+    batch.next_generation = batch.next_generation.checked_add(1).unwrap_or(1);
+    let generation = BatchGeneration(batch.next_generation);
+    batch.entries.insert(
         key,
         BatchRegistryEntry {
             state: BatchRegistryState::Announced,
@@ -351,7 +435,7 @@ pub fn batch_announce_terminal(id: &str, attempt_id: u64) -> Option<BatchGenerat
             deadline: None,
         },
     );
-    cell.cv.notify_all();
+    batch_cell.cv.notify_all();
     Some(generation)
 }
 
@@ -534,32 +618,103 @@ pub fn batch_ready_owner_matches(
 }
 
 pub fn batch_clear_all_terminals() {
-    let cell = batch_terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    g.entries.clear();
-    cell.cv.notify_all();
+    let terminal_cell = terminal_control();
+    let _terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    batch.entries.clear();
+    batch.handoffs.clear();
+    batch_cell.cv.notify_all();
+}
+
+fn apply_handoff_control(
+    terminal: &mut TerminalControlState,
+    key: &AttemptKey,
+    handoff: &mut SingletonHandoff,
+    kind: &str,
+) -> bool {
+    let mut changed = false;
+    match kind {
+        "abort" => {
+            if !handoff.abort_latched {
+                handoff.abort_latched = true;
+                changed = true;
+            }
+            if let Some(singleton) = handoff.singleton.as_mut() {
+                if singleton.decision.is_none() {
+                    singleton.decision = Some(TerminalControlDecision::Abort);
+                    changed = true;
+                }
+            }
+            if handoff.adopted {
+                if let Some(active) = terminal.active.as_mut().filter(|active| {
+                    active.id == key.id && active.attempt_id == key.attempt_id
+                }) {
+                    if active.decision.is_none() {
+                        active.decision = Some(TerminalControlDecision::Abort);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        "commit" if !handoff.abort_latched => {
+            if let Some(singleton) = handoff.singleton.as_mut() {
+                if singleton.ready && singleton.decision.is_none() {
+                    singleton.decision = Some(TerminalControlDecision::Commit);
+                    changed = true;
+                }
+            }
+            if handoff.adopted {
+                if let Some(active) = terminal.active.as_mut().filter(|active| {
+                    active.id == key.id && active.attempt_id == key.attempt_id
+                }) {
+                    if active.ready && active.decision.is_none() {
+                        active.decision = Some(TerminalControlDecision::Commit);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 /// Apply abort/commit control by current wire key. The wire protocol has no
 /// generation, so this is intentionally the sole key-only producer input.
+///
+/// The terminal→batch lock order makes a handoff tombstone visible to the
+/// reader without a snapshot/removal gap.
 pub fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
-    let cell = batch_terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    if let Some(handoff) = batch.handoffs.get_mut(&key) {
+        if apply_handoff_control(&mut terminal, &key, handoff, kind) {
+            terminal_cell.cv.notify_all();
+            batch_cell.cv.notify_all();
+        }
+        return;
+    }
+    if let Some(entry) = batch.entries.get_mut(&key) {
         match kind {
             "abort" => {
-                if !e.abort_latched {
-                    e.abort_latched = true;
-                    cell.cv.notify_all();
+                if !entry.abort_latched {
+                    entry.abort_latched = true;
+                    batch_cell.cv.notify_all();
                 }
             }
             "commit" => {
-                if e.abort_latched {
+                if entry.abort_latched {
                     return;
                 }
-                if matches!(e.state, BatchRegistryState::Ready { .. }) && !e.commit_latched {
-                    e.commit_latched = true;
-                    cell.cv.notify_all();
+                if matches!(entry.state, BatchRegistryState::Ready { .. })
+                    && !entry.commit_latched
+                {
+                    entry.commit_latched = true;
+                    batch_cell.cv.notify_all();
                 }
             }
             _ => {}
@@ -574,11 +729,14 @@ pub fn batch_check_abort(
 ) -> bool {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
-    g.entries
-        .get(&AttemptKey::new(id, attempt_id))
-        .is_some_and(|e| e.generation == generation && e.abort_latched)
+    let key = AttemptKey::new(id, attempt_id);
+    if let Some(entry) = g.entries.get(&key) {
+        return entry.generation == generation && entry.abort_latched;
+    }
+    g.handoffs.get(&key).is_some_and(|handoff| {
+        handoff.admission == generation && !handoff.adopted && handoff.abort_latched
+    })
 }
-
 /// Non-mutating generation-checked poll.
 pub fn batch_poll_decision(
     id: &str,
@@ -587,24 +745,32 @@ pub fn batch_poll_decision(
 ) -> Option<ClientTerminalDecision> {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
-    let e = g.entries.get(&AttemptKey::new(id, attempt_id))?;
-    if e.generation != generation {
+    let key = AttemptKey::new(id, attempt_id);
+    if let Some(e) = g.entries.get(&key) {
+        if e.generation != generation {
+            return None;
+        }
+        if e.abort_latched {
+            return Some(ClientTerminalDecision::Abort);
+        }
+        if let Some(deadline) = e.deadline {
+            if Instant::now() >= deadline {
+                return Some(ClientTerminalDecision::Abort);
+            }
+        }
+        if e.commit_latched && matches!(e.state, BatchRegistryState::Ready { .. }) {
+            return Some(ClientTerminalDecision::Commit);
+        }
         return None;
     }
-    if e.abort_latched {
-        return Some(ClientTerminalDecision::Abort);
-    }
-    if let Some(deadline) = e.deadline {
-        if Instant::now() >= deadline {
+    if let Some(handoff) = g.handoffs.get(&key) {
+        if handoff.admission == generation && !handoff.adopted {
             return Some(ClientTerminalDecision::Abort);
         }
     }
-    if e.commit_latched && matches!(e.state, BatchRegistryState::Ready { .. }) {
-        return Some(ClientTerminalDecision::Commit);
-    }
+
     None
 }
-
 /// Blocking generation-checked wait used by lane commit polling.
 pub fn batch_wait_decision(
     id: &str,
@@ -646,37 +812,49 @@ pub fn batch_wait_decision(
     }
 }
 
-/// Remove an exact batch admission while capturing ownership of the currently
-/// active singleton transaction. The caller must retire its lane only after
-/// any fallible GPU reset succeeds; this function then makes the batch owner
-/// unavailable exactly once and returns the snapshot for the outer main loop.
+/// Atomically replace an exact batch admission with a singleton handoff
+/// tombstone and capture the matching singleton transaction.
+///
+/// The terminal lock is held before the batch lock. The tombstone remains in
+/// the batch state until adoption and the matching singleton lifecycle close,
+/// so controls cannot fall into a removal-before-adoption gap and a same-key
+/// next generation cannot overtake the old owner.
 pub fn batch_handoff_to_singleton_and_clear(
     id: &str,
     attempt_id: u64,
     generation: BatchGeneration,
 ) -> Option<SingletonTransfer> {
-    let singleton = {
-        let cell = terminal_control();
-        let g = cell.mu.lock().unwrap();
-        g.active
-            .as_ref()
-            .filter(|active| active.id == id && active.attempt_id == attempt_id)
-            .cloned()
-    };
-    let (batch_abort_latched, removed) = {
-        let cell = batch_terminal_control();
-        let mut g = cell.mu.lock().unwrap();
-        let key = AttemptKey::new(id, attempt_id);
-        let entry = g.entries.get(&key)?;
-        if entry.generation != generation {
-            return None;
-        }
-        let batch_abort_latched = entry.abort_latched;
-        g.entries.remove(&key);
-        cell.cv.notify_all();
-        (batch_abort_latched, true)
-    };
-    removed.then_some(SingletonTransfer {
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    if batch.handoffs.contains_key(&key) {
+        return None;
+    }
+    let batch_abort_latched = batch
+        .entries
+        .get(&key)
+        .filter(|entry| entry.generation == generation)
+        .map(|entry| entry.abort_latched)?;
+    let singleton = terminal.active.as_ref().filter(|active| {
+        active.id == id && active.attempt_id == attempt_id
+    });
+    let singleton = singleton.cloned();
+    batch.entries.remove(&key);
+    batch.handoffs.insert(
+        key.clone(),
+        SingletonHandoff::new(generation, singleton.clone(), batch_abort_latched),
+    );
+    if terminal.active.as_ref().is_some_and(|active| {
+        active.id == id && active.attempt_id == attempt_id
+    }) {
+        terminal.active = None;
+        terminal_cell.cv.notify_all();
+    }
+    batch_cell.cv.notify_all();
+    Some(SingletonTransfer {
+        key,
         admission: generation,
         batch_abort_latched,
         singleton,
@@ -685,26 +863,59 @@ pub fn batch_handoff_to_singleton_and_clear(
 
 /// Restore a transferred singleton transaction without allocating a new
 /// lifecycle generation or resetting an already-latched decision.
+///
+/// Adoption consumes the exact tombstone token but keeps its reservation
+/// until [`clear_terminal_control`] closes the adopted singleton lifecycle.
 pub fn adopt_singleton_transfer(id: &str, attempt_id: u64, transfer: SingletonTransfer) -> bool {
-    let Some(singleton) = transfer.singleton else {
+    let key = AttemptKey::new(id, attempt_id);
+    if transfer.key != key {
+        return false;
+    }
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    let Some(handoff) = batch.handoffs.get_mut(&key) else {
         return false;
     };
+    if handoff.admission != transfer.admission || handoff.adopted {
+        return false;
+    }
+    let mut singleton = handoff
+        .singleton
+        .clone()
+        .or_else(|| transfer.singleton.clone());
+    if singleton.is_none() {
+        terminal.next_generation = terminal.next_generation.checked_add(1).unwrap_or(1);
+        singleton = Some(ActiveTerminalControl {
+            id: id.to_string(),
+            attempt_id,
+            generation: terminal.next_generation,
+            ready: false,
+            decision: None,
+            terminal_claimed: false,
+        });
+    }
+    let mut singleton = singleton.expect("singleton handoff allocation");
     if singleton.id != id || singleton.attempt_id != attempt_id {
         return false;
     }
-    let cell = terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    g.active = Some(singleton);
-    cell.cv.notify_all();
+    if (handoff.abort_latched || transfer.batch_abort_latched)
+        && singleton.decision.is_none()
+    {
+        singleton.decision = Some(TerminalControlDecision::Abort);
+    }
+    handoff.singleton = Some(singleton.clone());
+    handoff.adopted = true;
+    terminal.active = Some(singleton);
+    terminal_cell.cv.notify_all();
+    batch_cell.cv.notify_all();
     true
 }
 
-/// Transfer an exact batch admission to the sequential singleton. The batch
-/// lock is released before taking the singleton lock or applying control.
-///
-/// Existing callers that do not carry an explicit handoff message retain the
-/// historical behavior: create a singleton transaction only when the batch
-/// side had an abort latched.
+/// Transfer an exact batch admission to the sequential singleton. The
+/// handoff is adopted while both ownership cells remain serialized; its
+/// tombstone is released with the eventual singleton cleanup.
 pub fn batch_transfer_abort_to_singleton_and_clear(
     id: &str,
     attempt_id: u64,
@@ -714,15 +925,10 @@ pub fn batch_transfer_abort_to_singleton_and_clear(
         return false;
     };
     let had_abort = transfer.batch_abort_latched();
-    if transfer.singleton.is_none() {
-        activate_terminal_control(id, attempt_id);
-        if had_abort {
-            apply_terminal_control("abort", id, attempt_id);
-        }
-    } else if had_abort && !check_abort(id) {
-        apply_terminal_control("abort", id, attempt_id);
+    if !adopt_singleton_transfer(id, attempt_id, transfer) {
+        return false;
     }
-    had_abort
+    had_abort || check_abort(id)
 }
 
 /// Pure commit-teardown classifier: success `done` is allowed only after both
@@ -946,47 +1152,59 @@ impl Drop for TerminalControlGuard {
 }
 
 /// True if the in-flight request with `req_id` has been aborted for the
-/// active attempt. Does not clear the latch (abort remains authoritative
-/// through the rest of the turn / handshake).
+/// active attempt or a handoff tombstone that is waiting for adoption.
+/// Does not clear the latch (abort remains authoritative through the rest of
+/// the turn / handshake).
 pub fn check_abort(req_id: &str) -> bool {
-    let cell = terminal_control();
-    let g = cell.mu.lock().unwrap();
-    match g.active.as_ref() {
-        Some(active)
-            if active.id == req_id
-                && matches!(active.decision, Some(TerminalControlDecision::Abort)) =>
-        {
-            true
-        }
-        _ => false,
+    let terminal_cell = terminal_control();
+    let terminal = terminal_cell.mu.lock().unwrap();
+    if terminal.active.as_ref().is_some_and(|active| {
+        active.id == req_id
+            && matches!(active.decision, Some(TerminalControlDecision::Abort))
+    }) {
+        return true;
     }
+    let batch_cell = batch_terminal_control();
+    let batch = batch_cell.mu.lock().unwrap();
+    batch
+        .handoffs
+        .iter()
+        .any(|(key, handoff)| key.id == req_id && handoff.abort_latched)
 }
 
 /// Apply a control message from the stdin reader.
 /// - `abort`: accepted throughout generation when `(id, attempt_id)` matches.
 /// - `commit`: accepted only after readiness for the matching pair.
+/// - transfer tombstones retain either control until singleton adoption.
 /// Stale / malformed controls are ignored without mutating state.
 pub fn apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
-    let cell = terminal_control();
-    let mut g = cell.mu.lock().unwrap();
-    let Some(active) = g.active.as_mut() else {
-        return;
-    };
-    if active.id != id || active.attempt_id != attempt_id {
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    if let Some(handoff) = batch.handoffs.get_mut(&key) {
+        if apply_handoff_control(&mut terminal, &key, handoff, kind) {
+            terminal_cell.cv.notify_all();
+            batch_cell.cv.notify_all();
+        }
         return;
     }
-    if active.decision.is_some() {
+    let Some(active) = terminal.active.as_mut() else {
+        return;
+    };
+    if active.id != id || active.attempt_id != attempt_id || active.decision.is_some() {
         return;
     }
     match kind {
         "abort" => {
             active.decision = Some(TerminalControlDecision::Abort);
-            cell.cv.notify_all();
+            terminal_cell.cv.notify_all();
         }
         "commit" => {
             if active.ready {
                 active.decision = Some(TerminalControlDecision::Commit);
-                cell.cv.notify_all();
+                terminal_cell.cv.notify_all();
             }
             // Early commit before ready: ignore (must not commit).
         }
