@@ -117,6 +117,28 @@ impl Drop for BatchTerminalCleanup {
     }
 }
 
+/// Emit a terminal error for a generate key announced by the reader.
+///
+/// Admission failures happen before the singleton terminal transaction is
+/// activated, so bind the existing keyed registry entry through
+/// [`BatchAttemptScope`] and let the normal active-attempt writer claim it.
+/// Retire the key only after the writer has claimed and emitted the error.
+fn emit_batch_admission_error(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    attempt_id: u64,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    {
+        let _scope = BatchAttemptScope::enter_for(id, attempt_id);
+        emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
+        let _ = stdout.flush();
+    }
+    batch_clear_terminal(id, attempt_id);
+}
 /// Parse attempt_id from a JSON number only (u64 or non-neg i64).
 /// Decimal strings are rejected — no further coercion.
 fn parse_wire_attempt_id(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -2232,16 +2254,15 @@ fn main() {
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
-                        emit_uncorrelated_error(
+                        emit_batch_admission_error(
                             &mut stdout,
-                            Some(id),
+                            id,
+                            gen_attempt_id,
                             "no model loaded",
                             "validation",
                             false,
                             false,
                         );
-                        let _ = stdout.flush();
-                        batch_clear_terminal(id, gen_attempt_id);
                         continue;
                     }
                 };
@@ -2250,22 +2271,22 @@ fn main() {
                 // Text generate on it must refuse — not fall through to the
                 // token path with a vocab-0 skeleton tokenizer.
                 if hipfire_loader::img_route(m.arch_id).is_diffusion() {
-                    emit_uncorrelated_error(
+                    emit_batch_admission_error(
                         &mut stdout,
-                        Some(id),
+                        id,
+                        gen_attempt_id,
                         "text generate refused: loaded model is a diffusion checkpoint (arch 40/45) — use img_generate",
                         "validation",
                         false,
                         false,
                     );
-                    let _ = stdout.flush();
-                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
                 if let Some(reason) = batch_poisoned.as_ref() {
-                    emit_uncorrelated_error(
+                    emit_batch_admission_error(
                         &mut stdout,
-                        Some(id),
+                        id,
+                        gen_attempt_id,
                         &format!(
                             "continuous batch GPU state poisoned; unload/reload required: {reason}"
                         ),
@@ -2273,8 +2294,6 @@ fn main() {
                         false,
                         false,
                     );
-                    let _ = stdout.flush();
-                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
                 // Sticky GPU fault (700/719) latched by an arch op: the HIP
@@ -2285,9 +2304,10 @@ fn main() {
                 // re-establishes a live context (model reload does not reset
                 // the primary context), so the latch is never cleared here.
                 if let Some(poison) = hipfire_runtime::reset_core::gpu_poison() {
-                    emit_uncorrelated_error(
+                    emit_batch_admission_error(
                         &mut stdout,
-                        Some(id),
+                        id,
+                        gen_attempt_id,
                         &format!(
                             "GPU context dead after sticky HipError({}) at {}; process restart required",
                             poison.code, poison.site,
@@ -2296,8 +2316,6 @@ fn main() {
                         false,
                         false,
                     );
-                    let _ = stdout.flush();
-                    batch_clear_terminal(id, gen_attempt_id);
                     continue;
                 }
 
@@ -3003,16 +3021,15 @@ fn main() {
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     &mut stdout,
-                                    Some(id),
+                                    id,
+                                    gen_attempt_id,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
                         };
@@ -3021,16 +3038,15 @@ fn main() {
                             batch_scope.rebind_for(id, gen_attempt_id);
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
-                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     &mut stdout,
-                                    Some(id),
+                                    id,
+                                    gen_attempt_id,
                                     "prompt exceeds lane capacity or empty",
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
                             // Explicit wire `seed` must reach the lane RNG on
@@ -3158,16 +3174,15 @@ fn main() {
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     &mut stdout,
-                                    Some(id),
+                                    id,
+                                    gen_attempt_id,
                                     &format!("render failed: {e}"),
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
                         };
@@ -3180,16 +3195,15 @@ fn main() {
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
-                                let _scope = BatchAttemptScope::enter_for(id, gen_attempt_id);
-                                emit_uncorrelated_error(
+                                emit_batch_admission_error(
                                     &mut stdout,
-                                    Some(id),
+                                    id,
+                                    gen_attempt_id,
                                     "prompt exceeds lane capacity or empty",
                                     "validation",
                                     false,
                                     false,
                                 );
-                                batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
                             // Explicit wire `seed` must reach the lane RNG on
@@ -4425,7 +4439,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_vision_mode_gate;
+    use super::{apply_vision_mode_gate, emit_batch_admission_error};
+    use hipfire_engine::emit::emit_active_attempt_error;
+    use hipfire_engine::terminal::{
+        batch_announce_terminal, batch_clear_all_terminals, batch_clear_terminal,
+        batch_terminal_control, clear_terminal_control, set_active_attempt_id, AttemptKey,
+        BatchAttemptScope,
+    };
 
     #[test]
     fn vision_mode_off_drops_even_an_explicit_sidecar() {
@@ -4447,5 +4467,94 @@ mod tests {
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
+    }
+
+    #[test]
+    fn admitted_generate_errors_are_keyed_and_cleanup_after_emit() {
+        static TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+
+        // The early no-model path owns the reader-announced batch key even
+        // before singleton activation. Verify the writer claims that live
+        // entry before cleanup retires it.
+        let early_id = "admission-no-model";
+        let early_attempt = 70_001;
+        assert!(batch_announce_terminal(early_id, early_attempt));
+        let mut early_out = Vec::new();
+        {
+            let _scope = BatchAttemptScope::enter_for(early_id, early_attempt);
+            let key = AttemptKey::new(early_id, early_attempt);
+            {
+                let state = batch_terminal_control().mu.lock().unwrap();
+                assert!(state
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| !entry.terminal_claimed));
+            }
+            emit_active_attempt_error(
+                &mut early_out,
+                Some(early_id),
+                "no model loaded",
+                "validation",
+                false,
+                false,
+            );
+            {
+                let state = batch_terminal_control().mu.lock().unwrap();
+                assert!(
+                    state
+                        .entries
+                        .get(&key)
+                        .is_some_and(|entry| entry.terminal_claimed),
+                    "writer must claim the live keyed entry before cleanup"
+                );
+            }
+        }
+        batch_clear_terminal(early_id, early_attempt);
+        let early_events: Vec<serde_json::Value> = std::str::from_utf8(&early_out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(early_events.len(), 1);
+        assert_eq!(early_events[0]["id"], early_id);
+        assert_eq!(early_events[0]["attempt_id"], early_attempt);
+        assert_ne!(early_events[0]["attempt_id"], 0);
+
+        // The shared admission helper covers both batch render and lane
+        // capacity rejection without emitting an attempt-zero envelope.
+        for (offset, message) in [
+            (1_u64, "render failed: malformed prompt"),
+            (2_u64, "prompt exceeds lane capacity or empty"),
+        ] {
+            let id = format!("admission-batch-{offset}");
+            let attempt = 70_001 + offset;
+            assert!(batch_announce_terminal(&id, attempt));
+            let mut out = Vec::new();
+            emit_batch_admission_error(&mut out, &id, attempt, message, "validation", false, false);
+            let events: Vec<serde_json::Value> = std::str::from_utf8(&out)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["id"], id);
+            assert_eq!(events[0]["attempt_id"], attempt);
+            assert_ne!(events[0]["attempt_id"], 0);
+            assert_eq!(events[0]["class"], "validation");
+            assert!(
+                batch_announce_terminal(&id, attempt),
+                "key must be retired only after the emitted terminal"
+            );
+            batch_clear_terminal(&id, attempt);
+        }
+
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
     }
 }
