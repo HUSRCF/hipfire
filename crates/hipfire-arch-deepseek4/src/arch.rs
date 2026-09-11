@@ -3901,6 +3901,26 @@ mod tests {
     /// leaked stage still fails loudly.
     const DSPARK_VRAM_SLACK_BYTES: usize = 64 << 20;
 
+    /// Serializes the four DSpark fault tests below. Each drives a ~6 GiB
+    /// sidecar load and asserts device-global HIP free bytes, so concurrent
+    /// execution on one GPU measures its siblings' live loads as its own
+    /// "leak". Same `static TEST_LOCK: Mutex<()>` pattern as
+    /// `hipfire-runtime/src/llama.rs` (`RNG_TEST_LOCK`).
+    static DSPARK_VRAM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Warm-up upload that pays the ROCm first-device-allocation reservation
+    /// before any VRAM baseline is taken. The first `hipMalloc` in a HIP
+    /// process permanently reserves a fixed driver-side VM/setup block that no
+    /// process-tracked owner can free: measured 153,092,096 bytes (146.00 MiB)
+    /// on gfx1201/R9700, reproduced in isolation with a lone 1 MiB
+    /// `upload_raw` + `free_tensor` + `drain_pool` (process `hipMalloc` /
+    /// `hipFree` ledger balances exactly, a second identical load adds zero
+    /// bytes, and the shortfall is identical for 1.9 GiB and 5.9 GiB peaks).
+    /// Warming here keeps the rollback assertions strict: a genuinely leaked
+    /// DSpark stage (~1.9 GiB) still fails loudly against the 64 MiB slack.
+    /// This is an explicitly named warm-up, not slack.
+    const DSPARK_ROCM_FIRST_ALLOC_WARMUP_BYTES: usize = 1 << 20;
+
     /// Open the fixture sidecar + config and init the GPU, or `None` (with a
     /// skip message) when the env var is unset or no GPU is present. A set
     /// but unreadable fixture is a setup error and fails loudly.
@@ -3912,10 +3932,23 @@ mod tests {
                 return None;
             }
         };
-        let Some(gpu) = Gpu::init().ok() else {
+        let Some(mut gpu) = Gpu::init().ok() else {
             eprintln!("skip: no GPU");
             return None;
         };
+        // Pay the one-time ROCm first-allocation reservation up front so the
+        // per-test `free_before` baselines below measure only what the load
+        // under test owns. Idempotent within a process: post-warm-up uploads
+        // add no further reservation.
+        let warm = gpu
+            .upload_raw(
+                &vec![0u8; DSPARK_ROCM_FIRST_ALLOC_WARMUP_BYTES],
+                &[DSPARK_ROCM_FIRST_ALLOC_WARMUP_BYTES],
+            )
+            .expect("DSpark first-alloc warm-up upload");
+        gpu.free_tensor(warm)
+            .expect("DSpark first-alloc warm-up free");
+        gpu.drain_pool();
         let mut hfq = HfqFile::open(std::path::Path::new(&path))
             .unwrap_or_else(|e| panic!("open {DSPARK_FIXTURE_ENV}={path}: {e:?}"));
         let cfg = DeepseekV4::config_from_hfq(&hfq).expect("DSpark fixture model config");
@@ -3986,6 +4019,10 @@ mod tests {
     /// without the fault, and prove the reloaded weights forward finite
     /// vocab-length logits.
     fn exercise_dspark_fault_via_seam(fault: DeepseekV4DsparkFault) {
+        // Serialize the four DSpark VRAM-accounting tests (see
+        // DSPARK_VRAM_TEST_LOCK): device-global free-byte assertions cannot
+        // run concurrently on one GPU.
+        let _vram_guard = DSPARK_VRAM_TEST_LOCK.lock().unwrap();
         let Some((hfq, cfg, mut gpu)) = dspark_fixture_gpu() else {
             return;
         };
