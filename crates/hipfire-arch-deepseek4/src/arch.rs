@@ -3884,92 +3884,196 @@ mod tests {
         assert_eq!(dense_hfq_dtype(19), None);
     }
 
-    fn stage_dspark_fault_owners(
-        fault: DeepseekV4DsparkFault,
-        staging: &mut DsparkLoadStaging,
-        gpu: &mut Gpu,
-    ) {
-        let mut tiny = || gpu.zeros(&[1], DType::F32).expect("tiny owner allocation");
-        match fault {
-            DeepseekV4DsparkFault::AfterLayer(_) => {
-                let mut layer = DeepseekV4LayerWeights::new_empty(0);
-                layer.attn_norm = Some(tiny());
-                staging.stages.push(layer);
+    /// Env var naming the real DSpark sidecar fixture for the fault-seam
+    /// tests below (e.g. `~/.hipfire/models/deepseek-v4-flash-dspark.mq2lloyd`
+    /// — the same artifact `examples/dspark_load_smoke.rs` opens). The
+    /// sidecar carries its own model config, so no trunk fixture is needed.
+    /// Unset (or no GPU) skips with a message; nothing is fabricated.
+    const DSPARK_FIXTURE_ENV: &str = "HIPFIRE_DSPARK_FIXTURE";
+
+    /// HIP free-byte slack for the rollback VRAM assertions. `free_tensor`
+    /// parks buffers in the `Gpu` reuse pool, so each test drains the pool
+    /// before comparing HIP-visible free bytes; the residual delta is driver
+    /// rounding plus neighbor-process noise. No dedicated plateau/equality
+    /// helper exists in-crate (closest patterns are the heterogeneous
+    /// `safety_margin_bytes` accounting and the `pool_stats` new/reused
+    /// counters); 64 MiB sits far below one resident DSpark stage, so any
+    /// leaked stage still fails loudly.
+    const DSPARK_VRAM_SLACK_BYTES: usize = 64 << 20;
+
+    /// Open the fixture sidecar + config and init the GPU, or `None` (with a
+    /// skip message) when the env var is unset or no GPU is present. A set
+    /// but unreadable fixture is a setup error and fails loudly.
+    fn dspark_fixture_gpu() -> Option<(HfqFile, DeepseekV4Config, Gpu)> {
+        let path = match std::env::var(DSPARK_FIXTURE_ENV) {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("skip: {DSPARK_FIXTURE_ENV} unset (need a real DSpark sidecar HFQ)");
+                return None;
             }
-            DeepseekV4DsparkFault::AfterHeadHelper => {
-                let mut layer = DeepseekV4LayerWeights::new_empty(0);
-                layer.mtp_hc_head_fn = Some(tiny());
-                layer.mtp_hc_head_base = Some(tiny());
-                layer.mtp_final_norm = Some(tiny());
-                staging.stages.push(layer);
-            }
-            DeepseekV4DsparkFault::AfterMainProj => {
-                staging.main_proj = Some(tiny());
-            }
-            DeepseekV4DsparkFault::AfterGlobal => {
-                staging.main_proj = Some(tiny());
-                staging.main_norm = Some(tiny());
-                staging.markov_w1 = Some(tiny());
-                staging.markov_w2 = Some(tiny());
-                staging.confidence_proj = Some(tiny());
-                staging.draft_head = Some(tiny());
-            }
-        }
+        };
+        let Some(gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return None;
+        };
+        let mut hfq = HfqFile::open(std::path::Path::new(&path))
+            .unwrap_or_else(|e| panic!("open {DSPARK_FIXTURE_ENV}={path}: {e:?}"));
+        let cfg = DeepseekV4::config_from_hfq(&hfq).expect("DSpark fixture model config");
+        hfq.drop_mmap();
+        Some((hfq, cfg, gpu))
     }
 
-    fn exercise_dspark_fault(fault: DeepseekV4DsparkFault) {
-        let Some(mut gpu) = Gpu::init().ok() else {
-            eprintln!("skip: no GPU");
+    fn dspark_free_vram_bytes(gpu: &Gpu) -> usize {
+        gpu.hip.get_vram_info().expect("DSpark test VRAM query").0
+    }
+
+    /// Single-vector forward through the reloaded Markov head: a synthetic
+    /// token embedding through `markov_w2` via `gemv_auto` — the exact GEMV
+    /// the production draft path runs per slot in `dspark_forward_head` —
+    /// yielding vocab-length logits. The sidecar carries no trunk
+    /// embedding/head, so a full `dspark_forward` is out of reach
+    /// fixture-only; this still runs the real reloaded weight through its
+    /// real decode kernel.
+    fn dspark_markov_head_logits(
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        dspark: &DsparkWeights,
+    ) -> Vec<f32> {
+        let rank = dspark.cfg.markov_rank;
+        let vocab = cfg.vocab_size;
+        let w2 = dspark.markov_w2.as_ref().expect("markov_w2 staged");
+        let emb = gpu
+            .upload_f32(&vec![0.5f32; rank], &[rank])
+            .expect("DSpark test markov embedding upload");
+        let rot = if crate::forward::weight_needs_fwht(w2) {
+            let rotated = gpu
+                .alloc_tensor(&[rank], DType::F32)
+                .expect("DSpark test markov embedding rotation buffer");
+            gpu.rotate_x_mq(&emb, &rotated, rank)
+                .expect("DSpark test markov embedding rotation");
+            Some(rotated)
+        } else {
+            None
+        };
+        let logits_dev = gpu
+            .alloc_tensor(&[vocab], DType::F32)
+            .expect("DSpark test markov logits buffer");
+        crate::forward::gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            w2,
+            rot.as_ref().unwrap_or(&emb),
+            &emb,
+            &logits_dev,
+            vocab,
+            rank,
+        )
+        .expect("DSpark test markov head GEMV");
+        let logits = gpu
+            .download_f32(&logits_dev)
+            .expect("DSpark test markov logits download");
+        let _ = gpu.free_tensor(logits_dev);
+        if let Some(rotated) = rot {
+            let _ = gpu.free_tensor(rotated);
+        }
+        let _ = gpu.free_tensor(emb);
+        logits
+    }
+
+    /// Fault-seam round trip for one [`DeepseekV4DsparkFault`]: fail the
+    /// production [`DeepseekV4::load_dspark_with_fault`] load, prove HIP
+    /// free VRAM returns to its pre-load value, retry the identical load
+    /// without the fault, and prove the reloaded weights forward finite
+    /// vocab-length logits.
+    fn exercise_dspark_fault_via_seam(fault: DeepseekV4DsparkFault) {
+        let Some((hfq, cfg, mut gpu)) = dspark_fixture_gpu() else {
             return;
         };
-        let cfg = DsparkConfig {
-            block_size: 5,
-            target_layer_ids: vec![0],
-            markov_rank: 1,
-            noise_token_id: 0,
-        };
-        let (new_before, reused_before, _) = gpu.pool_stats();
-        let mut staging = DsparkLoadStaging::new(cfg.clone(), 1);
-        stage_dspark_fault_owners(fault, &mut staging, &mut gpu);
-        let (new_after_alloc, _, _) = gpu.pool_stats();
-        assert!(new_after_alloc >= new_before);
-        staging.rollback(&mut gpu);
-        let (new_after_rollback, reused_after_rollback, _) = gpu.pool_stats();
-        assert_eq!(new_after_rollback, new_after_alloc);
+        let free_before = dspark_free_vram_bytes(&gpu);
 
-        let mut retry = DsparkLoadStaging::new(cfg, 1);
-        stage_dspark_fault_owners(fault, &mut retry, &mut gpu);
-        retry.rollback(&mut gpu);
-        let (new_after_retry, reused_after_retry, _) = gpu.pool_stats();
-        assert_eq!(new_after_retry, new_after_alloc);
+        let err = match DeepseekV4::load_dspark_with_fault(&hfq, &mut gpu, &cfg, fault) {
+            Ok(_) => panic!("fault-injected DSpark load must fail for {fault:?}"),
+            Err(err) => err,
+        };
         assert!(
-            reused_after_retry > reused_after_rollback.max(reused_before),
-            "{fault:?} did not reuse a released owner"
+            err.contains("injected DSpark failure"),
+            "{fault:?} error bypassed the fault seam: {err}"
         );
         gpu.drain_pool();
+        let free_after_fail = dspark_free_vram_bytes(&gpu);
+        assert!(
+            free_after_fail + DSPARK_VRAM_SLACK_BYTES >= free_before,
+            "{fault:?} leaked VRAM across rollback: free {free_before} -> {free_after_fail}"
+        );
+
+        let dspark = DeepseekV4::load_dspark(&hfq, &mut gpu, &cfg)
+            .expect("DSpark retry load")
+            .expect("DSpark fixture must carry a DSpark config");
+        assert!(!dspark.stages.is_empty(), "retry loaded no stages");
+        assert!(dspark.main_proj.is_some(), "retry missing main_proj");
+        assert!(dspark.main_norm.is_some(), "retry missing main_norm");
+        assert!(dspark.markov_w1.is_some(), "retry missing markov_w1");
+        assert!(dspark.markov_w2.is_some(), "retry missing markov_w2");
+        assert!(
+            dspark.confidence_proj.is_some(),
+            "retry missing confidence_proj"
+        );
+
+        let logits = dspark_markov_head_logits(&mut gpu, &cfg, &dspark);
+        assert_eq!(logits.len(), cfg.vocab_size, "retry logits length != vocab");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "retry produced non-finite logits"
+        );
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in &logits {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        assert!(max > min, "retry produced degenerate constant logits");
+
+        dspark.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        let free_final = dspark_free_vram_bytes(&gpu);
+        assert!(
+            free_final + DSPARK_VRAM_SLACK_BYTES >= free_before,
+            "{fault:?} leaked VRAM across retry unload: free {free_before} -> {free_final}"
+        );
     }
 
+    /// Requires a real HIP GPU and `HIPFIRE_DSPARK_FIXTURE` pointing at a
+    /// real DSpark sidecar HFQ. Early-owner fault: fails after the first
+    /// complete stage is admitted to staging.
     #[test]
-    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    #[ignore = "requires real HIP GPU + HIPFIRE_DSPARK_FIXTURE (real DSpark sidecar HFQ)"]
     fn dspark_after_layer_fault_rolls_back_and_retries() {
-        exercise_dspark_fault(DeepseekV4DsparkFault::AfterLayer(0));
+        exercise_dspark_fault_via_seam(DeepseekV4DsparkFault::AfterLayer(0));
     }
 
+    /// Requires a real HIP GPU and `HIPFIRE_DSPARK_FIXTURE` pointing at a
+    /// real DSpark sidecar HFQ. Mid-load fault: fails after the last
+    /// stage's dense + routed experts + HC helper tensors are staged.
     #[test]
-    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    #[ignore = "requires real HIP GPU + HIPFIRE_DSPARK_FIXTURE (real DSpark sidecar HFQ)"]
     fn dspark_after_head_helper_fault_rolls_back_and_retries() {
-        exercise_dspark_fault(DeepseekV4DsparkFault::AfterHeadHelper);
+        exercise_dspark_fault_via_seam(DeepseekV4DsparkFault::AfterHeadHelper);
     }
 
+    /// Requires a real HIP GPU and `HIPFIRE_DSPARK_FIXTURE` pointing at a
+    /// real DSpark sidecar HFQ. Post-upload fault: fails after the first
+    /// DSpark global (`main_proj`) is staged.
     #[test]
-    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    #[ignore = "requires real HIP GPU + HIPFIRE_DSPARK_FIXTURE (real DSpark sidecar HFQ)"]
     fn dspark_after_main_proj_fault_rolls_back_and_retries() {
-        exercise_dspark_fault(DeepseekV4DsparkFault::AfterMainProj);
+        exercise_dspark_fault_via_seam(DeepseekV4DsparkFault::AfterMainProj);
     }
 
+    /// Requires a real HIP GPU and `HIPFIRE_DSPARK_FIXTURE` pointing at a
+    /// real DSpark sidecar HFQ. Final-publish fault: fails after every
+    /// stage and global is staged, just before publication.
     #[test]
-    #[ignore = "requires real HIP GPU; fixture-free owner seam"]
+    #[ignore = "requires real HIP GPU + HIPFIRE_DSPARK_FIXTURE (real DSpark sidecar HFQ)"]
     fn dspark_after_global_fault_rolls_back_and_retries() {
-        exercise_dspark_fault(DeepseekV4DsparkFault::AfterGlobal);
+        exercise_dspark_fault_via_seam(DeepseekV4DsparkFault::AfterGlobal);
     }
 }
