@@ -17,7 +17,8 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision,
+    active_attempt_id, await_client_terminal_commit, check_abort,
+    emit_aborted_terminal_after_abort, ClientTerminalDecision,
 };
 
 fn emit_active_attempt_error(
@@ -2282,7 +2283,9 @@ pub fn run_dots_ocr_ngram_loop(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated);
+        }
     }
 }
 
@@ -2477,7 +2480,9 @@ pub fn generate_dots_ocr_text(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated);
+        }
     }
 }
 

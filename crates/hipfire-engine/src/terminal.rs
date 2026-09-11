@@ -153,7 +153,11 @@ pub fn clear_terminal_control() {
     let batch_cell = batch_terminal_control();
     let mut batch = batch_cell.mu.lock().unwrap();
     if let Some(key) = completed_key {
-        if batch.handoffs.get(&key).is_some_and(|handoff| handoff.adopted) {
+        if batch
+            .handoffs
+            .get(&key)
+            .is_some_and(|handoff| handoff.adopted)
+        {
             batch.handoffs.remove(&key);
             batch_cell.cv.notify_all();
         }
@@ -400,7 +404,8 @@ pub fn claim_wire_terminal(id: &str, attempt_id: u64) -> bool {
     }
     // A scope with no live entry is a stale batch producer. Never let it
     // fall through to the singleton after its keyed generation retired.
-    if active_batch_generation().is_some() || batch.entries.keys().any(|candidate| candidate.id == id)
+    if active_batch_generation().is_some()
+        || batch.entries.keys().any(|candidate| candidate.id == id)
     {
         return false;
     }
@@ -447,18 +452,17 @@ pub fn batch_activate_terminal(id: &str, attempt_id: u64) -> Option<BatchGenerat
 
 /// Promote an exact admission from Announced to Queued. Repeating the
 /// transition for the same owner is idempotent; a stale token fails closed.
-pub fn batch_transition_to_queued(
-    id: &str,
-    attempt_id: u64,
-    generation: BatchGeneration,
-) -> bool {
+pub fn batch_transition_to_queued(id: &str, attempt_id: u64, generation: BatchGeneration) -> bool {
     let cell = batch_terminal_control();
     let mut g = cell.mu.lock().unwrap();
     if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
         if e.generation != generation {
             return false;
         }
-        if matches!(e.state, BatchRegistryState::Announced | BatchRegistryState::Queued) {
+        if matches!(
+            e.state,
+            BatchRegistryState::Announced | BatchRegistryState::Queued
+        ) {
             e.state = BatchRegistryState::Queued;
             cell.cv.notify_all();
             return true;
@@ -648,9 +652,11 @@ fn apply_handoff_control(
                 }
             }
             if handoff.adopted {
-                if let Some(active) = terminal.active.as_mut().filter(|active| {
-                    active.id == key.id && active.attempt_id == key.attempt_id
-                }) {
+                if let Some(active) = terminal
+                    .active
+                    .as_mut()
+                    .filter(|active| active.id == key.id && active.attempt_id == key.attempt_id)
+                {
                     if active.decision.is_none() {
                         active.decision = Some(TerminalControlDecision::Abort);
                         changed = true;
@@ -666,9 +672,11 @@ fn apply_handoff_control(
                 }
             }
             if handoff.adopted {
-                if let Some(active) = terminal.active.as_mut().filter(|active| {
-                    active.id == key.id && active.attempt_id == key.attempt_id
-                }) {
+                if let Some(active) = terminal
+                    .active
+                    .as_mut()
+                    .filter(|active| active.id == key.id && active.attempt_id == key.attempt_id)
+                {
                     if active.ready && active.decision.is_none() {
                         active.decision = Some(TerminalControlDecision::Commit);
                         changed = true;
@@ -711,8 +719,7 @@ pub fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
                 if entry.abort_latched {
                     return;
                 }
-                if matches!(entry.state, BatchRegistryState::Ready { .. })
-                    && !entry.commit_latched
+                if matches!(entry.state, BatchRegistryState::Ready { .. }) && !entry.commit_latched
                 {
                     entry.commit_latched = true;
                     batch_cell.cv.notify_all();
@@ -723,11 +730,7 @@ pub fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
     }
 }
 
-pub fn batch_check_abort(
-    id: &str,
-    attempt_id: u64,
-    generation: BatchGeneration,
-) -> bool {
+pub fn batch_check_abort(id: &str, attempt_id: u64, generation: BatchGeneration) -> bool {
     let cell = batch_terminal_control();
     let g = cell.mu.lock().unwrap();
     let key = AttemptKey::new(id, attempt_id);
@@ -838,18 +841,21 @@ pub fn batch_handoff_to_singleton_and_clear(
         .get(&key)
         .filter(|entry| entry.generation == generation)
         .map(|entry| entry.abort_latched)?;
-    let singleton = terminal.active.as_ref().filter(|active| {
-        active.id == id && active.attempt_id == attempt_id
-    });
+    let singleton = terminal
+        .active
+        .as_ref()
+        .filter(|active| active.id == id && active.attempt_id == attempt_id);
     let singleton = singleton.cloned();
     batch.entries.remove(&key);
     batch.handoffs.insert(
         key.clone(),
         SingletonHandoff::new(generation, singleton.clone(), batch_abort_latched),
     );
-    if terminal.active.as_ref().is_some_and(|active| {
-        active.id == id && active.attempt_id == attempt_id
-    }) {
+    if terminal
+        .active
+        .as_ref()
+        .is_some_and(|active| active.id == id && active.attempt_id == attempt_id)
+    {
         terminal.active = None;
         terminal_cell.cv.notify_all();
     }
@@ -901,9 +907,7 @@ pub fn adopt_singleton_transfer(id: &str, attempt_id: u64, transfer: SingletonTr
     if singleton.id != id || singleton.attempt_id != attempt_id {
         return false;
     }
-    if (handoff.abort_latched || transfer.batch_abort_latched)
-        && singleton.decision.is_none()
-    {
+    if (handoff.abort_latched || transfer.batch_abort_latched) && singleton.decision.is_none() {
         singleton.decision = Some(TerminalControlDecision::Abort);
     }
     handoff.singleton = Some(singleton.clone());
@@ -1101,11 +1105,7 @@ impl BatchAttemptScope {
         Self::enter_with_generation(attempt_id, None)
     }
 
-    pub fn enter_for_generation(
-        id: &str,
-        attempt_id: u64,
-        generation: BatchGeneration,
-    ) -> Self {
+    pub fn enter_for_generation(id: &str, attempt_id: u64, generation: BatchGeneration) -> Self {
         let generation = batch_is_current(id, attempt_id, generation).then_some(generation);
         Self::enter_with_generation(attempt_id, generation)
     }
@@ -1160,8 +1160,7 @@ pub fn check_abort(req_id: &str) -> bool {
     let terminal_cell = terminal_control();
     let terminal = terminal_cell.mu.lock().unwrap();
     if terminal.active.as_ref().is_some_and(|active| {
-        active.id == req_id
-            && matches!(active.decision, Some(TerminalControlDecision::Abort))
+        active.id == req_id && matches!(active.decision, Some(TerminalControlDecision::Abort))
     }) {
         return true;
     }
@@ -1316,6 +1315,27 @@ pub fn await_client_terminal_commit(
         return ClientTerminalDecision::Abort;
     }
     wait_terminal_control_decision(id, attempt_id, CLIENT_TERMINAL_COMMIT_TIMEOUT)
+}
+
+/// Emit the correlated aborted terminal after a [`ClientTerminalDecision::Abort`]
+/// from [`await_client_terminal_commit`] (matching `abort`, disconnect, or
+/// bounded-timeout fail-closed).
+///
+/// Writes the canonical correlated pair the client abort drain unblocks on
+/// (`hipfire-client` `abort_and_drain_with_rx`): `aborted` plus a `done` with
+/// `finish_reason: "aborted"`, both carrying the active attempt id — the same
+/// dialect the complete Qwen route emits via `ep_emit_abort`. The
+/// wire-terminal claim makes this exactly-once per `(id, attempt_id)`: a
+/// repeat call or a racing error path emits nothing.
+///
+/// Never emits a success `done`, releases no tool calls, and stores no cache.
+/// Returns true when the terminal was delivered.
+pub fn emit_aborted_terminal_after_abort(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> bool {
+    crate::emit::emit_qwen_ar_cancelled(stdout, id, completion_tokens)
 }
 
 /// Emit a previously staged `done` envelope after Commit. Payload must be the

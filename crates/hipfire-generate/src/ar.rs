@@ -1137,6 +1137,7 @@ macro_rules! define_route_start {
                 gen_start_contract_version_for_arch($arch),
             );
             let _ = output.write_all(&buffer);
+            let _ = output.flush();
         }
     };
 }
@@ -1171,6 +1172,7 @@ fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str, started_in_think: 
         },
     );
     let _ = output.write_all(&buffer);
+    let _ = output.flush();
 }
 define_route_start!(deepseek4_spec_route_start, 9);
 define_route_start!(cohere_ar_route_start, 12);
@@ -5203,8 +5205,7 @@ pub fn generate(
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
             ClientTerminalDecision::Abort => {
-                // Bring-up AR path has no full production rollback attestation;
-                // suppress success done on cancel/disconnect (fail-closed).
+                emit_aborted_terminal_after_abort(stdout, id, generated);
             }
         }
     }

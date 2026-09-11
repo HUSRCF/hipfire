@@ -7358,7 +7358,9 @@ pub fn generate_minimax(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+        }
     }
 }
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
@@ -8102,7 +8104,9 @@ pub fn generate_cohere2moe(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+        }
     }
 }
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -8335,7 +8339,9 @@ pub fn generate_qwen2(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+        }
     }
 }
 
@@ -9039,7 +9045,9 @@ pub fn generate_maple(
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+        }
     }
 }
 

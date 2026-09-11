@@ -15,10 +15,10 @@ use hipfire_engine::terminal::{
     batch_clear_all_terminals, batch_clear_terminal, batch_clear_terminal_at_generation,
     batch_handoff_to_singleton_and_clear, batch_mark_ready_with_pending, batch_terminal_control,
     batch_terminal_generation, check_abort, claim_terminal, claim_terminal_at_generation,
-    claim_wire_terminal, clear_terminal_control, emit_staged_terminal_done,
-    mark_terminal_control_ready, set_active_attempt_id, terminal_control, terminal_generation,
-    wait_terminal_control_decision, BatchAttemptScope, ClientTerminalDecision, LaneTicket,
-    TerminalControlDecision,
+    claim_wire_terminal, clear_terminal_control, emit_aborted_terminal_after_abort,
+    emit_staged_terminal_done, mark_terminal_control_ready, set_active_attempt_id,
+    terminal_control, terminal_generation, wait_terminal_control_decision, BatchAttemptScope,
+    ClientTerminalDecision, LaneTicket, TerminalControlDecision,
 };
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -44,7 +44,6 @@ fn reset() {
     clear_terminal_control();
     set_active_attempt_id(0);
 }
-
 
 fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
     hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).is_some()
@@ -558,9 +557,8 @@ fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
         batch_clear_all_terminals();
         clear_terminal_control();
         set_active_attempt_id(0);
-        let generation =
-            hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
-                .expect("batch generation");
+        let generation = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+            .expect("batch generation");
         activate_terminal_control(id, attempt_id);
 
         let abort_at_phase = || {
@@ -569,11 +567,7 @@ fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
             let worker = std::thread::spawn(move || {
                 worker_gate.wait();
                 apply_terminal_control("abort", id, attempt_id);
-                hipfire_engine::terminal::batch_apply_terminal_control(
-                    "abort",
-                    id,
-                    attempt_id,
-                );
+                hipfire_engine::terminal::batch_apply_terminal_control("abort", id, attempt_id);
             });
             gate.wait();
             worker.join().expect("abort worker");
@@ -585,9 +579,8 @@ fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
             batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
                 .expect("singleton handoff")
         } else {
-            let transfer =
-                batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
-                    .expect("singleton handoff");
+            let transfer = batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
+                .expect("singleton handoff");
             if phase == 1 {
                 // Abort after the exact snapshot/tombstone boundary but before
                 // adoption; the tombstone must retain it.
@@ -595,11 +588,7 @@ fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
                 assert!(check_abort(id));
             } else {
                 // Abort after adoption must hit the restored singleton directly.
-                assert!(adopt_singleton_transfer(
-                    id,
-                    attempt_id,
-                    transfer.clone()
-                ));
+                assert!(adopt_singleton_transfer(id, attempt_id, transfer.clone()));
                 abort_at_phase();
                 assert!(check_abort(id));
             }
@@ -619,9 +608,8 @@ fn singleton_handoff_abort_is_atomic_at_each_transfer_phase() {
         );
         drop(_scope);
         clear_terminal_control();
-        let next_generation =
-            hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
-                .expect("next generation after old terminal");
+        let next_generation = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+            .expect("next generation after old terminal");
         assert_ne!(generation, next_generation);
         assert!(batch_clear_terminal_at_generation(
             id,
@@ -639,13 +627,11 @@ fn singleton_handoff_tombstone_serializes_abort_and_same_key_admission() {
     let _lock = begin_test();
     let id = "handoff-admission-barrier";
     let attempt_id = 89_u64;
-    let generation =
-        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
-            .expect("batch generation");
+    let generation = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+        .expect("batch generation");
     activate_terminal_control(id, attempt_id);
-    let transfer =
-        batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
-            .expect("singleton handoff");
+    let transfer = batch_handoff_to_singleton_and_clear(id, attempt_id, generation)
+        .expect("singleton handoff");
 
     let gate = Arc::new(Barrier::new(3));
     let abort_gate = Arc::clone(&gate);
@@ -660,8 +646,7 @@ fn singleton_handoff_tombstone_serializes_abort_and_same_key_admission() {
         announce_gate.wait();
         announce_tx
             .send(hipfire_engine::terminal::batch_announce_terminal(
-                id,
-                attempt_id,
+                id, attempt_id,
             ))
             .expect("announce result");
     });
@@ -685,9 +670,8 @@ fn singleton_handoff_tombstone_serializes_abort_and_same_key_admission() {
     drop(_scope);
     clear_terminal_control();
 
-    let generation_b =
-        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
-            .expect("B admitted after A release");
+    let generation_b = hipfire_engine::terminal::batch_announce_terminal(id, attempt_id)
+        .expect("B admitted after A release");
     assert_ne!(generation, generation_b);
     assert!(batch_clear_terminal_at_generation(
         id,
@@ -774,12 +758,7 @@ fn batch_admission_token_reuse_rejects_stale_producer_operations() {
         generation: 1,
         admission: generation_a,
     };
-    assert!(batch_bind_active(
-        id,
-        attempt_id,
-        generation_a,
-        ticket_a
-    ));
+    assert!(batch_bind_active(id, attempt_id, generation_a, ticket_a));
     assert!(batch_clear_terminal_at_generation(
         id,
         attempt_id,
@@ -804,18 +783,8 @@ fn batch_admission_token_reuse_rejects_stale_producer_operations() {
         generation: 2,
         admission: generation_b,
     };
-    assert!(!batch_bind_active(
-        id,
-        attempt_id,
-        generation_a,
-        ticket_a
-    ));
-    assert!(batch_bind_active(
-        id,
-        attempt_id,
-        generation_b,
-        ticket_b
-    ));
+    assert!(!batch_bind_active(id, attempt_id, generation_a, ticket_a));
+    assert!(batch_bind_active(id, attempt_id, generation_b, ticket_b));
     let pending = serde_json::json!({
         "type": "done",
         "id": id,
@@ -849,5 +818,72 @@ fn batch_admission_token_reuse_rejects_stale_producer_operations() {
         attempt_id,
         generation_b
     ));
+    reset();
+}
+
+#[test]
+fn abort_helper_emits_exactly_one_correlated_aborted_terminal() {
+    let _lock = begin_test();
+    set_active_attempt_id(41);
+    activate_terminal_control("req-abort", 41);
+    // Latch Abort the way the stdin reader does on client cancel.
+    apply_terminal_control("abort", "req-abort", 41);
+
+    let mut out = Vec::new();
+    assert!(
+        emit_aborted_terminal_after_abort(&mut out, "req-abort", 3),
+        "abort terminal must be delivered"
+    );
+    // Exactly-once: the wire-terminal claim is consumed, so a repeat call (or
+    // a racing error path) must emit nothing more.
+    assert!(
+        !emit_aborted_terminal_after_abort(&mut out, "req-abort", 3),
+        "repeat abort terminal must be suppressed"
+    );
+
+    let text = String::from_utf8(out).expect("terminal output is JSONL UTF-8");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("each terminal line is JSON"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected aborted + aborted-done pair, got: {text}"
+    );
+
+    assert_eq!(
+        events[0].get("type").and_then(|v| v.as_str()),
+        Some("aborted")
+    );
+    assert_eq!(
+        events[0].get("id").and_then(|v| v.as_str()),
+        Some("req-abort")
+    );
+    assert_eq!(
+        events[0].get("attempt_id").and_then(|v| v.as_u64()),
+        Some(41)
+    );
+
+    let done_count = events
+        .iter()
+        .filter(|v| v.get("type").and_then(|v| v.as_str()) == Some("done"))
+        .count();
+    assert_eq!(done_count, 1, "exactly one done envelope, got: {text}");
+    assert_eq!(events[1].get("type").and_then(|v| v.as_str()), Some("done"));
+    assert_eq!(
+        events[1].get("finish_reason").and_then(|v| v.as_str()),
+        Some("aborted"),
+        "never a success done on abort, got: {text}"
+    );
+    assert_eq!(
+        events[1].get("id").and_then(|v| v.as_str()),
+        Some("req-abort")
+    );
+    assert_eq!(
+        events[1].get("attempt_id").and_then(|v| v.as_u64()),
+        Some(41)
+    );
     reset();
 }
