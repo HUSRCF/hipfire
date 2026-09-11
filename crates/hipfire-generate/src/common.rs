@@ -201,7 +201,7 @@ pub fn emit_spec_cancel_after_rollback(
     epilogue: &RollbackEpilogue,
 ) {
     if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
+        crate::ar::emit_active_route_cancel(stdout, id, completion_tokens);
         return;
     }
     emit_fail_closed_error(
@@ -297,6 +297,21 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+fn emit_active_error_route_aware(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if crate::ar::active_generation_route().is_some() {
+        crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+    } else {
+        emit_active_attempt_error(stdout, id, message, class, retryable, rolled_back);
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -311,7 +326,35 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
-    emit_active_attempt_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    let _ = stdout.flush();
+}
+
+/// Emit a fail-closed error through an explicitly selected producer route.
+/// Batch drivers use this variant so one lane cannot clear the global route
+/// before another lane releases its own `(id, attempt_id)` start latch.
+pub fn emit_fail_closed_error_for_route(
+    route: crate::ar::GenerationRoute,
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    epilogue: &RollbackEpilogue,
+) {
+    let full = match &epilogue.context {
+        Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
+        _ => message.to_string(),
+    };
+    crate::ar::emit_generation_error(
+        route,
+        stdout,
+        id,
+        &full,
+        class,
+        retryable,
+        epilogue.rolled_back,
+    );
     let _ = stdout.flush();
 }
 
@@ -616,7 +659,7 @@ pub fn emit_ds4_malformed_action(
     debug_assert!(!action.store_cache);
     debug_assert!(!action.expose_tool_calls);
     debug_assert!(!action.retryable);
-    emit_active_attempt_error(
+    emit_active_error_route_aware(
         stdout,
         Some(id),
         &action.message,
@@ -680,8 +723,12 @@ pub fn emit_committed_event(
     t_ms: u64,
 ) {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if !*ENABLED {
         return;
     }
