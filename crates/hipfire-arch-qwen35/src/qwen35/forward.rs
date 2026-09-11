@@ -4508,6 +4508,7 @@ pub fn forward_prefill_dense_tp(
                             let ctx = DispatchCtx::new(&gpus.devices[rank]);
                             if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_attn(
                                 &mut gpus.devices[rank],
+                                false,
                                 layer,
                                 &configs[rank],
                                 &pbs_vec[rank],
